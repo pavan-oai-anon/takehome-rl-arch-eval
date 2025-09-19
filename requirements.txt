@@ -1,0 +1,8 @@
+openpipe-art[backend]
+weave
+python-dotenv
+unsloth
+torch
+openai>=1.0.0
+pydantic
+requests

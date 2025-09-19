@@ -1,0 +1,18 @@
+[project]
+name = "twenty-four-art"
+version = "0.1.0"
+description = "ART reinforcement learning setup for the 24 arithmetic game"
+requires-python = ">=3.10"
+dependencies = [
+    "openpipe-art[backend]==0.4.11",
+    "weave",
+    "python-dotenv",
+    "unsloth",
+    "torch",
+    "openai>=1.0.0",
+    "pydantic",
+    "requests",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
