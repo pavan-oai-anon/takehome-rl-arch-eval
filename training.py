@@ -42,6 +42,7 @@ class TrainingConfig:
     top_p: float = 0.95
     max_exceptions: int = 8
     cleanup_keep_last: int = 1
+    backend_path: str | None = None
     use_skypilot: bool = False
     skypilot_cluster_name: str = "art-task-cluster"
     skypilot_art_version: str | None = None
@@ -90,16 +91,80 @@ def import_module(path: Path, module_name: str, alias: str | None = None) -> Any
     return module
 
 
+def _resolve_backend_path(config: TrainingConfig, base_dir: Path) -> Path:
+    """Determine where LocalBackend artifacts should live."""
+
+    if config.backend_path:
+        path = Path(config.backend_path)
+        if not path.is_absolute():
+            path = base_dir / path
+    else:
+        path = base_dir / ".art"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def initialize_backend(config: TrainingConfig, base_task_dir: Path) -> Any:
+    """Create a backend that can be shared across multiple models."""
+
+    if config.use_skypilot:
+        if SkyPilotBackend is None:
+            raise RuntimeError(
+                "SkyPilot backend requested but openpipe-art[skypilot] is not installed",
+            )
+
+        cluster_kwargs: dict[str, Any] = {"cluster_name": config.skypilot_cluster_name}
+        if config.skypilot_art_version:
+            cluster_kwargs["art_version"] = config.skypilot_art_version
+        if config.skypilot_env_path:
+            env_path = Path(config.skypilot_env_path)
+            if not env_path.is_absolute():
+                env_path = base_task_dir / env_path
+            cluster_kwargs["env_path"] = str(env_path)
+        if config.skypilot_gpu:
+            cluster_kwargs["gpu"] = config.skypilot_gpu
+
+        backend = await SkyPilotBackend.initialize_cluster(**cluster_kwargs)
+    else:
+        backend_path = _resolve_backend_path(config, base_task_dir)
+        backend = LocalBackend(in_process=True, path=str(backend_path))
+
+    return backend
+
+
+_initialized_weave_projects: set[str] = set()
+
+
+def maybe_enable_weave(project: str) -> bool:
+    """Initialize Weave logging once per project when credentials are present."""
+
+    if project in _initialized_weave_projects:
+        return True
+
+    if not (os.getenv("WANDB_API_KEY") or os.getenv("WEAVE_API_KEY")):
+        return False
+
+    try:
+        weave.init(project, settings={"print_call_link": False})
+        _initialized_weave_projects.add(project)
+        return True
+    except Exception as exc:  # pragma: no cover - telemetry optional
+        print(f"Weave init failed: {exc}")
+        return False
+
+
 async def setup_model(
     config: TrainingConfig,
+    *,
+    backend: Any,
     task_dir: Path,
-) -> tuple[art.TrainableModel, Any, bool]:
-    """Instantiate and register an ART TrainableModel using task-local storage."""
+    random_seed: int,
+) -> tuple[art.TrainableModel, bool]:
+    """Instantiate and register an ART TrainableModel on the shared backend."""
 
-    load_dotenv(task_dir / ".env")
-    load_dotenv()  # allow repository-level overrides
+    load_dotenv(task_dir / ".env", override=True)
 
-    random.seed(getattr(sys.modules.get("env"), "RANDOM_SEED", 1234))
+    random.seed(random_seed)
 
     model = art.TrainableModel(
         name=config.model_name,
@@ -114,38 +179,11 @@ async def setup_model(
         ),
     )
 
-    backend_path = task_dir / ".art"
-    backend_path.mkdir(parents=True, exist_ok=True)
-
-    if config.use_skypilot:
-        if SkyPilotBackend is None:
-            raise RuntimeError(
-                "SkyPilot backend requested but openpipe-art[skypilot] is not installed",
-            )
-
-        cluster_kwargs: dict[str, Any] = {"cluster_name": config.skypilot_cluster_name}
-        if config.skypilot_art_version:
-            cluster_kwargs["art_version"] = config.skypilot_art_version
-        if config.skypilot_env_path:
-            cluster_kwargs["env_path"] = str(task_dir / config.skypilot_env_path)
-        if config.skypilot_gpu:
-            cluster_kwargs["gpu"] = config.skypilot_gpu
-
-        backend = await SkyPilotBackend.initialize_cluster(**cluster_kwargs)
-    else:
-        backend = LocalBackend(in_process=True, path=str(backend_path))
-
     await model.register(backend)
 
-    weave_enabled = False
-    if os.getenv("WANDB_API_KEY") or os.getenv("WEAVE_API_KEY"):
-        try:
-            weave.init(config.project, settings={"print_call_link": False})
-            weave_enabled = True
-        except Exception as exc:  # pragma: no cover - telemetry optional
-            print(f"Weave init failed: {exc}")
+    weave_enabled = maybe_enable_weave(config.project)
 
-    return model, backend, weave_enabled
+    return model, weave_enabled
 
 
 async def run_training(
@@ -200,12 +238,27 @@ async def run_training(
     print(f"Training finished at step {await model.get_step()}")
 
 
+@dataclass
+class TaskRuntime:
+    """Container describing a single task to train."""
+
+    name: str
+    task_dir: Path
+    env_module: Any
+    rollout_module: Any
+    rollout_fn: TrajectoryCallable
+    config: TrainingConfig
+    rollout_config: dict[str, Any]
+    random_seed: int
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an ART agent using a generated task folder")
+    parser = argparse.ArgumentParser(description="Train one or more ART agents using generated task folders")
     parser.add_argument(
-        "task_dir",
+        "task_dirs",
         type=Path,
-        help="Directory containing env.py and rollout.py produced by Codex",
+        nargs="+",
+        help="One or more directories containing env.py and rollout.py produced by Codex",
     )
     parser.add_argument("--steps", type=int, help="Override the number of training steps")
     parser.add_argument(
@@ -235,6 +288,11 @@ def parse_args() -> argparse.Namespace:
         "--top-p",
         type=float,
         help="Override nucleus sampling parameter for rollouts",
+    )
+    parser.add_argument(
+        "--backend-path",
+        dest="backend_path",
+        help="Directory to store shared backend artifacts when running locally",
     )
     parser.add_argument(
         "--use-skypilot",
@@ -292,58 +350,129 @@ def resolve_training_config(env_module: Any) -> tuple[TrainingConfig, dict[str, 
     return training_config, rollout_config
 
 
-async def main() -> None:
-    args = parse_args()
-    task_dir = args.task_dir.resolve()
-    if not task_dir.exists():
-        raise FileNotFoundError(f"Task directory {task_dir} does not exist")
-
-    env_module, rollout_module = load_task_modules(task_dir)
-    training_config, rollout_config = resolve_training_config(env_module)
+def apply_overrides(config: TrainingConfig, args: argparse.Namespace) -> None:
+    """Apply CLI overrides to a training config in-place."""
 
     if args.steps is not None:
-        training_config.steps = args.steps
+        config.steps = args.steps
     if args.trajectories_per_group is not None:
-        training_config.trajectories_per_group = args.trajectories_per_group
+        config.trajectories_per_group = args.trajectories_per_group
     if args.groups_per_step is not None:
-        training_config.groups_per_step = args.groups_per_step
+        config.groups_per_step = args.groups_per_step
     if args.learning_rate is not None:
-        training_config.learning_rate = args.learning_rate
+        config.learning_rate = args.learning_rate
     if args.temperature is not None:
-        training_config.temperature = args.temperature
-        rollout_config["temperature"] = args.temperature
+        config.temperature = args.temperature
     if args.top_p is not None:
-        training_config.top_p = args.top_p
-        rollout_config["top_p"] = args.top_p
+        config.top_p = args.top_p
+    if args.backend_path is not None:
+        config.backend_path = args.backend_path
     if args.use_skypilot:
-        training_config.use_skypilot = True
+        config.use_skypilot = True
     if args.skypilot_cluster_name is not None:
-        training_config.skypilot_cluster_name = args.skypilot_cluster_name
+        config.skypilot_cluster_name = args.skypilot_cluster_name
     if args.skypilot_art_version is not None:
-        training_config.skypilot_art_version = args.skypilot_art_version
+        config.skypilot_art_version = args.skypilot_art_version
     if args.skypilot_env_path is not None:
-        training_config.skypilot_env_path = args.skypilot_env_path
+        config.skypilot_env_path = args.skypilot_env_path
     if args.skypilot_gpu is not None:
-        training_config.skypilot_gpu = args.skypilot_gpu
+        config.skypilot_gpu = args.skypilot_gpu
     if args.teardown_remote_backend:
-        training_config.teardown_remote_backend = True
+        config.teardown_remote_backend = True
 
-    rollout_fn = getattr(rollout_module, "rollout", None)
-    if rollout_fn is None or not inspect.iscoroutinefunction(rollout_fn):
-        raise AttributeError("rollout.py must define an async function named 'rollout'")
 
-    model, backend, weave_enabled = await setup_model(training_config, task_dir)
+def ensure_backend_compat(base: TrainingConfig, candidate: TrainingConfig, task_name: str) -> None:
+    """Validate that two configs can safely share the same backend."""
+
+    shared_fields = [
+        "use_skypilot",
+        "skypilot_cluster_name",
+        "skypilot_art_version",
+        "skypilot_env_path",
+        "skypilot_gpu",
+        "backend_path",
+    ]
+
+    for field_name in shared_fields:
+        if getattr(base, field_name) != getattr(candidate, field_name):
+            raise ValueError(
+                f"Task '{task_name}' has incompatible '{field_name}' for a shared backend",
+            )
+
+
+async def main() -> None:
+    load_dotenv()
+    args = parse_args()
+
+    tasks: list[TaskRuntime] = []
+
+    for raw_dir in args.task_dirs:
+        task_dir = raw_dir.resolve()
+        if not task_dir.exists():
+            raise FileNotFoundError(f"Task directory {task_dir} does not exist")
+
+        env_module, rollout_module = load_task_modules(task_dir)
+        training_config, rollout_config = resolve_training_config(env_module)
+        apply_overrides(training_config, args)
+
+        rollout_config = {**training_config.as_dict(), **training_config.extra}
+
+        rollout_fn = getattr(rollout_module, "rollout", None)
+        if rollout_fn is None or not inspect.iscoroutinefunction(rollout_fn):
+            raise AttributeError(
+                f"rollout.py in '{task_dir}' must define an async function named 'rollout'",
+            )
+
+        random_seed = int(getattr(env_module, "RANDOM_SEED", 1234))
+
+        tasks.append(
+            TaskRuntime(
+                name=task_dir.name,
+                task_dir=task_dir,
+                env_module=env_module,
+                rollout_module=rollout_module,
+                rollout_fn=rollout_fn,  # type: ignore[arg-type]
+                config=training_config,
+                rollout_config=rollout_config,
+                random_seed=random_seed,
+            )
+        )
+
+    if not tasks:
+        raise RuntimeError("No tasks provided for training")
+
+    base_config = tasks[0].config
+    teardown_remote = base_config.teardown_remote_backend
+
+    for task in tasks[1:]:
+        ensure_backend_compat(base_config, task.config, task.name)
+        teardown_remote = teardown_remote or task.config.teardown_remote_backend
+
+    base_config.teardown_remote_backend = teardown_remote
+
+    backend = await initialize_backend(base_config, tasks[0].task_dir)
 
     try:
-        await run_training(
-            model,
-            training_config,
-            rollout_fn,  # type: ignore[arg-type]
-            rollout_config,
-            weave_enabled=weave_enabled,
-        )
+        for task in tasks:
+            sys.modules["env"] = task.env_module
+            sys.modules["rollout"] = task.rollout_module
+
+            model, weave_enabled = await setup_model(
+                task.config,
+                backend=backend,
+                task_dir=task.task_dir,
+                random_seed=task.random_seed,
+            )
+
+            await run_training(
+                model,
+                task.config,
+                task.rollout_fn,
+                task.rollout_config,
+                weave_enabled=weave_enabled,
+            )
     finally:
-        if training_config.use_skypilot and training_config.teardown_remote_backend:
+        if base_config.use_skypilot and base_config.teardown_remote_backend:
             down = getattr(backend, "down", None)
             if callable(down):
                 maybe_coro = down()
