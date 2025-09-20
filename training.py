@@ -9,6 +9,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -457,12 +458,21 @@ async def main() -> None:
             sys.modules["env"] = task.env_module
             sys.modules["rollout"] = task.rollout_module
 
+            model_dir_name = task.task_dir.parent.name
+            timestamp_component = task.task_dir.name
+            suffix_parts = [part for part in (model_dir_name, timestamp_component) if part]
+            unique_suffix = "-".join(suffix_parts) if suffix_parts else datetime.now().strftime("%Y%m%d_%H%M%S")
+            original_model_name = task.config.model_name
+            task.config.model_name = f"{original_model_name}-{unique_suffix}"
+
             model, weave_enabled = await setup_model(
                 task.config,
                 backend=backend,
                 task_dir=task.task_dir,
                 random_seed=task.random_seed,
             )
+
+            task.rollout_config["model_name"] = task.config.model_name
 
             await run_training(
                 model,
