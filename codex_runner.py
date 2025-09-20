@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -17,33 +18,40 @@ DEFAULT_PROMPTS: Dict[str, str] = {
 }
 
 
-def run_codex(prompt_name: str, user_prompt: str, output_dir: Path) -> None:
-    """Call Codex CLI with the composed prompt and write results to disk."""
+def run_codex(prompt_name: str, user_prompt: str, output_root: Path) -> Path:
+    """Call Codex CLI with the composed prompt and write results to an isolated folder."""
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_root / prompt_name / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     final_prompt = compose_prompt(user_prompt)
-    prompt_file = output_dir / f"{prompt_name}_prompt.txt"
-    prompt_file.write_text(final_prompt)
+    (run_dir / "prompt.txt").write_text(final_prompt)
 
     command = ["codex", *CODEX_FLAGS, final_prompt]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=run_dir,
+    )
 
-    output_file = output_dir / f"{prompt_name}_output.txt"
-    output_file.write_text(result.stdout)
-
-    stderr_file = output_dir / f"{prompt_name}_stderr.txt"
-    stderr_file.write_text(result.stderr)
+    (run_dir / "stdout.txt").write_text(result.stdout)
+    (run_dir / "stderr.txt").write_text(result.stderr)
 
     if result.returncode != 0:
         raise RuntimeError(
             f"Codex command failed for prompt '{prompt_name}' with exit code {result.returncode}."
         )
 
+    return run_dir
+
 
 def run_default_prompts(output_dir: Path = Path("codex_runs")) -> None:
     for name, prompt in DEFAULT_PROMPTS.items():
-        run_codex(name, prompt, output_dir)
+        run_dir = run_codex(name, prompt, output_dir)
+        print(f"{name} task generated in {run_dir}")
 
 
 if __name__ == "__main__":

@@ -5,23 +5,25 @@ from pathlib import Path
 
 
 GLOBAL_PROMPT = """You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
-Your task is to generate a complete, runnable reinforcement learning project that uses OpenPipe's ART framework.
-Follow these requirements:
-1. Never emit Colab or notebook-specific code (no %magics, no display widgets, no shell escapes like `!pip`).
-2. Use uv for every dependency or tooling operation (e.g. `uv pip install openpipe-art[backend]==0.4.11 --prerelease allow`).
-3. Target Python scripts with clear module boundaries, mirroring the structure shown in 2048.py: environment definition, rollout logic, training loop, and post-training evaluation.
-4. Define and register an `art.TrainableModel` with a `LocalBackend` (use `in_process=True` and persist checkpoints under `./.art`).
-5. Implement a rollout function decorated with `@weave.op` that yields `art.Trajectory` objects, capturing metadata and reward shaping similar to the 2048 example.
-6. Create an asyncio-driven training entry point (e.g. `async def main()` and `if __name__ == "__main__": asyncio.run(main())`).
-7. Include a gather/train loop that deletes older checkpoints, trains on grouped trajectories, and logs meaningful metrics to Weave/W&B when credentials are available.
-8. Provide a lightweight evaluation routine that reloads the freshly trained LoRA weights (via `FastLanguageModel.from_pretrained`) and demonstrates one or two inference rollouts in the target environment.
-9. Keep prompts and system messages concise but explicit about action formats the policy must return.
-10. Prefer pure Python helpers, type hints, and small docstrings to describe non-obvious logic.
-11. Make it easy to adapt hyperparameters, number of trajectories, and reward shaping constants.
-12. Validate XML or structured actions defensively; surface invalid moves with informative errors.
-13. Assume local execution on a single GPU; include comments when a config is a memory-saving tweak copied from 2048.py.
-14. Output shell snippets for uv installation or job kicks only when necessary; never assume Colab hardware.
-15. Organize files so the main training job can be launched with a single uv-invoked python command.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
 """
 
 
