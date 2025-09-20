@@ -1,0 +1,408 @@
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Create an ART reinforcement learning task that fixes typos in short product reviews. The environment should surface one noisy review per episode along with an optional difficulty label. Seed the environment with 10-20 sample reviews containing common spelling and grammar mistakes. The agent must return the corrected review verbatim (no extra commentary) in plain text. Keep the implementation aligned with the shared scaffolding and the 2048 reference style.
