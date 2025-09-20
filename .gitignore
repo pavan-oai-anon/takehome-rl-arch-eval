@@ -1,1 +1,4 @@
 *.pyc
+.art/
+unsloth_compiled_cache/
+wandb/
