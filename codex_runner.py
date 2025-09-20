@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import subprocess
 from datetime import datetime
@@ -51,7 +52,6 @@ def run_codex(
 
     env = os.environ.copy()
     env["OPENAI_API_KEY"] = api_key
-    print("OpenAI API Key: ", api_key)
 
     result = subprocess.run(
         command,
@@ -107,14 +107,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        help="Codex model identifier (overrides CODEX_MODEL env variable)",
-        default=os.getenv("CODEX_MODEL"),
+        dest="models",
+        action="append",
+        help="Codex model identifier (repeatable). Defaults to CODEX_MODEL env or 'default'.",
     )
     parser.add_argument(
         "--api-key",
         dest="api_key",
         help="OpenAI API key (overrides OPENAI_API_KEY env variable)",
-        default=os.getenv("OPENAI_API_KEY"),
     )
     return parser.parse_args()
 
@@ -124,8 +124,10 @@ def run_prompts(
     output_dir: Path,
     *,
     model: str | None,
+    model_label: str,
     api_key: str,
 ) -> None:
+    label = model_label or (model or "default")
     for name in prompt_names:
         prompt_text = resolve_prompt(name)
         run_dir = run_codex(
@@ -135,60 +137,90 @@ def run_prompts(
             model=model,
             api_key=api_key,
         )
-        print(f"{name} task generated in {run_dir}")
+        print(f"[{label}] {name} task generated in {run_dir}")
 
 
-_cached_model: str | None = None
-_cached_api_key: str | None = None
-
-
-def resolve_api_key() -> str:
-    """Fetch the OpenAI API key from environment variables."""
-
-    global _cached_api_key
-    if _cached_api_key is not None:
-        return _cached_api_key
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY must be set in the environment or .env to authenticate Codex runs",
-        )
-    _cached_api_key = api_key
-    return api_key
-
-
-def resolve_model() -> str | None:
-    """Pick the Codex model to use, if specified."""
-
-    global _cached_model
-    if _cached_model is not None:
-        return _cached_model
-
-    model = os.getenv("CODEX_MODEL")
-    _cached_model = model
-    return model
+def _run_prompts_worker(
+    *,
+    model_label: str,
+    model_override: str | None,
+    prompt_names: list[str],
+    output_dir: Path,
+    api_key: str,
+) -> None:
+    run_prompts(
+        prompt_names,
+        output_dir,
+        model=model_override,
+        model_label=model_label,
+        api_key=api_key,
+    )
 
 
 def main() -> None:
     load_dotenv()
     args = parse_args()
 
-    global _cached_api_key
-    global _cached_model
-
     if args.api_key:
         os.environ["OPENAI_API_KEY"] = args.api_key
-        _cached_api_key = None
-    if args.model:
-        os.environ["CODEX_MODEL"] = args.model
-        _cached_model = None
 
-    model = resolve_model()
-    api_key = resolve_api_key()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY must be set in the environment or via --api-key to authenticate Codex runs",
+        )
+
+    models: list[str] = []
+    if args.models:
+        models.extend(args.models)
+    else:
+        env_models = os.getenv("CODEX_MODEL")
+        if env_models:
+            models.extend(m.strip() for m in env_models.split(",") if m.strip())
+
+    if not models:
+        models = ["default"]
 
     prompts = list(BUILT_IN_PROMPTS) if args.prompt is None else [args.prompt]
-    run_prompts(prompts, args.output_dir, model=model, api_key=api_key)
+
+    if len(models) == 1:
+        model_name = models[0]
+        model_override = None if model_name == "default" else model_name
+        _run_prompts_worker(
+            model_label=model_name,
+            model_override=model_override,
+            prompt_names=prompts,
+            output_dir=args.output_dir,
+            api_key=api_key,
+        )
+        return
+
+    multiprocessing.set_start_method("spawn", force=True)
+
+    processes: list[tuple[str, multiprocessing.Process]] = []
+    for model_name in models:
+        model_override = None if model_name == "default" else model_name
+        proc = multiprocessing.Process(
+            target=_run_prompts_worker,
+            kwargs={
+                "model_label": model_name,
+                "model_override": model_override,
+                "prompt_names": prompts,
+                "output_dir": args.output_dir,
+                "api_key": api_key,
+            },
+        )
+        proc.start()
+        processes.append((model_name, proc))
+
+    failures: list[str] = []
+    for model_name, proc in processes:
+        proc.join()
+        if proc.exitcode != 0:
+            failures.append(f"{model_name} (exit {proc.exitcode})")
+
+    if failures:
+        raise RuntimeError("Codex runs failed for: " + ", ".join(failures))
 
 
 if __name__ == "__main__":
