@@ -1,0 +1,1 @@
+Create an ART reinforcement learning setup for the arithmetic game "24". The environment should present four random digits each episode and the agent must combine them with +, -, *, or / to reach exactly 24, returning solutions as XML (e.g. <solution>(3 * (4 + 4))</solution>). Use the shared project scaffolding and match the ergonomics of the 2048 example.
