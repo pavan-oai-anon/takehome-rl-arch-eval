@@ -1,0 +1,2397 @@
+[2025-09-20T23:45:23] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-20T23:45:23] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Create an ART reinforcement learning setup for the arithmetic game "24". The environment should present four random digits each episode and the agent must combine them with +, -, *, or / to reach exactly 24, returning solutions as XML (e.g. <solution>(3 * (4 + 4))</solution>). Use the shared project scaffolding and match the ergonomics of the 2048 example.
+[2025-09-20T23:46:13] codex
+
+I'll add two files: env.py with environment helpers, constants, and training config; and rollout.py implementing the ART rollout, prompts, validation, and reward shaping for the "24" game.
+[2025-09-20T23:46:46] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523/env.py
+"""Minimal environment helpers for the arithmetic game "24" using ART.
+
+This module exposes simple utilities used by rollout.py and a tweakable
+configuration block that mirrors the ergonomics of the 2048 example.
+
+Notes:
+- Assume LocalBackend for inference/training; model memory knobs (e.g.,
+  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
+- The host project supplies the training loop and evaluation entry point.
+"""
+from __future__ import annotations
+
+import ast
+import random
+import string
+from dataclasses import dataclass
+from typing import Iterable, Tuple
+
+
+# ------------------------------
+# Tunables and environment constants
+# ------------------------------
+RANDOM_SEED: int = 42
+TARGET_VALUE: int = 24
+DIGITS_PER_EPISODE: int = 4
+MIN_DIGIT: int = 1
+MAX_DIGIT: int = 9
+EPSILON: float = 1e-6  # Numeric tolerance for equality checks
+CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
+EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
+
+
+# ------------------------------
+# Training configuration consumed by the host trainer
+# ------------------------------
+TRAINING_CONFIG: dict = {
+    # Project + model identity
+    "project": "game-24",
+    "model_name": "agent-24",
+    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
+    # Trainer knobs
+    "steps": 10,
+    "trajectories_per_group": 18,
+    "groups_per_step": 1,
+    "learning_rate": 1e-5,
+    # Inference knobs
+    "max_completion_tokens": 96,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    # Fault tolerance + cleanup
+    "max_exceptions": 18,
+    "cleanup_keep_last": 1,
+}
+
+
+# ------------------------------
+# Helpers
+# ------------------------------
+
+
+def generate_episode_digits() -> Tuple[int, int, int, int]:
+    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
+
+    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
+    """
+
+    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
+
+
+def digits_to_string(digits: Iterable[int]) -> str:
+    """Return a compact string representation suitable for metadata.
+
+    The metadata must avoid lists/dicts for aggregation, so we serialize
+    the digits as a comma-separated string.
+    """
+
+    return ",".join(str(d) for d in digits)
+
+
+def new_episode_id(length: int = 6) -> str:
+    """Generate a short alphanumeric ID for metadata."""
+
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
+@dataclass
+class EvalResult:
+    """Container for a safely evaluated arithmetic expression.
+
+    Attributes
+    -----------
+    value: float | None
+        Numeric value if evaluation succeeded; None otherwise.
+    numbers: tuple[int, ...]
+        All integer literals encountered in the expression (in-order).
+    op_count: int
+        Number of binary operations used in the expression.
+    error: str | None
+        Human-readable error string if evaluation failed.
+    """
+
+    value: float | None
+    numbers: Tuple[int, ...]
+    op_count: int
+    error: str | None
+
+
+def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
+    """Return True if two iterables contain the same elements with counts.
+
+    Implemented without importing collections.Counter to keep the file lean.
+    """
+
+    counts: dict[int, int] = {}
+    for x in a:
+        counts[x] = counts.get(x, 0) + 1
+    for x in b:
+        if x not in counts:
+            return False
+        counts[x] -= 1
+        if counts[x] == 0:
+            del counts[x]
+    return not counts
+
+
+def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
+    """Check that the integer literals exactly match the provided digits."""
+
+    return _multiset_equal(numbers, episode_digits)
+
+
+def safe_eval_arithmetic(expr: str) -> EvalResult:
+    """Safely evaluate a restricted arithmetic expression.
+
+    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
+    Disallows unary operators, function calls, names, and other nodes.
+    Returns a value and metadata about numbers/op count, or an error string.
+    """
+
+    try:
+        node = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:  # pragma: no cover - defensive
+        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
+
+    numbers: list[int] = []
+
+    def eval_node(n: ast.AST) -> float:
+        if isinstance(n, ast.Expression):
+            return eval_node(n.body)
+        if isinstance(n, ast.BinOp):
+            left = eval_node(n.left)
+            right = eval_node(n.right)
+            if isinstance(n.op, ast.Add):
+                return left + right
+            if isinstance(n.op, ast.Sub):
+                return left - right
+            if isinstance(n.op, ast.Mult):
+                return left * right
+            if isinstance(n.op, ast.Div):
+                if abs(right) <= EPSILON:
+                    raise ZeroDivisionError
+                return left / right
+            raise ValueError("unsupported_operator")
+        if isinstance(n, ast.Constant) and isinstance(n.value, int):
+            value = int(n.value)
+            if not (0 <= value <= 9):  # restrict to single digits
+                raise ValueError("non_digit_literal")
+            numbers.append(value)
+            return float(value)
+        # Parentheses are represented structurally in the AST; no explicit node.
+        raise ValueError("unsupported_syntax")
+
+    try:
+        value = eval_node(node)
+        # op_count equals (#numbers - 1) for a valid binary tree over numbers
+        op_count = max(0, len(numbers) - 1)
+        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
+    except ZeroDivisionError:
+        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
+    except ValueError as exc:  # unsupported syntax, non-digit, etc.
+        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
+
+
+def render_system_prompt() -> str:
+    """Concise system instructions for the policy.
+
+    Keep this short so the model has headroom for completions during training.
+    """
+
+    return (
+        "You play the arithmetic game '24'. Combine the four given digits "
+        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
+        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
+    )
+
+
+def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
+    """User prompt describing the current episode's digits and format rules."""
+
+    return (
+        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
+        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
+    )
+
+
+[2025-09-20T23:46:46] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A env.py
+[2025-09-20T23:46:46] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/env.py b/codex_runs/24/gpt-5/20250920_234523/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..258b0cf9f53b0fcba0dd6fc69950aca0e74abd42
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/env.py
+@@ -0,0 +1,206 @@
++"""Minimal environment helpers for the arithmetic game "24" using ART.
++
++This module exposes simple utilities used by rollout.py and a tweakable
++configuration block that mirrors the ergonomics of the 2048 example.
++
++Notes:
++- Assume LocalBackend for inference/training; model memory knobs (e.g.,
++  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
++- The host project supplies the training loop and evaluation entry point.
++"""
++from __future__ import annotations
++
++import ast
++import random
++import string
++from dataclasses import dataclass
++from typing import Iterable, Tuple
++
++
++# ------------------------------
++# Tunables and environment constants
++# ------------------------------
++RANDOM_SEED: int = 42
++TARGET_VALUE: int = 24
++DIGITS_PER_EPISODE: int = 4
++MIN_DIGIT: int = 1
++MAX_DIGIT: int = 9
++EPSILON: float = 1e-6  # Numeric tolerance for equality checks
++CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
++EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
++
++
++# ------------------------------
++# Training configuration consumed by the host trainer
++# ------------------------------
++TRAINING_CONFIG: dict = {
++    # Project + model identity
++    "project": "game-24",
++    "model_name": "agent-24",
++    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
++    # Trainer knobs
++    "steps": 10,
++    "trajectories_per_group": 18,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    # Inference knobs
++    "max_completion_tokens": 96,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Fault tolerance + cleanup
++    "max_exceptions": 18,
++    "cleanup_keep_last": 1,
++}
++
++
++# ------------------------------
++# Helpers
++# ------------------------------
++
++
++def generate_episode_digits() -> Tuple[int, int, int, int]:
++    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
++
++    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
++    """
++
++    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
++
++
++def digits_to_string(digits: Iterable[int]) -> str:
++    """Return a compact string representation suitable for metadata.
++
++    The metadata must avoid lists/dicts for aggregation, so we serialize
++    the digits as a comma-separated string.
++    """
++
++    return ",".join(str(d) for d in digits)
++
++
++def new_episode_id(length: int = 6) -> str:
++    """Generate a short alphanumeric ID for metadata."""
++
++    alphabet = string.ascii_letters + string.digits
++    return "".join(random.choices(alphabet, k=length))
++
++
++@dataclass
++class EvalResult:
++    """Container for a safely evaluated arithmetic expression.
++
++    Attributes
++    -----------
++    value: float | None
++        Numeric value if evaluation succeeded; None otherwise.
++    numbers: tuple[int, ...]
++        All integer literals encountered in the expression (in-order).
++    op_count: int
++        Number of binary operations used in the expression.
++    error: str | None
++        Human-readable error string if evaluation failed.
++    """
++
++    value: float | None
++    numbers: Tuple[int, ...]
++    op_count: int
++    error: str | None
++
++
++def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
++    """Return True if two iterables contain the same elements with counts.
++
++    Implemented without importing collections.Counter to keep the file lean.
++    """
++
++    counts: dict[int, int] = {}
++    for x in a:
++        counts[x] = counts.get(x, 0) + 1
++    for x in b:
++        if x not in counts:
++            return False
++        counts[x] -= 1
++        if counts[x] == 0:
++            del counts[x]
++    return not counts
++
++
++def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
++    """Check that the integer literals exactly match the provided digits."""
++
++    return _multiset_equal(numbers, episode_digits)
++
++
++def safe_eval_arithmetic(expr: str) -> EvalResult:
++    """Safely evaluate a restricted arithmetic expression.
++
++    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
++    Disallows unary operators, function calls, names, and other nodes.
++    Returns a value and metadata about numbers/op count, or an error string.
++    """
++
++    try:
++        node = ast.parse(expr, mode="eval")
++    except SyntaxError as exc:  # pragma: no cover - defensive
++        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
++
++    numbers: list[int] = []
++
++    def eval_node(n: ast.AST) -> float:
++        if isinstance(n, ast.Expression):
++            return eval_node(n.body)
++        if isinstance(n, ast.BinOp):
++            left = eval_node(n.left)
++            right = eval_node(n.right)
++            if isinstance(n.op, ast.Add):
++                return left + right
++            if isinstance(n.op, ast.Sub):
++                return left - right
++            if isinstance(n.op, ast.Mult):
++                return left * right
++            if isinstance(n.op, ast.Div):
++                if abs(right) <= EPSILON:
++                    raise ZeroDivisionError
++                return left / right
++            raise ValueError("unsupported_operator")
++        if isinstance(n, ast.Constant) and isinstance(n.value, int):
++            value = int(n.value)
++            if not (0 <= value <= 9):  # restrict to single digits
++                raise ValueError("non_digit_literal")
++            numbers.append(value)
++            return float(value)
++        # Parentheses are represented structurally in the AST; no explicit node.
++        raise ValueError("unsupported_syntax")
++
++    try:
++        value = eval_node(node)
++        # op_count equals (#numbers - 1) for a valid binary tree over numbers
++        op_count = max(0, len(numbers) - 1)
++        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
++    except ZeroDivisionError:
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
++    except ValueError as exc:  # unsupported syntax, non-digit, etc.
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
++
++
++def render_system_prompt() -> str:
++    """Concise system instructions for the policy.
++
++    Keep this short so the model has headroom for completions during training.
++    """
++
++    return (
++        "You play the arithmetic game '24'. Combine the four given digits "
++        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
++        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
++    )
++
++
++def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
++    """User prompt describing the current episode's digits and format rules."""
++
++    return (
++        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
++        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
++    )
++
++
+
+[2025-09-20T23:46:47] tokens used: 9,435
+[2025-09-20T23:46:47] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/env.py b/codex_runs/24/gpt-5/20250920_234523/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..258b0cf9f53b0fcba0dd6fc69950aca0e74abd42
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/env.py
+@@ -0,0 +1,206 @@
++"""Minimal environment helpers for the arithmetic game "24" using ART.
++
++This module exposes simple utilities used by rollout.py and a tweakable
++configuration block that mirrors the ergonomics of the 2048 example.
++
++Notes:
++- Assume LocalBackend for inference/training; model memory knobs (e.g.,
++  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
++- The host project supplies the training loop and evaluation entry point.
++"""
++from __future__ import annotations
++
++import ast
++import random
++import string
++from dataclasses import dataclass
++from typing import Iterable, Tuple
++
++
++# ------------------------------
++# Tunables and environment constants
++# ------------------------------
++RANDOM_SEED: int = 42
++TARGET_VALUE: int = 24
++DIGITS_PER_EPISODE: int = 4
++MIN_DIGIT: int = 1
++MAX_DIGIT: int = 9
++EPSILON: float = 1e-6  # Numeric tolerance for equality checks
++CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
++EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
++
++
++# ------------------------------
++# Training configuration consumed by the host trainer
++# ------------------------------
++TRAINING_CONFIG: dict = {
++    # Project + model identity
++    "project": "game-24",
++    "model_name": "agent-24",
++    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
++    # Trainer knobs
++    "steps": 10,
++    "trajectories_per_group": 18,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    # Inference knobs
++    "max_completion_tokens": 96,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Fault tolerance + cleanup
++    "max_exceptions": 18,
++    "cleanup_keep_last": 1,
++}
++
++
++# ------------------------------
++# Helpers
++# ------------------------------
++
++
++def generate_episode_digits() -> Tuple[int, int, int, int]:
++    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
++
++    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
++    """
++
++    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
++
++
++def digits_to_string(digits: Iterable[int]) -> str:
++    """Return a compact string representation suitable for metadata.
++
++    The metadata must avoid lists/dicts for aggregation, so we serialize
++    the digits as a comma-separated string.
++    """
++
++    return ",".join(str(d) for d in digits)
++
++
++def new_episode_id(length: int = 6) -> str:
++    """Generate a short alphanumeric ID for metadata."""
++
++    alphabet = string.ascii_letters + string.digits
++    return "".join(random.choices(alphabet, k=length))
++
++
++@dataclass
++class EvalResult:
++    """Container for a safely evaluated arithmetic expression.
++
++    Attributes
++    -----------
++    value: float | None
++        Numeric value if evaluation succeeded; None otherwise.
++    numbers: tuple[int, ...]
++        All integer literals encountered in the expression (in-order).
++    op_count: int
++        Number of binary operations used in the expression.
++    error: str | None
++        Human-readable error string if evaluation failed.
++    """
++
++    value: float | None
++    numbers: Tuple[int, ...]
++    op_count: int
++    error: str | None
++
++
++def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
++    """Return True if two iterables contain the same elements with counts.
++
++    Implemented without importing collections.Counter to keep the file lean.
++    """
++
++    counts: dict[int, int] = {}
++    for x in a:
++        counts[x] = counts.get(x, 0) + 1
++    for x in b:
++        if x not in counts:
++            return False
++        counts[x] -= 1
++        if counts[x] == 0:
++            del counts[x]
++    return not counts
++
++
++def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
++    """Check that the integer literals exactly match the provided digits."""
++
++    return _multiset_equal(numbers, episode_digits)
++
++
++def safe_eval_arithmetic(expr: str) -> EvalResult:
++    """Safely evaluate a restricted arithmetic expression.
++
++    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
++    Disallows unary operators, function calls, names, and other nodes.
++    Returns a value and metadata about numbers/op count, or an error string.
++    """
++
++    try:
++        node = ast.parse(expr, mode="eval")
++    except SyntaxError as exc:  # pragma: no cover - defensive
++        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
++
++    numbers: list[int] = []
++
++    def eval_node(n: ast.AST) -> float:
++        if isinstance(n, ast.Expression):
++            return eval_node(n.body)
++        if isinstance(n, ast.BinOp):
++            left = eval_node(n.left)
++            right = eval_node(n.right)
++            if isinstance(n.op, ast.Add):
++                return left + right
++            if isinstance(n.op, ast.Sub):
++                return left - right
++            if isinstance(n.op, ast.Mult):
++                return left * right
++            if isinstance(n.op, ast.Div):
++                if abs(right) <= EPSILON:
++                    raise ZeroDivisionError
++                return left / right
++            raise ValueError("unsupported_operator")
++        if isinstance(n, ast.Constant) and isinstance(n.value, int):
++            value = int(n.value)
++            if not (0 <= value <= 9):  # restrict to single digits
++                raise ValueError("non_digit_literal")
++            numbers.append(value)
++            return float(value)
++        # Parentheses are represented structurally in the AST; no explicit node.
++        raise ValueError("unsupported_syntax")
++
++    try:
++        value = eval_node(node)
++        # op_count equals (#numbers - 1) for a valid binary tree over numbers
++        op_count = max(0, len(numbers) - 1)
++        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
++    except ZeroDivisionError:
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
++    except ValueError as exc:  # unsupported syntax, non-digit, etc.
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
++
++
++def render_system_prompt() -> str:
++    """Concise system instructions for the policy.
++
++    Keep this short so the model has headroom for completions during training.
++    """
++
++    return (
++        "You play the arithmetic game '24'. Combine the four given digits "
++        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
++        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
++    )
++
++
++def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
++    """User prompt describing the current episode's digits and format rules."""
++
++    return (
++        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
++        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
++    )
++
++
+
+[2025-09-20T23:47:10] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523/rollout.py
+"""ART rollout for the arithmetic game "24".
+
+Implements a single-turn rollout that:
+- samples four digits
+- prompts the policy to return <solution>EXPR</solution>
+- validates and evaluates the expression safely
+- logs scalar metadata and numeric metrics
+- computes a shaped reward based on closeness to 24 and rule adherence
+"""
+from __future__ import annotations
+
+import random
+from typing import Any
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    TARGET_VALUE,
+    CLIPPED_ERROR,
+    EXACT_SOLUTION_REWARD,
+    EPSILON,
+    digits_to_string,
+    generate_episode_digits,
+    new_episode_id,
+    numbers_match_episode,
+    render_system_prompt,
+    render_user_prompt,
+    safe_eval_arithmetic,
+)
+
+
+def _smooth_reward(abs_error: float, used_all_digits: bool) -> float:
+    """Smooth, bounded reward for near-misses.
+
+    Maps zero error -> 1.0, and errors >= CLIPPED_ERROR -> 0.0. Adds a small
+    bonus when the expression uses exactly the given digits to guide learning.
+    """
+
+    base = max(0.0, 1.0 - min(abs_error, CLIPPED_ERROR) / CLIPPED_ERROR)
+    return base + (0.2 if used_all_digits else 0.0)
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Collect one trajectory for the game "24".
+
+    Parameters
+    ----------
+    model: art.Model
+        The model to query for completions.
+    step: int
+        Current training step; included in metadata for aggregation.
+    config: dict[str, Any]
+        Training/inference config forwarded from the host loop.
+    """
+
+    # Deterministic sampling per step (still varied by episode id/draw).
+    random.seed(RANDOM_SEED + step)
+    d1, d2, d3, d4 = generate_episode_digits()
+    digits_str = digits_to_string((d1, d2, d3, d4))
+    episode_id = new_episode_id()
+
+    # System + one user turn (single-step decision problem).
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": render_system_prompt()}],
+        metadata={
+            "notebook-id": "24",  # scalar string for aggregation
+            "project": TRAINING_CONFIG.get("project", "game-24"),
+            "step": step,
+            "episode_id": episode_id,
+            "digits": digits_str,
+        },
+        reward=0.0,
+    )
+
+    user_prompt = render_user_prompt(d1, d2, d3, d4)
+    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
+
+    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
+    completion = await client.chat.completions.create(
+        messages=trajectory.messages(),
+        model=model.name,
+        max_completion_tokens=int(TRAINING_CONFIG.get("max_completion_tokens", 96)),
+        temperature=float(TRAINING_CONFIG.get("temperature", 0.7)),
+        top_p=float(TRAINING_CONFIG.get("top_p", 0.9)),
+        stream=False,
+    )
+
+    choice = completion.choices[0]
+    content = choice.message.content
+    if not isinstance(content, str):  # pragma: no cover - defensive
+        content = str(content)
+    trajectory.messages_and_choices.append(choice)
+
+    # Parse <solution> ... </solution>
+    xml_error = None
+    expr_text: str | None = None
+    try:
+        # Minimal, robust extraction without bringing XML deps: simple slice
+        # while keeping strict tag names; if missing, this will raise.
+        start_tag = "<solution>"
+        end_tag = "</solution>"
+        start = content.index(start_tag) + len(start_tag)
+        end = content.index(end_tag, start)
+        expr_text = content[start:end].strip()
+        if not expr_text:
+            xml_error = "empty_solution"
+    except Exception:
+        xml_error = "missing_or_malformed_xml"
+
+    if xml_error is not None or expr_text is None:
+        trajectory.reward = -1.0
+        trajectory.metadata["error"] = xml_error or "xml_extract_failed"
+        trajectory.metrics["invalid_solution"] = 1.0
+        trajectory.metrics["abs_error"] = float("inf")
+        trajectory.metrics["used_all_digits"] = 0.0
+        trajectory.metrics["is_exact"] = 0.0
+        trajectory.metrics["op_count"] = 0.0
+        return trajectory
+
+    # Safe evaluation + rule checks
+    eval_result = safe_eval_arithmetic(expr_text)
+    used_all_digits = numbers_match_episode(eval_result.numbers, (d1, d2, d3, d4))
+
+    if eval_result.error is not None or eval_result.value is None:
+        trajectory.reward = -1.0
+        trajectory.metadata["error"] = str(eval_result.error)
+        trajectory.metrics["invalid_solution"] = 1.0
+        trajectory.metrics["abs_error"] = float("inf")
+        trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
+        trajectory.metrics["is_exact"] = 0.0
+        trajectory.metrics["op_count"] = float(eval_result.op_count)
+        return trajectory
+
+    # Compute closeness and reward
+    abs_error = abs(eval_result.value - TARGET_VALUE)
+    is_exact = abs_error <= EPSILON and used_all_digits
+    if is_exact:
+        reward = EXACT_SOLUTION_REWARD
+    else:
+        reward = _smooth_reward(abs_error, used_all_digits)
+
+    # Metrics (numbers only) and minimal scalar metadata
+    trajectory.reward = float(reward)
+    trajectory.metadata["error"] = ""  # keep scalar-only metadata
+    trajectory.metrics["abs_error"] = float(abs_error)
+    trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
+    trajectory.metrics["is_exact"] = 1.0 if is_exact else 0.0
+    trajectory.metrics["invalid_solution"] = 0.0
+    trajectory.metrics["op_count"] = float(eval_result.op_count)
+
+    return trajectory
+
+
+[2025-09-20T23:47:10] apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+A rollout.py
+[2025-09-20T23:47:10] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/env.py b/codex_runs/24/gpt-5/20250920_234523/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..258b0cf9f53b0fcba0dd6fc69950aca0e74abd42
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/env.py
+@@ -0,0 +1,206 @@
++"""Minimal environment helpers for the arithmetic game "24" using ART.
++
++This module exposes simple utilities used by rollout.py and a tweakable
++configuration block that mirrors the ergonomics of the 2048 example.
++
++Notes:
++- Assume LocalBackend for inference/training; model memory knobs (e.g.,
++  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
++- The host project supplies the training loop and evaluation entry point.
++"""
++from __future__ import annotations
++
++import ast
++import random
++import string
++from dataclasses import dataclass
++from typing import Iterable, Tuple
++
++
++# ------------------------------
++# Tunables and environment constants
++# ------------------------------
++RANDOM_SEED: int = 42
++TARGET_VALUE: int = 24
++DIGITS_PER_EPISODE: int = 4
++MIN_DIGIT: int = 1
++MAX_DIGIT: int = 9
++EPSILON: float = 1e-6  # Numeric tolerance for equality checks
++CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
++EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
++
++
++# ------------------------------
++# Training configuration consumed by the host trainer
++# ------------------------------
++TRAINING_CONFIG: dict = {
++    # Project + model identity
++    "project": "game-24",
++    "model_name": "agent-24",
++    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
++    # Trainer knobs
++    "steps": 10,
++    "trajectories_per_group": 18,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    # Inference knobs
++    "max_completion_tokens": 96,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Fault tolerance + cleanup
++    "max_exceptions": 18,
++    "cleanup_keep_last": 1,
++}
++
++
++# ------------------------------
++# Helpers
++# ------------------------------
++
++
++def generate_episode_digits() -> Tuple[int, int, int, int]:
++    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
++
++    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
++    """
++
++    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
++
++
++def digits_to_string(digits: Iterable[int]) -> str:
++    """Return a compact string representation suitable for metadata.
++
++    The metadata must avoid lists/dicts for aggregation, so we serialize
++    the digits as a comma-separated string.
++    """
++
++    return ",".join(str(d) for d in digits)
++
++
++def new_episode_id(length: int = 6) -> str:
++    """Generate a short alphanumeric ID for metadata."""
++
++    alphabet = string.ascii_letters + string.digits
++    return "".join(random.choices(alphabet, k=length))
++
++
++@dataclass
++class EvalResult:
++    """Container for a safely evaluated arithmetic expression.
++
++    Attributes
++    -----------
++    value: float | None
++        Numeric value if evaluation succeeded; None otherwise.
++    numbers: tuple[int, ...]
++        All integer literals encountered in the expression (in-order).
++    op_count: int
++        Number of binary operations used in the expression.
++    error: str | None
++        Human-readable error string if evaluation failed.
++    """
++
++    value: float | None
++    numbers: Tuple[int, ...]
++    op_count: int
++    error: str | None
++
++
++def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
++    """Return True if two iterables contain the same elements with counts.
++
++    Implemented without importing collections.Counter to keep the file lean.
++    """
++
++    counts: dict[int, int] = {}
++    for x in a:
++        counts[x] = counts.get(x, 0) + 1
++    for x in b:
++        if x not in counts:
++            return False
++        counts[x] -= 1
++        if counts[x] == 0:
++            del counts[x]
++    return not counts
++
++
++def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
++    """Check that the integer literals exactly match the provided digits."""
++
++    return _multiset_equal(numbers, episode_digits)
++
++
++def safe_eval_arithmetic(expr: str) -> EvalResult:
++    """Safely evaluate a restricted arithmetic expression.
++
++    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
++    Disallows unary operators, function calls, names, and other nodes.
++    Returns a value and metadata about numbers/op count, or an error string.
++    """
++
++    try:
++        node = ast.parse(expr, mode="eval")
++    except SyntaxError as exc:  # pragma: no cover - defensive
++        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
++
++    numbers: list[int] = []
++
++    def eval_node(n: ast.AST) -> float:
++        if isinstance(n, ast.Expression):
++            return eval_node(n.body)
++        if isinstance(n, ast.BinOp):
++            left = eval_node(n.left)
++            right = eval_node(n.right)
++            if isinstance(n.op, ast.Add):
++                return left + right
++            if isinstance(n.op, ast.Sub):
++                return left - right
++            if isinstance(n.op, ast.Mult):
++                return left * right
++            if isinstance(n.op, ast.Div):
++                if abs(right) <= EPSILON:
++                    raise ZeroDivisionError
++                return left / right
++            raise ValueError("unsupported_operator")
++        if isinstance(n, ast.Constant) and isinstance(n.value, int):
++            value = int(n.value)
++            if not (0 <= value <= 9):  # restrict to single digits
++                raise ValueError("non_digit_literal")
++            numbers.append(value)
++            return float(value)
++        # Parentheses are represented structurally in the AST; no explicit node.
++        raise ValueError("unsupported_syntax")
++
++    try:
++        value = eval_node(node)
++        # op_count equals (#numbers - 1) for a valid binary tree over numbers
++        op_count = max(0, len(numbers) - 1)
++        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
++    except ZeroDivisionError:
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
++    except ValueError as exc:  # unsupported syntax, non-digit, etc.
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
++
++
++def render_system_prompt() -> str:
++    """Concise system instructions for the policy.
++
++    Keep this short so the model has headroom for completions during training.
++    """
++
++    return (
++        "You play the arithmetic game '24'. Combine the four given digits "
++        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
++        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
++    )
++
++
++def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
++    """User prompt describing the current episode's digits and format rules."""
++
++    return (
++        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
++        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
++    )
++
++
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rollout.py b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d50154d9d8c9d440e0e12a4aeb59606358bc6073
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+@@ -0,0 +1,160 @@
++"""ART rollout for the arithmetic game "24".
++
++Implements a single-turn rollout that:
++- samples four digits
++- prompts the policy to return <solution>EXPR</solution>
++- validates and evaluates the expression safely
++- logs scalar metadata and numeric metrics
++- computes a shaped reward based on closeness to 24 and rule adherence
++"""
++from __future__ import annotations
++
++import random
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    TARGET_VALUE,
++    CLIPPED_ERROR,
++    EXACT_SOLUTION_REWARD,
++    EPSILON,
++    digits_to_string,
++    generate_episode_digits,
++    new_episode_id,
++    numbers_match_episode,
++    render_system_prompt,
++    render_user_prompt,
++    safe_eval_arithmetic,
++)
++
++
++def _smooth_reward(abs_error: float, used_all_digits: bool) -> float:
++    """Smooth, bounded reward for near-misses.
++
++    Maps zero error -> 1.0, and errors >= CLIPPED_ERROR -> 0.0. Adds a small
++    bonus when the expression uses exactly the given digits to guide learning.
++    """
++
++    base = max(0.0, 1.0 - min(abs_error, CLIPPED_ERROR) / CLIPPED_ERROR)
++    return base + (0.2 if used_all_digits else 0.0)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect one trajectory for the game "24".
++
++    Parameters
++    ----------
++    model: art.Model
++        The model to query for completions.
++    step: int
++        Current training step; included in metadata for aggregation.
++    config: dict[str, Any]
++        Training/inference config forwarded from the host loop.
++    """
++
++    # Deterministic sampling per step (still varied by episode id/draw).
++    random.seed(RANDOM_SEED + step)
++    d1, d2, d3, d4 = generate_episode_digits()
++    digits_str = digits_to_string((d1, d2, d3, d4))
++    episode_id = new_episode_id()
++
++    # System + one user turn (single-step decision problem).
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": render_system_prompt()}],
++        metadata={
++            "notebook-id": "24",  # scalar string for aggregation
++            "project": TRAINING_CONFIG.get("project", "game-24"),
++            "step": step,
++            "episode_id": episode_id,
++            "digits": digits_str,
++        },
++        reward=0.0,
++    )
++
++    user_prompt = render_user_prompt(d1, d2, d3, d4)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++    completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=int(TRAINING_CONFIG.get("max_completion_tokens", 96)),
++        temperature=float(TRAINING_CONFIG.get("temperature", 0.7)),
++        top_p=float(TRAINING_CONFIG.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content
++    if not isinstance(content, str):  # pragma: no cover - defensive
++        content = str(content)
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse <solution> ... </solution>
++    xml_error = None
++    expr_text: str | None = None
++    try:
++        # Minimal, robust extraction without bringing XML deps: simple slice
++        # while keeping strict tag names; if missing, this will raise.
++        start_tag = "<solution>"
++        end_tag = "</solution>"
++        start = content.index(start_tag) + len(start_tag)
++        end = content.index(end_tag, start)
++        expr_text = content[start:end].strip()
++        if not expr_text:
++            xml_error = "empty_solution"
++    except Exception:
++        xml_error = "missing_or_malformed_xml"
++
++    if xml_error is not None or expr_text is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = xml_error or "xml_extract_failed"
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = 0.0
++        return trajectory
++
++    # Safe evaluation + rule checks
++    eval_result = safe_eval_arithmetic(expr_text)
++    used_all_digits = numbers_match_episode(eval_result.numbers, (d1, d2, d3, d4))
++
++    if eval_result.error is not None or eval_result.value is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = str(eval_result.error)
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = float(eval_result.op_count)
++        return trajectory
++
++    # Compute closeness and reward
++    abs_error = abs(eval_result.value - TARGET_VALUE)
++    is_exact = abs_error <= EPSILON and used_all_digits
++    if is_exact:
++        reward = EXACT_SOLUTION_REWARD
++    else:
++        reward = _smooth_reward(abs_error, used_all_digits)
++
++    # Metrics (numbers only) and minimal scalar metadata
++    trajectory.reward = float(reward)
++    trajectory.metadata["error"] = ""  # keep scalar-only metadata
++    trajectory.metrics["abs_error"] = float(abs_error)
++    trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++    trajectory.metrics["is_exact"] = 1.0 if is_exact else 0.0
++    trajectory.metrics["invalid_solution"] = 0.0
++    trajectory.metrics["op_count"] = float(eval_result.op_count)
++
++    return trajectory
++
++
+
+[2025-09-20T23:47:11] tokens used: 13,379
+[2025-09-20T23:47:11] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/env.py b/codex_runs/24/gpt-5/20250920_234523/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..258b0cf9f53b0fcba0dd6fc69950aca0e74abd42
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/env.py
+@@ -0,0 +1,206 @@
++"""Minimal environment helpers for the arithmetic game "24" using ART.
++
++This module exposes simple utilities used by rollout.py and a tweakable
++configuration block that mirrors the ergonomics of the 2048 example.
++
++Notes:
++- Assume LocalBackend for inference/training; model memory knobs (e.g.,
++  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
++- The host project supplies the training loop and evaluation entry point.
++"""
++from __future__ import annotations
++
++import ast
++import random
++import string
++from dataclasses import dataclass
++from typing import Iterable, Tuple
++
++
++# ------------------------------
++# Tunables and environment constants
++# ------------------------------
++RANDOM_SEED: int = 42
++TARGET_VALUE: int = 24
++DIGITS_PER_EPISODE: int = 4
++MIN_DIGIT: int = 1
++MAX_DIGIT: int = 9
++EPSILON: float = 1e-6  # Numeric tolerance for equality checks
++CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
++EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
++
++
++# ------------------------------
++# Training configuration consumed by the host trainer
++# ------------------------------
++TRAINING_CONFIG: dict = {
++    # Project + model identity
++    "project": "game-24",
++    "model_name": "agent-24",
++    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
++    # Trainer knobs
++    "steps": 10,
++    "trajectories_per_group": 18,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    # Inference knobs
++    "max_completion_tokens": 96,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Fault tolerance + cleanup
++    "max_exceptions": 18,
++    "cleanup_keep_last": 1,
++}
++
++
++# ------------------------------
++# Helpers
++# ------------------------------
++
++
++def generate_episode_digits() -> Tuple[int, int, int, int]:
++    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
++
++    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
++    """
++
++    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
++
++
++def digits_to_string(digits: Iterable[int]) -> str:
++    """Return a compact string representation suitable for metadata.
++
++    The metadata must avoid lists/dicts for aggregation, so we serialize
++    the digits as a comma-separated string.
++    """
++
++    return ",".join(str(d) for d in digits)
++
++
++def new_episode_id(length: int = 6) -> str:
++    """Generate a short alphanumeric ID for metadata."""
++
++    alphabet = string.ascii_letters + string.digits
++    return "".join(random.choices(alphabet, k=length))
++
++
++@dataclass
++class EvalResult:
++    """Container for a safely evaluated arithmetic expression.
++
++    Attributes
++    -----------
++    value: float | None
++        Numeric value if evaluation succeeded; None otherwise.
++    numbers: tuple[int, ...]
++        All integer literals encountered in the expression (in-order).
++    op_count: int
++        Number of binary operations used in the expression.
++    error: str | None
++        Human-readable error string if evaluation failed.
++    """
++
++    value: float | None
++    numbers: Tuple[int, ...]
++    op_count: int
++    error: str | None
++
++
++def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
++    """Return True if two iterables contain the same elements with counts.
++
++    Implemented without importing collections.Counter to keep the file lean.
++    """
++
++    counts: dict[int, int] = {}
++    for x in a:
++        counts[x] = counts.get(x, 0) + 1
++    for x in b:
++        if x not in counts:
++            return False
++        counts[x] -= 1
++        if counts[x] == 0:
++            del counts[x]
++    return not counts
++
++
++def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
++    """Check that the integer literals exactly match the provided digits."""
++
++    return _multiset_equal(numbers, episode_digits)
++
++
++def safe_eval_arithmetic(expr: str) -> EvalResult:
++    """Safely evaluate a restricted arithmetic expression.
++
++    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
++    Disallows unary operators, function calls, names, and other nodes.
++    Returns a value and metadata about numbers/op count, or an error string.
++    """
++
++    try:
++        node = ast.parse(expr, mode="eval")
++    except SyntaxError as exc:  # pragma: no cover - defensive
++        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
++
++    numbers: list[int] = []
++
++    def eval_node(n: ast.AST) -> float:
++        if isinstance(n, ast.Expression):
++            return eval_node(n.body)
++        if isinstance(n, ast.BinOp):
++            left = eval_node(n.left)
++            right = eval_node(n.right)
++            if isinstance(n.op, ast.Add):
++                return left + right
++            if isinstance(n.op, ast.Sub):
++                return left - right
++            if isinstance(n.op, ast.Mult):
++                return left * right
++            if isinstance(n.op, ast.Div):
++                if abs(right) <= EPSILON:
++                    raise ZeroDivisionError
++                return left / right
++            raise ValueError("unsupported_operator")
++        if isinstance(n, ast.Constant) and isinstance(n.value, int):
++            value = int(n.value)
++            if not (0 <= value <= 9):  # restrict to single digits
++                raise ValueError("non_digit_literal")
++            numbers.append(value)
++            return float(value)
++        # Parentheses are represented structurally in the AST; no explicit node.
++        raise ValueError("unsupported_syntax")
++
++    try:
++        value = eval_node(node)
++        # op_count equals (#numbers - 1) for a valid binary tree over numbers
++        op_count = max(0, len(numbers) - 1)
++        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
++    except ZeroDivisionError:
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
++    except ValueError as exc:  # unsupported syntax, non-digit, etc.
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
++
++
++def render_system_prompt() -> str:
++    """Concise system instructions for the policy.
++
++    Keep this short so the model has headroom for completions during training.
++    """
++
++    return (
++        "You play the arithmetic game '24'. Combine the four given digits "
++        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
++        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
++    )
++
++
++def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
++    """User prompt describing the current episode's digits and format rules."""
++
++    return (
++        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
++        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
++    )
++
++
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rollout.py b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d50154d9d8c9d440e0e12a4aeb59606358bc6073
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+@@ -0,0 +1,160 @@
++"""ART rollout for the arithmetic game "24".
++
++Implements a single-turn rollout that:
++- samples four digits
++- prompts the policy to return <solution>EXPR</solution>
++- validates and evaluates the expression safely
++- logs scalar metadata and numeric metrics
++- computes a shaped reward based on closeness to 24 and rule adherence
++"""
++from __future__ import annotations
++
++import random
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    TARGET_VALUE,
++    CLIPPED_ERROR,
++    EXACT_SOLUTION_REWARD,
++    EPSILON,
++    digits_to_string,
++    generate_episode_digits,
++    new_episode_id,
++    numbers_match_episode,
++    render_system_prompt,
++    render_user_prompt,
++    safe_eval_arithmetic,
++)
++
++
++def _smooth_reward(abs_error: float, used_all_digits: bool) -> float:
++    """Smooth, bounded reward for near-misses.
++
++    Maps zero error -> 1.0, and errors >= CLIPPED_ERROR -> 0.0. Adds a small
++    bonus when the expression uses exactly the given digits to guide learning.
++    """
++
++    base = max(0.0, 1.0 - min(abs_error, CLIPPED_ERROR) / CLIPPED_ERROR)
++    return base + (0.2 if used_all_digits else 0.0)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect one trajectory for the game "24".
++
++    Parameters
++    ----------
++    model: art.Model
++        The model to query for completions.
++    step: int
++        Current training step; included in metadata for aggregation.
++    config: dict[str, Any]
++        Training/inference config forwarded from the host loop.
++    """
++
++    # Deterministic sampling per step (still varied by episode id/draw).
++    random.seed(RANDOM_SEED + step)
++    d1, d2, d3, d4 = generate_episode_digits()
++    digits_str = digits_to_string((d1, d2, d3, d4))
++    episode_id = new_episode_id()
++
++    # System + one user turn (single-step decision problem).
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": render_system_prompt()}],
++        metadata={
++            "notebook-id": "24",  # scalar string for aggregation
++            "project": TRAINING_CONFIG.get("project", "game-24"),
++            "step": step,
++            "episode_id": episode_id,
++            "digits": digits_str,
++        },
++        reward=0.0,
++    )
++
++    user_prompt = render_user_prompt(d1, d2, d3, d4)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++    completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=int(TRAINING_CONFIG.get("max_completion_tokens", 96)),
++        temperature=float(TRAINING_CONFIG.get("temperature", 0.7)),
++        top_p=float(TRAINING_CONFIG.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content
++    if not isinstance(content, str):  # pragma: no cover - defensive
++        content = str(content)
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse <solution> ... </solution>
++    xml_error = None
++    expr_text: str | None = None
++    try:
++        # Minimal, robust extraction without bringing XML deps: simple slice
++        # while keeping strict tag names; if missing, this will raise.
++        start_tag = "<solution>"
++        end_tag = "</solution>"
++        start = content.index(start_tag) + len(start_tag)
++        end = content.index(end_tag, start)
++        expr_text = content[start:end].strip()
++        if not expr_text:
++            xml_error = "empty_solution"
++    except Exception:
++        xml_error = "missing_or_malformed_xml"
++
++    if xml_error is not None or expr_text is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = xml_error or "xml_extract_failed"
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = 0.0
++        return trajectory
++
++    # Safe evaluation + rule checks
++    eval_result = safe_eval_arithmetic(expr_text)
++    used_all_digits = numbers_match_episode(eval_result.numbers, (d1, d2, d3, d4))
++
++    if eval_result.error is not None or eval_result.value is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = str(eval_result.error)
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = float(eval_result.op_count)
++        return trajectory
++
++    # Compute closeness and reward
++    abs_error = abs(eval_result.value - TARGET_VALUE)
++    is_exact = abs_error <= EPSILON and used_all_digits
++    if is_exact:
++        reward = EXACT_SOLUTION_REWARD
++    else:
++        reward = _smooth_reward(abs_error, used_all_digits)
++
++    # Metrics (numbers only) and minimal scalar metadata
++    trajectory.reward = float(reward)
++    trajectory.metadata["error"] = ""  # keep scalar-only metadata
++    trajectory.metrics["abs_error"] = float(abs_error)
++    trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++    trajectory.metrics["is_exact"] = 1.0 if is_exact else 0.0
++    trajectory.metrics["invalid_solution"] = 0.0
++    trajectory.metrics["op_count"] = float(eval_result.op_count)
++
++    return trajectory
++
++
+
+[2025-09-20T23:47:11] codex
+
+**What I added**
+- env.py: Environment helpers and shared config for the “24” game.
+- rollout.py: Single-turn ART rollout that prompts, validates, scores, and logs.
+
+**Key Details**
+- Exposes RANDOM_SEED and TRAINING_CONFIG with all required keys in env.py.
+- Small, reusable helpers with docstrings and type hints:
+  - Digit sampling, ID generation, prompt rendering.
+  - Safe expression evaluation via AST (only +, -, *, / and parentheses; single-digit literals).
+  - Multiset validation to ensure each digit is used exactly once.
+- rollout.py implements:
+  - @weave.op and @art.retry guarded async rollout(model, step, config).
+  - Concise system/user prompts; agent returns <solution>EXPR</solution>.
+  - Defensive parsing; invalid outputs set metadata error and metric invalid_solution = 1.0.
+  - Reward shaping:
+    - EXACT_SOLUTION_REWARD = 2.0 for exact valid 24.
+    - Smooth reward for near misses: base = 1 - clipped_abs_error/24 with bonus for using all digits.
+- Metadata are scalar-only; metrics are numeric only.
+- Assumes LocalBackend; memory-tuning notes are left to host (as in 2048).
+
+**Files**
+- env.py:1
+- rollout.py:1
+
+If you want, I can tune TRAINING_CONFIG for your hardware or adjust reward shaping (e.g., stronger digit-usage penalties or different clipping).
+[2025-09-20T23:47:14] tokens used: 15,494
+[2025-09-20T23:47:14] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/env.py b/codex_runs/24/gpt-5/20250920_234523/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..258b0cf9f53b0fcba0dd6fc69950aca0e74abd42
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/env.py
+@@ -0,0 +1,206 @@
++"""Minimal environment helpers for the arithmetic game "24" using ART.
++
++This module exposes simple utilities used by rollout.py and a tweakable
++configuration block that mirrors the ergonomics of the 2048 example.
++
++Notes:
++- Assume LocalBackend for inference/training; model memory knobs (e.g.,
++  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
++- The host project supplies the training loop and evaluation entry point.
++"""
++from __future__ import annotations
++
++import ast
++import random
++import string
++from dataclasses import dataclass
++from typing import Iterable, Tuple
++
++
++# ------------------------------
++# Tunables and environment constants
++# ------------------------------
++RANDOM_SEED: int = 42
++TARGET_VALUE: int = 24
++DIGITS_PER_EPISODE: int = 4
++MIN_DIGIT: int = 1
++MAX_DIGIT: int = 9
++EPSILON: float = 1e-6  # Numeric tolerance for equality checks
++CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
++EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
++
++
++# ------------------------------
++# Training configuration consumed by the host trainer
++# ------------------------------
++TRAINING_CONFIG: dict = {
++    # Project + model identity
++    "project": "game-24",
++    "model_name": "agent-24",
++    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
++    # Trainer knobs
++    "steps": 10,
++    "trajectories_per_group": 18,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    # Inference knobs
++    "max_completion_tokens": 96,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Fault tolerance + cleanup
++    "max_exceptions": 18,
++    "cleanup_keep_last": 1,
++}
++
++
++# ------------------------------
++# Helpers
++# ------------------------------
++
++
++def generate_episode_digits() -> Tuple[int, int, int, int]:
++    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
++
++    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
++    """
++
++    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
++
++
++def digits_to_string(digits: Iterable[int]) -> str:
++    """Return a compact string representation suitable for metadata.
++
++    The metadata must avoid lists/dicts for aggregation, so we serialize
++    the digits as a comma-separated string.
++    """
++
++    return ",".join(str(d) for d in digits)
++
++
++def new_episode_id(length: int = 6) -> str:
++    """Generate a short alphanumeric ID for metadata."""
++
++    alphabet = string.ascii_letters + string.digits
++    return "".join(random.choices(alphabet, k=length))
++
++
++@dataclass
++class EvalResult:
++    """Container for a safely evaluated arithmetic expression.
++
++    Attributes
++    -----------
++    value: float | None
++        Numeric value if evaluation succeeded; None otherwise.
++    numbers: tuple[int, ...]
++        All integer literals encountered in the expression (in-order).
++    op_count: int
++        Number of binary operations used in the expression.
++    error: str | None
++        Human-readable error string if evaluation failed.
++    """
++
++    value: float | None
++    numbers: Tuple[int, ...]
++    op_count: int
++    error: str | None
++
++
++def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
++    """Return True if two iterables contain the same elements with counts.
++
++    Implemented without importing collections.Counter to keep the file lean.
++    """
++
++    counts: dict[int, int] = {}
++    for x in a:
++        counts[x] = counts.get(x, 0) + 1
++    for x in b:
++        if x not in counts:
++            return False
++        counts[x] -= 1
++        if counts[x] == 0:
++            del counts[x]
++    return not counts
++
++
++def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
++    """Check that the integer literals exactly match the provided digits."""
++
++    return _multiset_equal(numbers, episode_digits)
++
++
++def safe_eval_arithmetic(expr: str) -> EvalResult:
++    """Safely evaluate a restricted arithmetic expression.
++
++    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
++    Disallows unary operators, function calls, names, and other nodes.
++    Returns a value and metadata about numbers/op count, or an error string.
++    """
++
++    try:
++        node = ast.parse(expr, mode="eval")
++    except SyntaxError as exc:  # pragma: no cover - defensive
++        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
++
++    numbers: list[int] = []
++
++    def eval_node(n: ast.AST) -> float:
++        if isinstance(n, ast.Expression):
++            return eval_node(n.body)
++        if isinstance(n, ast.BinOp):
++            left = eval_node(n.left)
++            right = eval_node(n.right)
++            if isinstance(n.op, ast.Add):
++                return left + right
++            if isinstance(n.op, ast.Sub):
++                return left - right
++            if isinstance(n.op, ast.Mult):
++                return left * right
++            if isinstance(n.op, ast.Div):
++                if abs(right) <= EPSILON:
++                    raise ZeroDivisionError
++                return left / right
++            raise ValueError("unsupported_operator")
++        if isinstance(n, ast.Constant) and isinstance(n.value, int):
++            value = int(n.value)
++            if not (0 <= value <= 9):  # restrict to single digits
++                raise ValueError("non_digit_literal")
++            numbers.append(value)
++            return float(value)
++        # Parentheses are represented structurally in the AST; no explicit node.
++        raise ValueError("unsupported_syntax")
++
++    try:
++        value = eval_node(node)
++        # op_count equals (#numbers - 1) for a valid binary tree over numbers
++        op_count = max(0, len(numbers) - 1)
++        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
++    except ZeroDivisionError:
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
++    except ValueError as exc:  # unsupported syntax, non-digit, etc.
++        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
++
++
++def render_system_prompt() -> str:
++    """Concise system instructions for the policy.
++
++    Keep this short so the model has headroom for completions during training.
++    """
++
++    return (
++        "You play the arithmetic game '24'. Combine the four given digits "
++        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
++        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
++    )
++
++
++def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
++    """User prompt describing the current episode's digits and format rules."""
++
++    return (
++        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
++        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
++    )
++
++
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rollout.py b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d50154d9d8c9d440e0e12a4aeb59606358bc6073
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rollout.py
+@@ -0,0 +1,160 @@
++"""ART rollout for the arithmetic game "24".
++
++Implements a single-turn rollout that:
++- samples four digits
++- prompts the policy to return <solution>EXPR</solution>
++- validates and evaluates the expression safely
++- logs scalar metadata and numeric metrics
++- computes a shaped reward based on closeness to 24 and rule adherence
++"""
++from __future__ import annotations
++
++import random
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    TARGET_VALUE,
++    CLIPPED_ERROR,
++    EXACT_SOLUTION_REWARD,
++    EPSILON,
++    digits_to_string,
++    generate_episode_digits,
++    new_episode_id,
++    numbers_match_episode,
++    render_system_prompt,
++    render_user_prompt,
++    safe_eval_arithmetic,
++)
++
++
++def _smooth_reward(abs_error: float, used_all_digits: bool) -> float:
++    """Smooth, bounded reward for near-misses.
++
++    Maps zero error -> 1.0, and errors >= CLIPPED_ERROR -> 0.0. Adds a small
++    bonus when the expression uses exactly the given digits to guide learning.
++    """
++
++    base = max(0.0, 1.0 - min(abs_error, CLIPPED_ERROR) / CLIPPED_ERROR)
++    return base + (0.2 if used_all_digits else 0.0)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect one trajectory for the game "24".
++
++    Parameters
++    ----------
++    model: art.Model
++        The model to query for completions.
++    step: int
++        Current training step; included in metadata for aggregation.
++    config: dict[str, Any]
++        Training/inference config forwarded from the host loop.
++    """
++
++    # Deterministic sampling per step (still varied by episode id/draw).
++    random.seed(RANDOM_SEED + step)
++    d1, d2, d3, d4 = generate_episode_digits()
++    digits_str = digits_to_string((d1, d2, d3, d4))
++    episode_id = new_episode_id()
++
++    # System + one user turn (single-step decision problem).
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": render_system_prompt()}],
++        metadata={
++            "notebook-id": "24",  # scalar string for aggregation
++            "project": TRAINING_CONFIG.get("project", "game-24"),
++            "step": step,
++            "episode_id": episode_id,
++            "digits": digits_str,
++        },
++        reward=0.0,
++    )
++
++    user_prompt = render_user_prompt(d1, d2, d3, d4)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++    completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=int(TRAINING_CONFIG.get("max_completion_tokens", 96)),
++        temperature=float(TRAINING_CONFIG.get("temperature", 0.7)),
++        top_p=float(TRAINING_CONFIG.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content
++    if not isinstance(content, str):  # pragma: no cover - defensive
++        content = str(content)
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse <solution> ... </solution>
++    xml_error = None
++    expr_text: str | None = None
++    try:
++        # Minimal, robust extraction without bringing XML deps: simple slice
++        # while keeping strict tag names; if missing, this will raise.
++        start_tag = "<solution>"
++        end_tag = "</solution>"
++        start = content.index(start_tag) + len(start_tag)
++        end = content.index(end_tag, start)
++        expr_text = content[start:end].strip()
++        if not expr_text:
++            xml_error = "empty_solution"
++    except Exception:
++        xml_error = "missing_or_malformed_xml"
++
++    if xml_error is not None or expr_text is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = xml_error or "xml_extract_failed"
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = 0.0
++        return trajectory
++
++    # Safe evaluation + rule checks
++    eval_result = safe_eval_arithmetic(expr_text)
++    used_all_digits = numbers_match_episode(eval_result.numbers, (d1, d2, d3, d4))
++
++    if eval_result.error is not None or eval_result.value is None:
++        trajectory.reward = -1.0
++        trajectory.metadata["error"] = str(eval_result.error)
++        trajectory.metrics["invalid_solution"] = 1.0
++        trajectory.metrics["abs_error"] = float("inf")
++        trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++        trajectory.metrics["is_exact"] = 0.0
++        trajectory.metrics["op_count"] = float(eval_result.op_count)
++        return trajectory
++
++    # Compute closeness and reward
++    abs_error = abs(eval_result.value - TARGET_VALUE)
++    is_exact = abs_error <= EPSILON and used_all_digits
++    if is_exact:
++        reward = EXACT_SOLUTION_REWARD
++    else:
++        reward = _smooth_reward(abs_error, used_all_digits)
++
++    # Metrics (numbers only) and minimal scalar metadata
++    trajectory.reward = float(reward)
++    trajectory.metadata["error"] = ""  # keep scalar-only metadata
++    trajectory.metrics["abs_error"] = float(abs_error)
++    trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
++    trajectory.metrics["is_exact"] = 1.0 if is_exact else 0.0
++    trajectory.metrics["invalid_solution"] = 0.0
++    trajectory.metrics["op_count"] = float(eval_result.op_count)
++
++    return trajectory
++
++
+

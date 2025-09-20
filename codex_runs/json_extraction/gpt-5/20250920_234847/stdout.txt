@@ -1,0 +1,4018 @@
+[2025-09-20T23:48:47] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/json_extraction/gpt-5/20250920_234847
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-20T23:48:47] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Design an ART reinforcement learning task that extracts structured JSON from unstructured data. The environment should emit a piece of text containing free-form text and metadata fields. You probably want to seed the environment with 10-20 examples. The agent must return a JSON object, ensuring the response is valid JSON and fields follow the prompted schema. Reuse the shared project scaffolding and keep the ergonomics close to the 2048 reference.
+[2025-09-20T23:50:20] codex
+
+I’ll create two files: env.py with task constants, seeded examples, and validation/reward helpers; and rollout.py with the ART rollout function using those helpers. Then I’ll wire rewards and scalar metadata, keeping prompts concise.
+[2025-09-20T23:52:11] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+"""Environment helpers for a minimal JSON-extraction ART task.
+
+This package defines:
+- constants and training hyperparameters surfaced via TRAINING_CONFIG
+- a small bank of unstructured examples with ground-truth labels
+- utilities to build prompts, parse/validate model output, and score rewards
+
+Notes
+- Inference and training are assumed to run on ART's LocalBackend.
+- If you need to install dependencies locally, prefer uv, e.g.:
+  `uv pip install openpipe-art weave openai requests`.
+"""
+from __future__ import annotations
+
+import json
+import random
+import re
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+
+
+# ----------------------------
+# Task constants (easy to tweak)
+# ----------------------------
+RANDOM_SEED: int = 1337
+
+# Minimal training config consumed by the host training loop.
+# Keep values small for fast iteration; adjust as needed.
+TRAINING_CONFIG: dict[str, Any] = {
+    "project": "json-extract-mini",
+    "model_name": "agent-jsonex-001",
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "steps": 24,
+    "trajectories_per_group": 16,
+    "groups_per_step": 1,
+    "learning_rate": 1e-5,
+    "max_completion_tokens": 160,
+    "temperature": 0.3,
+    "top_p": 0.9,
+    "max_exceptions": 32,
+    # Local cleanup behavior mirrors the 2048 example ergonomics.
+    "cleanup_keep_last": True,
+}
+
+
+# ----------------------------
+# Schema and seeded examples
+# ----------------------------
+SCHEMA_DESCRIPTION: str = (
+    "Return only a valid minified JSON object with fields: "
+    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
+    '"total": number, "currency": string, "items_count": integer}. '
+    "Do not include markdown or commentary."
+)
+
+Field = Dict[str, Any]
+Example = Dict[str, Any]
+
+
+EXAMPLES: list[Example] = [
+    {
+        "id": "ex-001",
+        "text": (
+            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
+            "Amount due: USD $1,234.50 for 3 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1001",
+            "customer": "Acme Corp",
+            "date": "2024-03-05",
+            "total": 1234.50,
+            "currency": "USD",
+            "items_count": 3,
+        },
+    },
+    {
+        "id": "ex-002",
+        "text": (
+            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
+            "Total €2,999.00 with 5 line items."
+        ),
+        "label": {
+            "invoice_id": "INV-1002",
+            "customer": "Globex",
+            "date": "2024-04-17",
+            "total": 2999.00,
+            "currency": "EUR",
+            "items_count": 5,
+        },
+    },
+    {
+        "id": "ex-003",
+        "text": (
+            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
+            "items count: 2."
+        ),
+        "label": {
+            "invoice_id": "INV-1003",
+            "customer": "Initech",
+            "date": "2024-04-17",
+            "total": 420.75,
+            "currency": "GBP",
+            "items_count": 2,
+        },
+    },
+    {
+        "id": "ex-004",
+        "text": (
+            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
+            "4 items"
+        ),
+        "label": {
+            "invoice_id": "INV-1004",
+            "customer": "Umbrella Co.",
+            "date": "2024-05-02",
+            "total": 58000.0,
+            "currency": "JPY",
+            "items_count": 4,
+        },
+    },
+    {
+        "id": "ex-005",
+        "text": (
+            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
+            "Items: 1."
+        ),
+        "label": {
+            "invoice_id": "INV-1005",
+            "customer": "Contoso Ltd",
+            "date": "2024-05-10",
+            "total": 75.00,
+            "currency": "USD",
+            "items_count": 1,
+        },
+    },
+    {
+        "id": "ex-006",
+        "text": (
+            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
+            "there are 6 items listed."
+        ),
+        "label": {
+            "invoice_id": "INV-1006",
+            "customer": "Wayne Enterprises",
+            "date": "2024-06-10",
+            "total": 1050.0,
+            "currency": "AUD",
+            "items_count": 6,
+        },
+    },
+    {
+        "id": "ex-007",
+        "text": (
+            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
+            "Amount: CAD 12,345.67 for 8 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1007",
+            "customer": "Stark Industries",
+            "date": "2024-06-11",
+            "total": 12345.67,
+            "currency": "CAD",
+            "items_count": 8,
+        },
+    },
+    {
+        "id": "ex-008",
+        "text": (
+            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
+        ),
+        "label": {
+            "invoice_id": "INV-1008",
+            "customer": "MegaCorp",
+            "date": "2024-06-15",
+            "total": 980.40,
+            "currency": "CHF",
+            "items_count": 2,
+        },
+    },
+    {
+        "id": "ex-009",
+        "text": (
+            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
+            "Total payable: 2,250.00 MXN for 5 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1009",
+            "customer": "Soylent Corp",
+            "date": "2024-07-15",
+            "total": 2250.0,
+            "currency": "MXN",
+            "items_count": 5,
+        },
+    },
+    {
+        "id": "ex-010",
+        "text": (
+            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
+            "Amount ZAR 7,700.00; 7 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1010",
+            "customer": "Black Mesa Research Facility",
+            "date": "2024-07-20",
+            "total": 7700.0,
+            "currency": "ZAR",
+            "items_count": 7,
+        },
+    },
+    {
+        "id": "ex-011",
+        "text": (
+            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
+        ),
+        "label": {
+            "invoice_id": "INV-1011",
+            "customer": "Aperture Science",
+            "date": "2024-08-01",
+            "total": 1240.50,
+            "currency": "NOK",
+            "items_count": 3,
+        },
+    },
+    {
+        "id": "ex-012",
+        "text": (
+            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
+        ),
+        "label": {
+            "invoice_id": "INV-1012",
+            "customer": "Oceanic Airlines",
+            "date": "2024-08-15",
+            "total": 2100.0,
+            "currency": "SGD",
+            "items_count": 4,
+        },
+    },
+    {
+        "id": "ex-013",
+        "text": (
+            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1013",
+            "customer": "Hooli",
+            "date": "2024-09-01",
+            "total": 3300.0,
+            "currency": "BRL",
+            "items_count": 9,
+        },
+    },
+    {
+        "id": "ex-014",
+        "text": (
+            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
+            "Total due: 1,500.25 USD; items=2."
+        ),
+        "label": {
+            "invoice_id": "INV-1014",
+            "customer": "Tyrell Corporation",
+            "date": "2024-09-02",
+            "total": 1500.25,
+            "currency": "USD",
+            "items_count": 2,
+        },
+    },
+    {
+        "id": "ex-015",
+        "text": (
+            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
+        ),
+        "label": {
+            "invoice_id": "INV-1015",
+            "customer": "Cyberdyne Systems",
+            "date": "2024-09-20",
+            "total": 850000.0,
+            "currency": "KRW",
+            "items_count": 10,
+        },
+    },
+]
+
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def get_rng(step: int) -> random.Random:
+    """Deterministic RNG per step for stable sampling."""
+    return random.Random(RANDOM_SEED + int(step))
+
+
+def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
+    """Pick an example index deterministically from `EXAMPLES`.
+
+    Uses step to create a stable cycle with minor randomness.
+    """
+    if not EXAMPLES:
+        raise RuntimeError("No seeded examples available")
+    base = step % len(EXAMPLES)
+    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
+    idx = (base + jitter) % len(EXAMPLES)
+    return idx, EXAMPLES[idx]
+
+
+def build_user_prompt(example: Example) -> str:
+    """Construct a concise user prompt for the extraction task."""
+    return (
+        "Extract the requested fields from the text.\n"
+        f"Schema: {SCHEMA_DESCRIPTION}\n"
+        "Text:\n" + example["text"]
+    )
+
+
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
+
+
+def _strip_code_fences(text: str) -> str:
+    return _CODE_FENCE_RE.sub("", text).strip()
+
+
+def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Attempt to parse a JSON object from arbitrary model output.
+
+    Returns (payload, error). `payload` is None when parsing fails.
+    """
+    raw = _strip_code_fences(text)
+    # First try: direct parse
+    try:
+        val = json.loads(raw)
+        if isinstance(val, dict):
+            return val, None
+        return None, "not_a_object"
+    except Exception:
+        pass
+
+    # Second try: bracket slicing from first '{' to last '}'
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = raw[start : end + 1]
+        try:
+            val = json.loads(snippet)
+            if isinstance(val, dict):
+                return val, None
+            return None, "not_a_object"
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, f"json_parse_error:{type(exc).__name__}"
+
+    return None, "no_braces_found"
+
+
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%Y.%m.%d",
+    "%d-%m-%Y",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%d %b %Y",
+    "%d %B %Y",
+    "%Y.%m.%d",
+)
+
+
+def normalize_date(value: Any) -> Optional[str]:
+    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
+    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return None
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        # Remove currency symbols and thousands separators
+        s = s.replace(",", "").replace(" ", "")
+        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):  # avoid True/False as ints
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        s = re.sub(r"[^0-9-]", "", s)
+        try:
+            return int(s)
+        except Exception:
+            return None
+    return None
+
+
+def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
+    """Score a prediction against ground truth with dense shaping.
+
+    Reward components (0..1 each):
+    - valid_json: 1 if object present (caller should set); included here for completeness
+    - coverage: fraction of required fields present
+    - type_score: fraction of fields coercible to the right type
+    - value_score: average per-field correctness; total uses smooth relative error
+
+    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
+    """
+    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
+
+    present = {k: (k in pred) for k in required}
+    coverage = sum(1.0 for k in required if present[k]) / len(required)
+
+    # Coerce and normalize
+    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
+    customer = pred.get("customer") if present["customer"] else None
+    date_norm = normalize_date(pred.get("date")) if present["date"] else None
+    total_val = _to_float(pred.get("total")) if present["total"] else None
+    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
+    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
+
+    type_ok = {
+        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
+        "customer": isinstance(customer, str) and bool(customer.strip()),
+        "date": isinstance(date_norm, str),
+        "total": isinstance(total_val, float),
+        "currency": isinstance(currency, str) and len(currency) >= 3,
+        "items_count": isinstance(items_count, int),
+    }
+    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
+
+    # Truth values
+    t_id = truth["invoice_id"]
+    t_customer = truth["customer"]
+    t_date = truth["date"]
+    t_total = float(truth["total"])  # already canonical
+    t_curr = truth["currency"].upper()
+    t_items = int(truth["items_count"])
+
+    # Per-field correctness (0/1), except total which is smooth
+    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
+    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
+    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
+    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
+    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
+
+    # Smooth score for total based on relative error
+    if type_ok["total"]:
+        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
+        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
+    else:
+        rel_err = 1.0
+        total_score = 0.0
+
+    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
+
+    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
+    valid_json = 1.0 if coverage > 0 else 0.0
+    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
+
+    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
+
+    metrics = {
+        "valid_json": float(valid_json),
+        "field_coverage": float(coverage),
+        "type_score": float(type_score),
+        "value_score": float(value_score),
+        "exact_match": float(exact_match),
+        "total_rel_error": float(rel_err),
+    }
+
+    # Validation error summary string for metadata (scalar-only constraint)
+    missing = [k for k in required if not present[k]]
+    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
+    valerr: Optional[str]
+    if missing:
+        valerr = f"missing:{','.join(missing)[:80]}"
+    elif wrong_types:
+        valerr = f"types:{','.join(wrong_types)[:80]}"
+    else:
+        valerr = None
+
+    return reward, metrics, valerr
+
+
+# ----------------------------
+# System prompt (concise)
+# ----------------------------
+SYSTEM_PROMPT: str = (
+    "You are a precise information extraction model. "
+    "Extract the requested fields and answer with only a valid JSON object. "
+    "Use exact schema and types; no extra keys, no commentary."
+)
+
+[2025-09-20T23:52:11] apply_patch(auto_approved=true) exited 0 in 5ms:
+Success. Updated the following files:
+A env.py
+[2025-09-20T23:52:11] turn diff:
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/env.py b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104b93f468f9444ce81e28aba6aa56c455473a0
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+@@ -0,0 +1,513 @@
++"""Environment helpers for a minimal JSON-extraction ART task.
++
++This package defines:
++- constants and training hyperparameters surfaced via TRAINING_CONFIG
++- a small bank of unstructured examples with ground-truth labels
++- utilities to build prompts, parse/validate model output, and score rewards
++
++Notes
++- Inference and training are assumed to run on ART's LocalBackend.
++- If you need to install dependencies locally, prefer uv, e.g.:
++  `uv pip install openpipe-art weave openai requests`.
++"""
++from __future__ import annotations
++
++import json
++import random
++import re
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++
++# ----------------------------
++# Task constants (easy to tweak)
++# ----------------------------
++RANDOM_SEED: int = 1337
++
++# Minimal training config consumed by the host training loop.
++# Keep values small for fast iteration; adjust as needed.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "json-extract-mini",
++    "model_name": "agent-jsonex-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 24,
++    "trajectories_per_group": 16,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 160,
++    "temperature": 0.3,
++    "top_p": 0.9,
++    "max_exceptions": 32,
++    # Local cleanup behavior mirrors the 2048 example ergonomics.
++    "cleanup_keep_last": True,
++}
++
++
++# ----------------------------
++# Schema and seeded examples
++# ----------------------------
++SCHEMA_DESCRIPTION: str = (
++    "Return only a valid minified JSON object with fields: "
++    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
++    '"total": number, "currency": string, "items_count": integer}. '
++    "Do not include markdown or commentary."
++)
++
++Field = Dict[str, Any]
++Example = Dict[str, Any]
++
++
++EXAMPLES: list[Example] = [
++    {
++        "id": "ex-001",
++        "text": (
++            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
++            "Amount due: USD $1,234.50 for 3 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1001",
++            "customer": "Acme Corp",
++            "date": "2024-03-05",
++            "total": 1234.50,
++            "currency": "USD",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-002",
++        "text": (
++            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
++            "Total €2,999.00 with 5 line items."
++        ),
++        "label": {
++            "invoice_id": "INV-1002",
++            "customer": "Globex",
++            "date": "2024-04-17",
++            "total": 2999.00,
++            "currency": "EUR",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-003",
++        "text": (
++            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
++            "items count: 2."
++        ),
++        "label": {
++            "invoice_id": "INV-1003",
++            "customer": "Initech",
++            "date": "2024-04-17",
++            "total": 420.75,
++            "currency": "GBP",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-004",
++        "text": (
++            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
++            "4 items"
++        ),
++        "label": {
++            "invoice_id": "INV-1004",
++            "customer": "Umbrella Co.",
++            "date": "2024-05-02",
++            "total": 58000.0,
++            "currency": "JPY",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-005",
++        "text": (
++            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
++            "Items: 1."
++        ),
++        "label": {
++            "invoice_id": "INV-1005",
++            "customer": "Contoso Ltd",
++            "date": "2024-05-10",
++            "total": 75.00,
++            "currency": "USD",
++            "items_count": 1,
++        },
++    },
++    {
++        "id": "ex-006",
++        "text": (
++            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
++            "there are 6 items listed."
++        ),
++        "label": {
++            "invoice_id": "INV-1006",
++            "customer": "Wayne Enterprises",
++            "date": "2024-06-10",
++            "total": 1050.0,
++            "currency": "AUD",
++            "items_count": 6,
++        },
++    },
++    {
++        "id": "ex-007",
++        "text": (
++            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
++            "Amount: CAD 12,345.67 for 8 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1007",
++            "customer": "Stark Industries",
++            "date": "2024-06-11",
++            "total": 12345.67,
++            "currency": "CAD",
++            "items_count": 8,
++        },
++    },
++    {
++        "id": "ex-008",
++        "text": (
++            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
++        ),
++        "label": {
++            "invoice_id": "INV-1008",
++            "customer": "MegaCorp",
++            "date": "2024-06-15",
++            "total": 980.40,
++            "currency": "CHF",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-009",
++        "text": (
++            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
++            "Total payable: 2,250.00 MXN for 5 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1009",
++            "customer": "Soylent Corp",
++            "date": "2024-07-15",
++            "total": 2250.0,
++            "currency": "MXN",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-010",
++        "text": (
++            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
++            "Amount ZAR 7,700.00; 7 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1010",
++            "customer": "Black Mesa Research Facility",
++            "date": "2024-07-20",
++            "total": 7700.0,
++            "currency": "ZAR",
++            "items_count": 7,
++        },
++    },
++    {
++        "id": "ex-011",
++        "text": (
++            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
++        ),
++        "label": {
++            "invoice_id": "INV-1011",
++            "customer": "Aperture Science",
++            "date": "2024-08-01",
++            "total": 1240.50,
++            "currency": "NOK",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-012",
++        "text": (
++            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
++        ),
++        "label": {
++            "invoice_id": "INV-1012",
++            "customer": "Oceanic Airlines",
++            "date": "2024-08-15",
++            "total": 2100.0,
++            "currency": "SGD",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-013",
++        "text": (
++            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1013",
++            "customer": "Hooli",
++            "date": "2024-09-01",
++            "total": 3300.0,
++            "currency": "BRL",
++            "items_count": 9,
++        },
++    },
++    {
++        "id": "ex-014",
++        "text": (
++            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
++            "Total due: 1,500.25 USD; items=2."
++        ),
++        "label": {
++            "invoice_id": "INV-1014",
++            "customer": "Tyrell Corporation",
++            "date": "2024-09-02",
++            "total": 1500.25,
++            "currency": "USD",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-015",
++        "text": (
++            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1015",
++            "customer": "Cyberdyne Systems",
++            "date": "2024-09-20",
++            "total": 850000.0,
++            "currency": "KRW",
++            "items_count": 10,
++        },
++    },
++]
++
++
++# ----------------------------
++# Helper functions
++# ----------------------------
++def get_rng(step: int) -> random.Random:
++    """Deterministic RNG per step for stable sampling."""
++    return random.Random(RANDOM_SEED + int(step))
++
++
++def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
++    """Pick an example index deterministically from `EXAMPLES`.
++
++    Uses step to create a stable cycle with minor randomness.
++    """
++    if not EXAMPLES:
++        raise RuntimeError("No seeded examples available")
++    base = step % len(EXAMPLES)
++    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
++    idx = (base + jitter) % len(EXAMPLES)
++    return idx, EXAMPLES[idx]
++
++
++def build_user_prompt(example: Example) -> str:
++    """Construct a concise user prompt for the extraction task."""
++    return (
++        "Extract the requested fields from the text.\n"
++        f"Schema: {SCHEMA_DESCRIPTION}\n"
++        "Text:\n" + example["text"]
++    )
++
++
++_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
++
++
++def _strip_code_fences(text: str) -> str:
++    return _CODE_FENCE_RE.sub("", text).strip()
++
++
++def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Attempt to parse a JSON object from arbitrary model output.
++
++    Returns (payload, error). `payload` is None when parsing fails.
++    """
++    raw = _strip_code_fences(text)
++    # First try: direct parse
++    try:
++        val = json.loads(raw)
++        if isinstance(val, dict):
++            return val, None
++        return None, "not_a_object"
++    except Exception:
++        pass
++
++    # Second try: bracket slicing from first '{' to last '}'
++    start = raw.find("{")
++    end = raw.rfind("}")
++    if start != -1 and end != -1 and end > start:
++        snippet = raw[start : end + 1]
++        try:
++            val = json.loads(snippet)
++            if isinstance(val, dict):
++                return val, None
++            return None, "not_a_object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, f"json_parse_error:{type(exc).__name__}"
++
++    return None, "no_braces_found"
++
++
++_DATE_FORMATS = (
++    "%Y-%m-%d",
++    "%Y/%m/%d",
++    "%d/%m/%Y",
++    "%m/%d/%Y",
++    "%Y.%m.%d",
++    "%d-%m-%Y",
++    "%b %d, %Y",
++    "%B %d, %Y",
++    "%d %b %Y",
++    "%d %B %Y",
++    "%Y.%m.%d",
++)
++
++
++def normalize_date(value: Any) -> Optional[str]:
++    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
++    if not isinstance(value, str):
++        return None
++    s = value.strip()
++    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
++    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
++    for fmt in _DATE_FORMATS:
++        try:
++            dt = datetime.strptime(s, fmt)
++            return dt.strftime("%Y-%m-%d")
++        except Exception:
++            continue
++    return None
++
++
++def _to_float(value: Any) -> Optional[float]:
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        s = value.strip()
++        # Remove currency symbols and thousands separators
++        s = s.replace(",", "").replace(" ", "")
++        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
++        try:
++            return float(s)
++        except Exception:
++            return None
++    return None
++
++
++def _to_int(value: Any) -> Optional[int]:
++    if isinstance(value, bool):  # avoid True/False as ints
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, float):
++        if value.is_integer():
++            return int(value)
++        return None
++    if isinstance(value, str):
++        s = value.strip()
++        s = re.sub(r"[^0-9-]", "", s)
++        try:
++            return int(s)
++        except Exception:
++            return None
++    return None
++
++
++def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
++    """Score a prediction against ground truth with dense shaping.
++
++    Reward components (0..1 each):
++    - valid_json: 1 if object present (caller should set); included here for completeness
++    - coverage: fraction of required fields present
++    - type_score: fraction of fields coercible to the right type
++    - value_score: average per-field correctness; total uses smooth relative error
++
++    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
++    """
++    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
++
++    present = {k: (k in pred) for k in required}
++    coverage = sum(1.0 for k in required if present[k]) / len(required)
++
++    # Coerce and normalize
++    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
++    customer = pred.get("customer") if present["customer"] else None
++    date_norm = normalize_date(pred.get("date")) if present["date"] else None
++    total_val = _to_float(pred.get("total")) if present["total"] else None
++    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
++    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
++
++    type_ok = {
++        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
++        "customer": isinstance(customer, str) and bool(customer.strip()),
++        "date": isinstance(date_norm, str),
++        "total": isinstance(total_val, float),
++        "currency": isinstance(currency, str) and len(currency) >= 3,
++        "items_count": isinstance(items_count, int),
++    }
++    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
++
++    # Truth values
++    t_id = truth["invoice_id"]
++    t_customer = truth["customer"]
++    t_date = truth["date"]
++    t_total = float(truth["total"])  # already canonical
++    t_curr = truth["currency"].upper()
++    t_items = int(truth["items_count"])
++
++    # Per-field correctness (0/1), except total which is smooth
++    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
++    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
++    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
++    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
++    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
++
++    # Smooth score for total based on relative error
++    if type_ok["total"]:
++        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
++        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
++    else:
++        rel_err = 1.0
++        total_score = 0.0
++
++    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
++
++    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
++    valid_json = 1.0 if coverage > 0 else 0.0
++    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
++
++    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
++
++    metrics = {
++        "valid_json": float(valid_json),
++        "field_coverage": float(coverage),
++        "type_score": float(type_score),
++        "value_score": float(value_score),
++        "exact_match": float(exact_match),
++        "total_rel_error": float(rel_err),
++    }
++
++    # Validation error summary string for metadata (scalar-only constraint)
++    missing = [k for k in required if not present[k]]
++    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
++    valerr: Optional[str]
++    if missing:
++        valerr = f"missing:{','.join(missing)[:80]}"
++    elif wrong_types:
++        valerr = f"types:{','.join(wrong_types)[:80]}"
++    else:
++        valerr = None
++
++    return reward, metrics, valerr
++
++
++# ----------------------------
++# System prompt (concise)
++# ----------------------------
++SYSTEM_PROMPT: str = (
++    "You are a precise information extraction model. "
++    "Extract the requested fields and answer with only a valid JSON object. "
++    "Use exact schema and types; no extra keys, no commentary."
++)
++
+
+[2025-09-20T23:52:11] tokens used: 13,706
+[2025-09-20T23:52:11] turn diff:
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/env.py b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104b93f468f9444ce81e28aba6aa56c455473a0
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+@@ -0,0 +1,513 @@
++"""Environment helpers for a minimal JSON-extraction ART task.
++
++This package defines:
++- constants and training hyperparameters surfaced via TRAINING_CONFIG
++- a small bank of unstructured examples with ground-truth labels
++- utilities to build prompts, parse/validate model output, and score rewards
++
++Notes
++- Inference and training are assumed to run on ART's LocalBackend.
++- If you need to install dependencies locally, prefer uv, e.g.:
++  `uv pip install openpipe-art weave openai requests`.
++"""
++from __future__ import annotations
++
++import json
++import random
++import re
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++
++# ----------------------------
++# Task constants (easy to tweak)
++# ----------------------------
++RANDOM_SEED: int = 1337
++
++# Minimal training config consumed by the host training loop.
++# Keep values small for fast iteration; adjust as needed.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "json-extract-mini",
++    "model_name": "agent-jsonex-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 24,
++    "trajectories_per_group": 16,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 160,
++    "temperature": 0.3,
++    "top_p": 0.9,
++    "max_exceptions": 32,
++    # Local cleanup behavior mirrors the 2048 example ergonomics.
++    "cleanup_keep_last": True,
++}
++
++
++# ----------------------------
++# Schema and seeded examples
++# ----------------------------
++SCHEMA_DESCRIPTION: str = (
++    "Return only a valid minified JSON object with fields: "
++    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
++    '"total": number, "currency": string, "items_count": integer}. '
++    "Do not include markdown or commentary."
++)
++
++Field = Dict[str, Any]
++Example = Dict[str, Any]
++
++
++EXAMPLES: list[Example] = [
++    {
++        "id": "ex-001",
++        "text": (
++            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
++            "Amount due: USD $1,234.50 for 3 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1001",
++            "customer": "Acme Corp",
++            "date": "2024-03-05",
++            "total": 1234.50,
++            "currency": "USD",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-002",
++        "text": (
++            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
++            "Total €2,999.00 with 5 line items."
++        ),
++        "label": {
++            "invoice_id": "INV-1002",
++            "customer": "Globex",
++            "date": "2024-04-17",
++            "total": 2999.00,
++            "currency": "EUR",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-003",
++        "text": (
++            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
++            "items count: 2."
++        ),
++        "label": {
++            "invoice_id": "INV-1003",
++            "customer": "Initech",
++            "date": "2024-04-17",
++            "total": 420.75,
++            "currency": "GBP",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-004",
++        "text": (
++            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
++            "4 items"
++        ),
++        "label": {
++            "invoice_id": "INV-1004",
++            "customer": "Umbrella Co.",
++            "date": "2024-05-02",
++            "total": 58000.0,
++            "currency": "JPY",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-005",
++        "text": (
++            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
++            "Items: 1."
++        ),
++        "label": {
++            "invoice_id": "INV-1005",
++            "customer": "Contoso Ltd",
++            "date": "2024-05-10",
++            "total": 75.00,
++            "currency": "USD",
++            "items_count": 1,
++        },
++    },
++    {
++        "id": "ex-006",
++        "text": (
++            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
++            "there are 6 items listed."
++        ),
++        "label": {
++            "invoice_id": "INV-1006",
++            "customer": "Wayne Enterprises",
++            "date": "2024-06-10",
++            "total": 1050.0,
++            "currency": "AUD",
++            "items_count": 6,
++        },
++    },
++    {
++        "id": "ex-007",
++        "text": (
++            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
++            "Amount: CAD 12,345.67 for 8 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1007",
++            "customer": "Stark Industries",
++            "date": "2024-06-11",
++            "total": 12345.67,
++            "currency": "CAD",
++            "items_count": 8,
++        },
++    },
++    {
++        "id": "ex-008",
++        "text": (
++            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
++        ),
++        "label": {
++            "invoice_id": "INV-1008",
++            "customer": "MegaCorp",
++            "date": "2024-06-15",
++            "total": 980.40,
++            "currency": "CHF",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-009",
++        "text": (
++            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
++            "Total payable: 2,250.00 MXN for 5 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1009",
++            "customer": "Soylent Corp",
++            "date": "2024-07-15",
++            "total": 2250.0,
++            "currency": "MXN",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-010",
++        "text": (
++            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
++            "Amount ZAR 7,700.00; 7 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1010",
++            "customer": "Black Mesa Research Facility",
++            "date": "2024-07-20",
++            "total": 7700.0,
++            "currency": "ZAR",
++            "items_count": 7,
++        },
++    },
++    {
++        "id": "ex-011",
++        "text": (
++            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
++        ),
++        "label": {
++            "invoice_id": "INV-1011",
++            "customer": "Aperture Science",
++            "date": "2024-08-01",
++            "total": 1240.50,
++            "currency": "NOK",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-012",
++        "text": (
++            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
++        ),
++        "label": {
++            "invoice_id": "INV-1012",
++            "customer": "Oceanic Airlines",
++            "date": "2024-08-15",
++            "total": 2100.0,
++            "currency": "SGD",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-013",
++        "text": (
++            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1013",
++            "customer": "Hooli",
++            "date": "2024-09-01",
++            "total": 3300.0,
++            "currency": "BRL",
++            "items_count": 9,
++        },
++    },
++    {
++        "id": "ex-014",
++        "text": (
++            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
++            "Total due: 1,500.25 USD; items=2."
++        ),
++        "label": {
++            "invoice_id": "INV-1014",
++            "customer": "Tyrell Corporation",
++            "date": "2024-09-02",
++            "total": 1500.25,
++            "currency": "USD",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-015",
++        "text": (
++            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1015",
++            "customer": "Cyberdyne Systems",
++            "date": "2024-09-20",
++            "total": 850000.0,
++            "currency": "KRW",
++            "items_count": 10,
++        },
++    },
++]
++
++
++# ----------------------------
++# Helper functions
++# ----------------------------
++def get_rng(step: int) -> random.Random:
++    """Deterministic RNG per step for stable sampling."""
++    return random.Random(RANDOM_SEED + int(step))
++
++
++def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
++    """Pick an example index deterministically from `EXAMPLES`.
++
++    Uses step to create a stable cycle with minor randomness.
++    """
++    if not EXAMPLES:
++        raise RuntimeError("No seeded examples available")
++    base = step % len(EXAMPLES)
++    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
++    idx = (base + jitter) % len(EXAMPLES)
++    return idx, EXAMPLES[idx]
++
++
++def build_user_prompt(example: Example) -> str:
++    """Construct a concise user prompt for the extraction task."""
++    return (
++        "Extract the requested fields from the text.\n"
++        f"Schema: {SCHEMA_DESCRIPTION}\n"
++        "Text:\n" + example["text"]
++    )
++
++
++_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
++
++
++def _strip_code_fences(text: str) -> str:
++    return _CODE_FENCE_RE.sub("", text).strip()
++
++
++def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Attempt to parse a JSON object from arbitrary model output.
++
++    Returns (payload, error). `payload` is None when parsing fails.
++    """
++    raw = _strip_code_fences(text)
++    # First try: direct parse
++    try:
++        val = json.loads(raw)
++        if isinstance(val, dict):
++            return val, None
++        return None, "not_a_object"
++    except Exception:
++        pass
++
++    # Second try: bracket slicing from first '{' to last '}'
++    start = raw.find("{")
++    end = raw.rfind("}")
++    if start != -1 and end != -1 and end > start:
++        snippet = raw[start : end + 1]
++        try:
++            val = json.loads(snippet)
++            if isinstance(val, dict):
++                return val, None
++            return None, "not_a_object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, f"json_parse_error:{type(exc).__name__}"
++
++    return None, "no_braces_found"
++
++
++_DATE_FORMATS = (
++    "%Y-%m-%d",
++    "%Y/%m/%d",
++    "%d/%m/%Y",
++    "%m/%d/%Y",
++    "%Y.%m.%d",
++    "%d-%m-%Y",
++    "%b %d, %Y",
++    "%B %d, %Y",
++    "%d %b %Y",
++    "%d %B %Y",
++    "%Y.%m.%d",
++)
++
++
++def normalize_date(value: Any) -> Optional[str]:
++    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
++    if not isinstance(value, str):
++        return None
++    s = value.strip()
++    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
++    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
++    for fmt in _DATE_FORMATS:
++        try:
++            dt = datetime.strptime(s, fmt)
++            return dt.strftime("%Y-%m-%d")
++        except Exception:
++            continue
++    return None
++
++
++def _to_float(value: Any) -> Optional[float]:
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        s = value.strip()
++        # Remove currency symbols and thousands separators
++        s = s.replace(",", "").replace(" ", "")
++        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
++        try:
++            return float(s)
++        except Exception:
++            return None
++    return None
++
++
++def _to_int(value: Any) -> Optional[int]:
++    if isinstance(value, bool):  # avoid True/False as ints
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, float):
++        if value.is_integer():
++            return int(value)
++        return None
++    if isinstance(value, str):
++        s = value.strip()
++        s = re.sub(r"[^0-9-]", "", s)
++        try:
++            return int(s)
++        except Exception:
++            return None
++    return None
++
++
++def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
++    """Score a prediction against ground truth with dense shaping.
++
++    Reward components (0..1 each):
++    - valid_json: 1 if object present (caller should set); included here for completeness
++    - coverage: fraction of required fields present
++    - type_score: fraction of fields coercible to the right type
++    - value_score: average per-field correctness; total uses smooth relative error
++
++    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
++    """
++    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
++
++    present = {k: (k in pred) for k in required}
++    coverage = sum(1.0 for k in required if present[k]) / len(required)
++
++    # Coerce and normalize
++    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
++    customer = pred.get("customer") if present["customer"] else None
++    date_norm = normalize_date(pred.get("date")) if present["date"] else None
++    total_val = _to_float(pred.get("total")) if present["total"] else None
++    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
++    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
++
++    type_ok = {
++        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
++        "customer": isinstance(customer, str) and bool(customer.strip()),
++        "date": isinstance(date_norm, str),
++        "total": isinstance(total_val, float),
++        "currency": isinstance(currency, str) and len(currency) >= 3,
++        "items_count": isinstance(items_count, int),
++    }
++    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
++
++    # Truth values
++    t_id = truth["invoice_id"]
++    t_customer = truth["customer"]
++    t_date = truth["date"]
++    t_total = float(truth["total"])  # already canonical
++    t_curr = truth["currency"].upper()
++    t_items = int(truth["items_count"])
++
++    # Per-field correctness (0/1), except total which is smooth
++    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
++    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
++    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
++    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
++    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
++
++    # Smooth score for total based on relative error
++    if type_ok["total"]:
++        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
++        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
++    else:
++        rel_err = 1.0
++        total_score = 0.0
++
++    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
++
++    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
++    valid_json = 1.0 if coverage > 0 else 0.0
++    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
++
++    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
++
++    metrics = {
++        "valid_json": float(valid_json),
++        "field_coverage": float(coverage),
++        "type_score": float(type_score),
++        "value_score": float(value_score),
++        "exact_match": float(exact_match),
++        "total_rel_error": float(rel_err),
++    }
++
++    # Validation error summary string for metadata (scalar-only constraint)
++    missing = [k for k in required if not present[k]]
++    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
++    valerr: Optional[str]
++    if missing:
++        valerr = f"missing:{','.join(missing)[:80]}"
++    elif wrong_types:
++        valerr = f"types:{','.join(wrong_types)[:80]}"
++    else:
++        valerr = None
++
++    return reward, metrics, valerr
++
++
++# ----------------------------
++# System prompt (concise)
++# ----------------------------
++SYSTEM_PROMPT: str = (
++    "You are a precise information extraction model. "
++    "Extract the requested fields and answer with only a valid JSON object. "
++    "Use exact schema and types; no extra keys, no commentary."
++)
++
+
+[2025-09-20T23:52:36] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+"""ART rollout for the JSON extraction environment.
+
+Implements a single-turn rollout that:
+- builds a concise system/user prompt
+- queries the model via the ART LocalBackend-compatible API surface
+- parses and validates structured output
+- logs scalar-only metadata and numeric metrics
+
+Reward shaping mirrors best practices: valid JSON, coverage, types, and
+value accuracy (with a smooth term for numeric closeness).
+"""
+from __future__ import annotations
+
+import requests
+import weave
+import art
+from typing import Any
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    SYSTEM_PROMPT,
+    get_rng,
+    pick_example,
+    build_user_prompt,
+    extract_json_object,
+    compute_reward,
+    EXAMPLES,
+)
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Single-step rollout for JSON extraction.
+
+    Parameters
+    - model: ART model handle (assumed LocalBackend for training/inference)
+    - step: current training step
+    - config: training config dict allowing overrides of generation params
+    """
+    rng = get_rng(step)
+    ex_idx, example = pick_example(step, rng)
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": SYSTEM_PROMPT}],
+        metadata={
+            "task": "json_extraction",
+            "project": str(TRAINING_CONFIG.get("project", "json-extract")),
+            "step": int(step),
+            "example_index": int(ex_idx),
+            "example_id": str(example["id"]),
+        },
+        reward=0.0,
+    )
+
+    user_prompt = build_user_prompt(example)
+    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
+
+    # LocalBackend-compatible OpenAI transport (as in 2048 example)
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    # Allow host config to override generation knobs
+    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
+    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
+    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
+
+    chat_completion = await client.chat.completions.create(
+        messages=trajectory.messages(),
+        model=model.name,
+        max_completion_tokens=max_tokens,
+        stream=False,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    choice = chat_completion.choices[0]
+    content = choice.message.content or ""
+    trajectory.messages_and_choices.append(choice)
+
+    payload, parse_err = extract_json_object(content)
+
+    # Defensive validation + reward
+    truth = example["label"]
+    if payload is None:
+        reward, shaped, _ = 0.0, {"valid_json": 0.0, "field_coverage": 0.0, "type_score": 0.0, "value_score": 0.0, "exact_match": 0.0, "total_rel_error": 1.0}, None
+        invalid = 1.0
+    else:
+        reward, shaped, _ = compute_reward(payload, truth)
+        invalid = 0.0
+
+    # Record numeric metrics (numbers only)
+    trajectory.metrics.update(shaped)
+    trajectory.metrics["invalid_solution"] = float(invalid)
+    trajectory.metrics["chars_out"] = float(len(content))
+
+    # Scalar-only metadata for aggregation
+    trajectory.metadata["parse_error"] = str(parse_err or "none")
+
+    trajectory.reward = float(reward)
+    return trajectory
+
+[2025-09-20T23:52:36] apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+A rollout.py
+[2025-09-20T23:52:36] turn diff:
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/env.py b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104b93f468f9444ce81e28aba6aa56c455473a0
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+@@ -0,0 +1,513 @@
++"""Environment helpers for a minimal JSON-extraction ART task.
++
++This package defines:
++- constants and training hyperparameters surfaced via TRAINING_CONFIG
++- a small bank of unstructured examples with ground-truth labels
++- utilities to build prompts, parse/validate model output, and score rewards
++
++Notes
++- Inference and training are assumed to run on ART's LocalBackend.
++- If you need to install dependencies locally, prefer uv, e.g.:
++  `uv pip install openpipe-art weave openai requests`.
++"""
++from __future__ import annotations
++
++import json
++import random
++import re
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++
++# ----------------------------
++# Task constants (easy to tweak)
++# ----------------------------
++RANDOM_SEED: int = 1337
++
++# Minimal training config consumed by the host training loop.
++# Keep values small for fast iteration; adjust as needed.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "json-extract-mini",
++    "model_name": "agent-jsonex-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 24,
++    "trajectories_per_group": 16,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 160,
++    "temperature": 0.3,
++    "top_p": 0.9,
++    "max_exceptions": 32,
++    # Local cleanup behavior mirrors the 2048 example ergonomics.
++    "cleanup_keep_last": True,
++}
++
++
++# ----------------------------
++# Schema and seeded examples
++# ----------------------------
++SCHEMA_DESCRIPTION: str = (
++    "Return only a valid minified JSON object with fields: "
++    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
++    '"total": number, "currency": string, "items_count": integer}. '
++    "Do not include markdown or commentary."
++)
++
++Field = Dict[str, Any]
++Example = Dict[str, Any]
++
++
++EXAMPLES: list[Example] = [
++    {
++        "id": "ex-001",
++        "text": (
++            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
++            "Amount due: USD $1,234.50 for 3 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1001",
++            "customer": "Acme Corp",
++            "date": "2024-03-05",
++            "total": 1234.50,
++            "currency": "USD",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-002",
++        "text": (
++            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
++            "Total €2,999.00 with 5 line items."
++        ),
++        "label": {
++            "invoice_id": "INV-1002",
++            "customer": "Globex",
++            "date": "2024-04-17",
++            "total": 2999.00,
++            "currency": "EUR",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-003",
++        "text": (
++            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
++            "items count: 2."
++        ),
++        "label": {
++            "invoice_id": "INV-1003",
++            "customer": "Initech",
++            "date": "2024-04-17",
++            "total": 420.75,
++            "currency": "GBP",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-004",
++        "text": (
++            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
++            "4 items"
++        ),
++        "label": {
++            "invoice_id": "INV-1004",
++            "customer": "Umbrella Co.",
++            "date": "2024-05-02",
++            "total": 58000.0,
++            "currency": "JPY",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-005",
++        "text": (
++            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
++            "Items: 1."
++        ),
++        "label": {
++            "invoice_id": "INV-1005",
++            "customer": "Contoso Ltd",
++            "date": "2024-05-10",
++            "total": 75.00,
++            "currency": "USD",
++            "items_count": 1,
++        },
++    },
++    {
++        "id": "ex-006",
++        "text": (
++            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
++            "there are 6 items listed."
++        ),
++        "label": {
++            "invoice_id": "INV-1006",
++            "customer": "Wayne Enterprises",
++            "date": "2024-06-10",
++            "total": 1050.0,
++            "currency": "AUD",
++            "items_count": 6,
++        },
++    },
++    {
++        "id": "ex-007",
++        "text": (
++            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
++            "Amount: CAD 12,345.67 for 8 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1007",
++            "customer": "Stark Industries",
++            "date": "2024-06-11",
++            "total": 12345.67,
++            "currency": "CAD",
++            "items_count": 8,
++        },
++    },
++    {
++        "id": "ex-008",
++        "text": (
++            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
++        ),
++        "label": {
++            "invoice_id": "INV-1008",
++            "customer": "MegaCorp",
++            "date": "2024-06-15",
++            "total": 980.40,
++            "currency": "CHF",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-009",
++        "text": (
++            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
++            "Total payable: 2,250.00 MXN for 5 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1009",
++            "customer": "Soylent Corp",
++            "date": "2024-07-15",
++            "total": 2250.0,
++            "currency": "MXN",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-010",
++        "text": (
++            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
++            "Amount ZAR 7,700.00; 7 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1010",
++            "customer": "Black Mesa Research Facility",
++            "date": "2024-07-20",
++            "total": 7700.0,
++            "currency": "ZAR",
++            "items_count": 7,
++        },
++    },
++    {
++        "id": "ex-011",
++        "text": (
++            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
++        ),
++        "label": {
++            "invoice_id": "INV-1011",
++            "customer": "Aperture Science",
++            "date": "2024-08-01",
++            "total": 1240.50,
++            "currency": "NOK",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-012",
++        "text": (
++            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
++        ),
++        "label": {
++            "invoice_id": "INV-1012",
++            "customer": "Oceanic Airlines",
++            "date": "2024-08-15",
++            "total": 2100.0,
++            "currency": "SGD",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-013",
++        "text": (
++            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1013",
++            "customer": "Hooli",
++            "date": "2024-09-01",
++            "total": 3300.0,
++            "currency": "BRL",
++            "items_count": 9,
++        },
++    },
++    {
++        "id": "ex-014",
++        "text": (
++            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
++            "Total due: 1,500.25 USD; items=2."
++        ),
++        "label": {
++            "invoice_id": "INV-1014",
++            "customer": "Tyrell Corporation",
++            "date": "2024-09-02",
++            "total": 1500.25,
++            "currency": "USD",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-015",
++        "text": (
++            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1015",
++            "customer": "Cyberdyne Systems",
++            "date": "2024-09-20",
++            "total": 850000.0,
++            "currency": "KRW",
++            "items_count": 10,
++        },
++    },
++]
++
++
++# ----------------------------
++# Helper functions
++# ----------------------------
++def get_rng(step: int) -> random.Random:
++    """Deterministic RNG per step for stable sampling."""
++    return random.Random(RANDOM_SEED + int(step))
++
++
++def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
++    """Pick an example index deterministically from `EXAMPLES`.
++
++    Uses step to create a stable cycle with minor randomness.
++    """
++    if not EXAMPLES:
++        raise RuntimeError("No seeded examples available")
++    base = step % len(EXAMPLES)
++    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
++    idx = (base + jitter) % len(EXAMPLES)
++    return idx, EXAMPLES[idx]
++
++
++def build_user_prompt(example: Example) -> str:
++    """Construct a concise user prompt for the extraction task."""
++    return (
++        "Extract the requested fields from the text.\n"
++        f"Schema: {SCHEMA_DESCRIPTION}\n"
++        "Text:\n" + example["text"]
++    )
++
++
++_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
++
++
++def _strip_code_fences(text: str) -> str:
++    return _CODE_FENCE_RE.sub("", text).strip()
++
++
++def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Attempt to parse a JSON object from arbitrary model output.
++
++    Returns (payload, error). `payload` is None when parsing fails.
++    """
++    raw = _strip_code_fences(text)
++    # First try: direct parse
++    try:
++        val = json.loads(raw)
++        if isinstance(val, dict):
++            return val, None
++        return None, "not_a_object"
++    except Exception:
++        pass
++
++    # Second try: bracket slicing from first '{' to last '}'
++    start = raw.find("{")
++    end = raw.rfind("}")
++    if start != -1 and end != -1 and end > start:
++        snippet = raw[start : end + 1]
++        try:
++            val = json.loads(snippet)
++            if isinstance(val, dict):
++                return val, None
++            return None, "not_a_object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, f"json_parse_error:{type(exc).__name__}"
++
++    return None, "no_braces_found"
++
++
++_DATE_FORMATS = (
++    "%Y-%m-%d",
++    "%Y/%m/%d",
++    "%d/%m/%Y",
++    "%m/%d/%Y",
++    "%Y.%m.%d",
++    "%d-%m-%Y",
++    "%b %d, %Y",
++    "%B %d, %Y",
++    "%d %b %Y",
++    "%d %B %Y",
++    "%Y.%m.%d",
++)
++
++
++def normalize_date(value: Any) -> Optional[str]:
++    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
++    if not isinstance(value, str):
++        return None
++    s = value.strip()
++    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
++    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
++    for fmt in _DATE_FORMATS:
++        try:
++            dt = datetime.strptime(s, fmt)
++            return dt.strftime("%Y-%m-%d")
++        except Exception:
++            continue
++    return None
++
++
++def _to_float(value: Any) -> Optional[float]:
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        s = value.strip()
++        # Remove currency symbols and thousands separators
++        s = s.replace(",", "").replace(" ", "")
++        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
++        try:
++            return float(s)
++        except Exception:
++            return None
++    return None
++
++
++def _to_int(value: Any) -> Optional[int]:
++    if isinstance(value, bool):  # avoid True/False as ints
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, float):
++        if value.is_integer():
++            return int(value)
++        return None
++    if isinstance(value, str):
++        s = value.strip()
++        s = re.sub(r"[^0-9-]", "", s)
++        try:
++            return int(s)
++        except Exception:
++            return None
++    return None
++
++
++def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
++    """Score a prediction against ground truth with dense shaping.
++
++    Reward components (0..1 each):
++    - valid_json: 1 if object present (caller should set); included here for completeness
++    - coverage: fraction of required fields present
++    - type_score: fraction of fields coercible to the right type
++    - value_score: average per-field correctness; total uses smooth relative error
++
++    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
++    """
++    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
++
++    present = {k: (k in pred) for k in required}
++    coverage = sum(1.0 for k in required if present[k]) / len(required)
++
++    # Coerce and normalize
++    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
++    customer = pred.get("customer") if present["customer"] else None
++    date_norm = normalize_date(pred.get("date")) if present["date"] else None
++    total_val = _to_float(pred.get("total")) if present["total"] else None
++    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
++    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
++
++    type_ok = {
++        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
++        "customer": isinstance(customer, str) and bool(customer.strip()),
++        "date": isinstance(date_norm, str),
++        "total": isinstance(total_val, float),
++        "currency": isinstance(currency, str) and len(currency) >= 3,
++        "items_count": isinstance(items_count, int),
++    }
++    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
++
++    # Truth values
++    t_id = truth["invoice_id"]
++    t_customer = truth["customer"]
++    t_date = truth["date"]
++    t_total = float(truth["total"])  # already canonical
++    t_curr = truth["currency"].upper()
++    t_items = int(truth["items_count"])
++
++    # Per-field correctness (0/1), except total which is smooth
++    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
++    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
++    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
++    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
++    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
++
++    # Smooth score for total based on relative error
++    if type_ok["total"]:
++        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
++        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
++    else:
++        rel_err = 1.0
++        total_score = 0.0
++
++    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
++
++    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
++    valid_json = 1.0 if coverage > 0 else 0.0
++    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
++
++    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
++
++    metrics = {
++        "valid_json": float(valid_json),
++        "field_coverage": float(coverage),
++        "type_score": float(type_score),
++        "value_score": float(value_score),
++        "exact_match": float(exact_match),
++        "total_rel_error": float(rel_err),
++    }
++
++    # Validation error summary string for metadata (scalar-only constraint)
++    missing = [k for k in required if not present[k]]
++    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
++    valerr: Optional[str]
++    if missing:
++        valerr = f"missing:{','.join(missing)[:80]}"
++    elif wrong_types:
++        valerr = f"types:{','.join(wrong_types)[:80]}"
++    else:
++        valerr = None
++
++    return reward, metrics, valerr
++
++
++# ----------------------------
++# System prompt (concise)
++# ----------------------------
++SYSTEM_PROMPT: str = (
++    "You are a precise information extraction model. "
++    "Extract the requested fields and answer with only a valid JSON object. "
++    "Use exact schema and types; no extra keys, no commentary."
++)
++
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8be09712fe68800b29cc00b557c8ab16457fb232
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+@@ -0,0 +1,106 @@
++"""ART rollout for the JSON extraction environment.
++
++Implements a single-turn rollout that:
++- builds a concise system/user prompt
++- queries the model via the ART LocalBackend-compatible API surface
++- parses and validates structured output
++- logs scalar-only metadata and numeric metrics
++
++Reward shaping mirrors best practices: valid JSON, coverage, types, and
++value accuracy (with a smooth term for numeric closeness).
++"""
++from __future__ import annotations
++
++import requests
++import weave
++import art
++from typing import Any
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    get_rng,
++    pick_example,
++    build_user_prompt,
++    extract_json_object,
++    compute_reward,
++    EXAMPLES,
++)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Single-step rollout for JSON extraction.
++
++    Parameters
++    - model: ART model handle (assumed LocalBackend for training/inference)
++    - step: current training step
++    - config: training config dict allowing overrides of generation params
++    """
++    rng = get_rng(step)
++    ex_idx, example = pick_example(step, rng)
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": SYSTEM_PROMPT}],
++        metadata={
++            "task": "json_extraction",
++            "project": str(TRAINING_CONFIG.get("project", "json-extract")),
++            "step": int(step),
++            "example_index": int(ex_idx),
++            "example_id": str(example["id"]),
++        },
++        reward=0.0,
++    )
++
++    user_prompt = build_user_prompt(example)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # LocalBackend-compatible OpenAI transport (as in 2048 example)
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    # Allow host config to override generation knobs
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=max_tokens,
++        stream=False,
++        temperature=temperature,
++        top_p=top_p,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    payload, parse_err = extract_json_object(content)
++
++    # Defensive validation + reward
++    truth = example["label"]
++    if payload is None:
++        reward, shaped, _ = 0.0, {"valid_json": 0.0, "field_coverage": 0.0, "type_score": 0.0, "value_score": 0.0, "exact_match": 0.0, "total_rel_error": 1.0}, None
++        invalid = 1.0
++    else:
++        reward, shaped, _ = compute_reward(payload, truth)
++        invalid = 0.0
++
++    # Record numeric metrics (numbers only)
++    trajectory.metrics.update(shaped)
++    trajectory.metrics["invalid_solution"] = float(invalid)
++    trajectory.metrics["chars_out"] = float(len(content))
++
++    # Scalar-only metadata for aggregation
++    trajectory.metadata["parse_error"] = str(parse_err or "none")
++
++    trajectory.reward = float(reward)
++    return trajectory
++
+
+[2025-09-20T23:52:36] tokens used: 20,552
+[2025-09-20T23:52:36] turn diff:
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/env.py b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104b93f468f9444ce81e28aba6aa56c455473a0
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+@@ -0,0 +1,513 @@
++"""Environment helpers for a minimal JSON-extraction ART task.
++
++This package defines:
++- constants and training hyperparameters surfaced via TRAINING_CONFIG
++- a small bank of unstructured examples with ground-truth labels
++- utilities to build prompts, parse/validate model output, and score rewards
++
++Notes
++- Inference and training are assumed to run on ART's LocalBackend.
++- If you need to install dependencies locally, prefer uv, e.g.:
++  `uv pip install openpipe-art weave openai requests`.
++"""
++from __future__ import annotations
++
++import json
++import random
++import re
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++
++# ----------------------------
++# Task constants (easy to tweak)
++# ----------------------------
++RANDOM_SEED: int = 1337
++
++# Minimal training config consumed by the host training loop.
++# Keep values small for fast iteration; adjust as needed.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "json-extract-mini",
++    "model_name": "agent-jsonex-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 24,
++    "trajectories_per_group": 16,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 160,
++    "temperature": 0.3,
++    "top_p": 0.9,
++    "max_exceptions": 32,
++    # Local cleanup behavior mirrors the 2048 example ergonomics.
++    "cleanup_keep_last": True,
++}
++
++
++# ----------------------------
++# Schema and seeded examples
++# ----------------------------
++SCHEMA_DESCRIPTION: str = (
++    "Return only a valid minified JSON object with fields: "
++    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
++    '"total": number, "currency": string, "items_count": integer}. '
++    "Do not include markdown or commentary."
++)
++
++Field = Dict[str, Any]
++Example = Dict[str, Any]
++
++
++EXAMPLES: list[Example] = [
++    {
++        "id": "ex-001",
++        "text": (
++            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
++            "Amount due: USD $1,234.50 for 3 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1001",
++            "customer": "Acme Corp",
++            "date": "2024-03-05",
++            "total": 1234.50,
++            "currency": "USD",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-002",
++        "text": (
++            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
++            "Total €2,999.00 with 5 line items."
++        ),
++        "label": {
++            "invoice_id": "INV-1002",
++            "customer": "Globex",
++            "date": "2024-04-17",
++            "total": 2999.00,
++            "currency": "EUR",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-003",
++        "text": (
++            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
++            "items count: 2."
++        ),
++        "label": {
++            "invoice_id": "INV-1003",
++            "customer": "Initech",
++            "date": "2024-04-17",
++            "total": 420.75,
++            "currency": "GBP",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-004",
++        "text": (
++            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
++            "4 items"
++        ),
++        "label": {
++            "invoice_id": "INV-1004",
++            "customer": "Umbrella Co.",
++            "date": "2024-05-02",
++            "total": 58000.0,
++            "currency": "JPY",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-005",
++        "text": (
++            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
++            "Items: 1."
++        ),
++        "label": {
++            "invoice_id": "INV-1005",
++            "customer": "Contoso Ltd",
++            "date": "2024-05-10",
++            "total": 75.00,
++            "currency": "USD",
++            "items_count": 1,
++        },
++    },
++    {
++        "id": "ex-006",
++        "text": (
++            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
++            "there are 6 items listed."
++        ),
++        "label": {
++            "invoice_id": "INV-1006",
++            "customer": "Wayne Enterprises",
++            "date": "2024-06-10",
++            "total": 1050.0,
++            "currency": "AUD",
++            "items_count": 6,
++        },
++    },
++    {
++        "id": "ex-007",
++        "text": (
++            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
++            "Amount: CAD 12,345.67 for 8 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1007",
++            "customer": "Stark Industries",
++            "date": "2024-06-11",
++            "total": 12345.67,
++            "currency": "CAD",
++            "items_count": 8,
++        },
++    },
++    {
++        "id": "ex-008",
++        "text": (
++            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
++        ),
++        "label": {
++            "invoice_id": "INV-1008",
++            "customer": "MegaCorp",
++            "date": "2024-06-15",
++            "total": 980.40,
++            "currency": "CHF",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-009",
++        "text": (
++            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
++            "Total payable: 2,250.00 MXN for 5 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1009",
++            "customer": "Soylent Corp",
++            "date": "2024-07-15",
++            "total": 2250.0,
++            "currency": "MXN",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-010",
++        "text": (
++            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
++            "Amount ZAR 7,700.00; 7 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1010",
++            "customer": "Black Mesa Research Facility",
++            "date": "2024-07-20",
++            "total": 7700.0,
++            "currency": "ZAR",
++            "items_count": 7,
++        },
++    },
++    {
++        "id": "ex-011",
++        "text": (
++            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
++        ),
++        "label": {
++            "invoice_id": "INV-1011",
++            "customer": "Aperture Science",
++            "date": "2024-08-01",
++            "total": 1240.50,
++            "currency": "NOK",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-012",
++        "text": (
++            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
++        ),
++        "label": {
++            "invoice_id": "INV-1012",
++            "customer": "Oceanic Airlines",
++            "date": "2024-08-15",
++            "total": 2100.0,
++            "currency": "SGD",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-013",
++        "text": (
++            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1013",
++            "customer": "Hooli",
++            "date": "2024-09-01",
++            "total": 3300.0,
++            "currency": "BRL",
++            "items_count": 9,
++        },
++    },
++    {
++        "id": "ex-014",
++        "text": (
++            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
++            "Total due: 1,500.25 USD; items=2."
++        ),
++        "label": {
++            "invoice_id": "INV-1014",
++            "customer": "Tyrell Corporation",
++            "date": "2024-09-02",
++            "total": 1500.25,
++            "currency": "USD",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-015",
++        "text": (
++            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1015",
++            "customer": "Cyberdyne Systems",
++            "date": "2024-09-20",
++            "total": 850000.0,
++            "currency": "KRW",
++            "items_count": 10,
++        },
++    },
++]
++
++
++# ----------------------------
++# Helper functions
++# ----------------------------
++def get_rng(step: int) -> random.Random:
++    """Deterministic RNG per step for stable sampling."""
++    return random.Random(RANDOM_SEED + int(step))
++
++
++def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
++    """Pick an example index deterministically from `EXAMPLES`.
++
++    Uses step to create a stable cycle with minor randomness.
++    """
++    if not EXAMPLES:
++        raise RuntimeError("No seeded examples available")
++    base = step % len(EXAMPLES)
++    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
++    idx = (base + jitter) % len(EXAMPLES)
++    return idx, EXAMPLES[idx]
++
++
++def build_user_prompt(example: Example) -> str:
++    """Construct a concise user prompt for the extraction task."""
++    return (
++        "Extract the requested fields from the text.\n"
++        f"Schema: {SCHEMA_DESCRIPTION}\n"
++        "Text:\n" + example["text"]
++    )
++
++
++_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
++
++
++def _strip_code_fences(text: str) -> str:
++    return _CODE_FENCE_RE.sub("", text).strip()
++
++
++def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Attempt to parse a JSON object from arbitrary model output.
++
++    Returns (payload, error). `payload` is None when parsing fails.
++    """
++    raw = _strip_code_fences(text)
++    # First try: direct parse
++    try:
++        val = json.loads(raw)
++        if isinstance(val, dict):
++            return val, None
++        return None, "not_a_object"
++    except Exception:
++        pass
++
++    # Second try: bracket slicing from first '{' to last '}'
++    start = raw.find("{")
++    end = raw.rfind("}")
++    if start != -1 and end != -1 and end > start:
++        snippet = raw[start : end + 1]
++        try:
++            val = json.loads(snippet)
++            if isinstance(val, dict):
++                return val, None
++            return None, "not_a_object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, f"json_parse_error:{type(exc).__name__}"
++
++    return None, "no_braces_found"
++
++
++_DATE_FORMATS = (
++    "%Y-%m-%d",
++    "%Y/%m/%d",
++    "%d/%m/%Y",
++    "%m/%d/%Y",
++    "%Y.%m.%d",
++    "%d-%m-%Y",
++    "%b %d, %Y",
++    "%B %d, %Y",
++    "%d %b %Y",
++    "%d %B %Y",
++    "%Y.%m.%d",
++)
++
++
++def normalize_date(value: Any) -> Optional[str]:
++    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
++    if not isinstance(value, str):
++        return None
++    s = value.strip()
++    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
++    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
++    for fmt in _DATE_FORMATS:
++        try:
++            dt = datetime.strptime(s, fmt)
++            return dt.strftime("%Y-%m-%d")
++        except Exception:
++            continue
++    return None
++
++
++def _to_float(value: Any) -> Optional[float]:
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        s = value.strip()
++        # Remove currency symbols and thousands separators
++        s = s.replace(",", "").replace(" ", "")
++        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
++        try:
++            return float(s)
++        except Exception:
++            return None
++    return None
++
++
++def _to_int(value: Any) -> Optional[int]:
++    if isinstance(value, bool):  # avoid True/False as ints
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, float):
++        if value.is_integer():
++            return int(value)
++        return None
++    if isinstance(value, str):
++        s = value.strip()
++        s = re.sub(r"[^0-9-]", "", s)
++        try:
++            return int(s)
++        except Exception:
++            return None
++    return None
++
++
++def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
++    """Score a prediction against ground truth with dense shaping.
++
++    Reward components (0..1 each):
++    - valid_json: 1 if object present (caller should set); included here for completeness
++    - coverage: fraction of required fields present
++    - type_score: fraction of fields coercible to the right type
++    - value_score: average per-field correctness; total uses smooth relative error
++
++    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
++    """
++    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
++
++    present = {k: (k in pred) for k in required}
++    coverage = sum(1.0 for k in required if present[k]) / len(required)
++
++    # Coerce and normalize
++    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
++    customer = pred.get("customer") if present["customer"] else None
++    date_norm = normalize_date(pred.get("date")) if present["date"] else None
++    total_val = _to_float(pred.get("total")) if present["total"] else None
++    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
++    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
++
++    type_ok = {
++        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
++        "customer": isinstance(customer, str) and bool(customer.strip()),
++        "date": isinstance(date_norm, str),
++        "total": isinstance(total_val, float),
++        "currency": isinstance(currency, str) and len(currency) >= 3,
++        "items_count": isinstance(items_count, int),
++    }
++    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
++
++    # Truth values
++    t_id = truth["invoice_id"]
++    t_customer = truth["customer"]
++    t_date = truth["date"]
++    t_total = float(truth["total"])  # already canonical
++    t_curr = truth["currency"].upper()
++    t_items = int(truth["items_count"])
++
++    # Per-field correctness (0/1), except total which is smooth
++    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
++    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
++    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
++    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
++    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
++
++    # Smooth score for total based on relative error
++    if type_ok["total"]:
++        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
++        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
++    else:
++        rel_err = 1.0
++        total_score = 0.0
++
++    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
++
++    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
++    valid_json = 1.0 if coverage > 0 else 0.0
++    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
++
++    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
++
++    metrics = {
++        "valid_json": float(valid_json),
++        "field_coverage": float(coverage),
++        "type_score": float(type_score),
++        "value_score": float(value_score),
++        "exact_match": float(exact_match),
++        "total_rel_error": float(rel_err),
++    }
++
++    # Validation error summary string for metadata (scalar-only constraint)
++    missing = [k for k in required if not present[k]]
++    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
++    valerr: Optional[str]
++    if missing:
++        valerr = f"missing:{','.join(missing)[:80]}"
++    elif wrong_types:
++        valerr = f"types:{','.join(wrong_types)[:80]}"
++    else:
++        valerr = None
++
++    return reward, metrics, valerr
++
++
++# ----------------------------
++# System prompt (concise)
++# ----------------------------
++SYSTEM_PROMPT: str = (
++    "You are a precise information extraction model. "
++    "Extract the requested fields and answer with only a valid JSON object. "
++    "Use exact schema and types; no extra keys, no commentary."
++)
++
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8be09712fe68800b29cc00b557c8ab16457fb232
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+@@ -0,0 +1,106 @@
++"""ART rollout for the JSON extraction environment.
++
++Implements a single-turn rollout that:
++- builds a concise system/user prompt
++- queries the model via the ART LocalBackend-compatible API surface
++- parses and validates structured output
++- logs scalar-only metadata and numeric metrics
++
++Reward shaping mirrors best practices: valid JSON, coverage, types, and
++value accuracy (with a smooth term for numeric closeness).
++"""
++from __future__ import annotations
++
++import requests
++import weave
++import art
++from typing import Any
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    get_rng,
++    pick_example,
++    build_user_prompt,
++    extract_json_object,
++    compute_reward,
++    EXAMPLES,
++)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Single-step rollout for JSON extraction.
++
++    Parameters
++    - model: ART model handle (assumed LocalBackend for training/inference)
++    - step: current training step
++    - config: training config dict allowing overrides of generation params
++    """
++    rng = get_rng(step)
++    ex_idx, example = pick_example(step, rng)
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": SYSTEM_PROMPT}],
++        metadata={
++            "task": "json_extraction",
++            "project": str(TRAINING_CONFIG.get("project", "json-extract")),
++            "step": int(step),
++            "example_index": int(ex_idx),
++            "example_id": str(example["id"]),
++        },
++        reward=0.0,
++    )
++
++    user_prompt = build_user_prompt(example)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # LocalBackend-compatible OpenAI transport (as in 2048 example)
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    # Allow host config to override generation knobs
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=max_tokens,
++        stream=False,
++        temperature=temperature,
++        top_p=top_p,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    payload, parse_err = extract_json_object(content)
++
++    # Defensive validation + reward
++    truth = example["label"]
++    if payload is None:
++        reward, shaped, _ = 0.0, {"valid_json": 0.0, "field_coverage": 0.0, "type_score": 0.0, "value_score": 0.0, "exact_match": 0.0, "total_rel_error": 1.0}, None
++        invalid = 1.0
++    else:
++        reward, shaped, _ = compute_reward(payload, truth)
++        invalid = 0.0
++
++    # Record numeric metrics (numbers only)
++    trajectory.metrics.update(shaped)
++    trajectory.metrics["invalid_solution"] = float(invalid)
++    trajectory.metrics["chars_out"] = float(len(content))
++
++    # Scalar-only metadata for aggregation
++    trajectory.metadata["parse_error"] = str(parse_err or "none")
++
++    trajectory.reward = float(reward)
++    return trajectory
++
+
+[2025-09-20T23:52:37] codex
+
+Created a minimal ART task with two files: env.py and rollout.py.
+
+**What’s Included**
+- env.py
+  - Exposes RANDOM_SEED and TRAINING_CONFIG with required keys.
+  - Defines a concise schema and 15 seeded unstructured examples with labels.
+  - Helpers to pick examples, build prompts, parse JSON from free-form outputs, normalize dates, coerce types, and compute dense rewards.
+  - SYSTEM_PROMPT tailored for strict JSON extraction.
+  - Reward shaping blends JSON validity, field coverage, type correctness, and value accuracy with a smooth term for numeric totals.
+
+- rollout.py
+  - Defines @weave.op and @art.retry guarded async rollout(model, step, config).
+  - Uses the LocalBackend-compatible AsyncOpenAI client (matching 2048 ergonomics).
+  - Builds concise system/user prompts, collects one assistant reply, validates it, and computes reward/metrics.
+  - Trajectory metadata uses only scalars; metrics are all numbers, including invalid_solution.
+
+**Usage Notes**
+- The host training loop should import TRAINING_CONFIG from env.py and rollout from rollout.py.
+- Defaults assume LocalBackend; if you need packages, install with: uv pip install openpipe-art weave openai requests
+- Adjust tuning at the top of env.py (RANDOM_SEED, TRAINING_CONFIG, and schema/examples).
+[2025-09-20T23:52:40] tokens used: 21,954
+[2025-09-20T23:52:40] turn diff:
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/env.py b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104b93f468f9444ce81e28aba6aa56c455473a0
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/env.py
+@@ -0,0 +1,513 @@
++"""Environment helpers for a minimal JSON-extraction ART task.
++
++This package defines:
++- constants and training hyperparameters surfaced via TRAINING_CONFIG
++- a small bank of unstructured examples with ground-truth labels
++- utilities to build prompts, parse/validate model output, and score rewards
++
++Notes
++- Inference and training are assumed to run on ART's LocalBackend.
++- If you need to install dependencies locally, prefer uv, e.g.:
++  `uv pip install openpipe-art weave openai requests`.
++"""
++from __future__ import annotations
++
++import json
++import random
++import re
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++
++# ----------------------------
++# Task constants (easy to tweak)
++# ----------------------------
++RANDOM_SEED: int = 1337
++
++# Minimal training config consumed by the host training loop.
++# Keep values small for fast iteration; adjust as needed.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "json-extract-mini",
++    "model_name": "agent-jsonex-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 24,
++    "trajectories_per_group": 16,
++    "groups_per_step": 1,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 160,
++    "temperature": 0.3,
++    "top_p": 0.9,
++    "max_exceptions": 32,
++    # Local cleanup behavior mirrors the 2048 example ergonomics.
++    "cleanup_keep_last": True,
++}
++
++
++# ----------------------------
++# Schema and seeded examples
++# ----------------------------
++SCHEMA_DESCRIPTION: str = (
++    "Return only a valid minified JSON object with fields: "
++    '{"invoice_id": string, "customer": string, "date": "YYYY-MM-DD", '
++    '"total": number, "currency": string, "items_count": integer}. '
++    "Do not include markdown or commentary."
++)
++
++Field = Dict[str, Any]
++Example = Dict[str, Any]
++
++
++EXAMPLES: list[Example] = [
++    {
++        "id": "ex-001",
++        "text": (
++            "Invoice INV-1001 for Acme Corp was issued on March 5, 2024. "
++            "Amount due: USD $1,234.50 for 3 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1001",
++            "customer": "Acme Corp",
++            "date": "2024-03-05",
++            "total": 1234.50,
++            "currency": "USD",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-002",
++        "text": (
++            "ACME Billing Notice — ID=INV-1002 (EUR). Issued 2024-04-17 to Globex. "
++            "Total €2,999.00 with 5 line items."
++        ),
++        "label": {
++            "invoice_id": "INV-1002",
++            "customer": "Globex",
++            "date": "2024-04-17",
++            "total": 2999.00,
++            "currency": "EUR",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-003",
++        "text": (
++            "Receipt ref INV-1003 to Initech on 17 Apr 2024. GBP 420.75 due; "
++            "items count: 2."
++        ),
++        "label": {
++            "invoice_id": "INV-1003",
++            "customer": "Initech",
++            "date": "2024-04-17",
++            "total": 420.75,
++            "currency": "GBP",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-004",
++        "text": (
++            "Invoice# INV-1004 | Customer: Umbrella Co. | 2024/05/02 | JPY ¥58,000 | "
++            "4 items"
++        ),
++        "label": {
++            "invoice_id": "INV-1004",
++            "customer": "Umbrella Co.",
++            "date": "2024-05-02",
++            "total": 58000.0,
++            "currency": "JPY",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-005",
++        "text": (
++            "Reminder: Payment for INV-1005 (Contoso Ltd). Issued 05/10/2024. Amount: $75.00 USD. "
++            "Items: 1."
++        ),
++        "label": {
++            "invoice_id": "INV-1005",
++            "customer": "Contoso Ltd",
++            "date": "2024-05-10",
++            "total": 75.00,
++            "currency": "USD",
++            "items_count": 1,
++        },
++    },
++    {
++        "id": "ex-006",
++        "text": (
++            "Statement INV-1006 for Wayne Enterprises dated 10-06-2024. Total due is AUD 1,050.00; "
++            "there are 6 items listed."
++        ),
++        "label": {
++            "invoice_id": "INV-1006",
++            "customer": "Wayne Enterprises",
++            "date": "2024-06-10",
++            "total": 1050.0,
++            "currency": "AUD",
++            "items_count": 6,
++        },
++    },
++    {
++        "id": "ex-007",
++        "text": (
++            "Billing doc INV-1007 sent to Stark Industries on June 11, 2024. "
++            "Amount: CAD 12,345.67 for 8 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1007",
++            "customer": "Stark Industries",
++            "date": "2024-06-11",
++            "total": 12345.67,
++            "currency": "CAD",
++            "items_count": 8,
++        },
++    },
++    {
++        "id": "ex-008",
++        "text": (
++            "INV-1008 | MegaCorp | 2024-06-15 | CHF 980.40 | items=2"
++        ),
++        "label": {
++            "invoice_id": "INV-1008",
++            "customer": "MegaCorp",
++            "date": "2024-06-15",
++            "total": 980.40,
++            "currency": "CHF",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-009",
++        "text": (
++            "Customer: Soylent Corp — invoice INV-1009 dated 15/07/2024. "
++            "Total payable: 2,250.00 MXN for 5 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1009",
++            "customer": "Soylent Corp",
++            "date": "2024-07-15",
++            "total": 2250.0,
++            "currency": "MXN",
++            "items_count": 5,
++        },
++    },
++    {
++        "id": "ex-010",
++        "text": (
++            "Invoice INV-1010 for Black Mesa Research Facility (ZAR). Issued Jul 20, 2024. "
++            "Amount ZAR 7,700.00; 7 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1010",
++            "customer": "Black Mesa Research Facility",
++            "date": "2024-07-20",
++            "total": 7700.0,
++            "currency": "ZAR",
++            "items_count": 7,
++        },
++    },
++    {
++        "id": "ex-011",
++        "text": (
++            "Notice: INV-1011 to Aperture Science on 2024.08.01 with total of NOK 1 240,50. Items: 3."
++        ),
++        "label": {
++            "invoice_id": "INV-1011",
++            "customer": "Aperture Science",
++            "date": "2024-08-01",
++            "total": 1240.50,
++            "currency": "NOK",
++            "items_count": 3,
++        },
++    },
++    {
++        "id": "ex-012",
++        "text": (
++            "Doc INV-1012; buyer: Oceanic Airlines; date=2024/08/15; amount=SGD 2,100.00; items: 4"
++        ),
++        "label": {
++            "invoice_id": "INV-1012",
++            "customer": "Oceanic Airlines",
++            "date": "2024-08-15",
++            "total": 2100.0,
++            "currency": "SGD",
++            "items_count": 4,
++        },
++    },
++    {
++        "id": "ex-013",
++        "text": (
++            "Invoice INV-1013 (BRL) to Hooli on 09-01-2024, totaling R$ 3.300,00 for 9 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1013",
++            "customer": "Hooli",
++            "date": "2024-09-01",
++            "total": 3300.0,
++            "currency": "BRL",
++            "items_count": 9,
++        },
++    },
++    {
++        "id": "ex-014",
++        "text": (
++            "INV-1014 issued to Tyrell Corporation on September 2, 2024. "
++            "Total due: 1,500.25 USD; items=2."
++        ),
++        "label": {
++            "invoice_id": "INV-1014",
++            "customer": "Tyrell Corporation",
++            "date": "2024-09-02",
++            "total": 1500.25,
++            "currency": "USD",
++            "items_count": 2,
++        },
++    },
++    {
++        "id": "ex-015",
++        "text": (
++            "Record INV-1015 to Cyberdyne Systems — 2024-09-20 — KRW ₩850,000 — 10 items."
++        ),
++        "label": {
++            "invoice_id": "INV-1015",
++            "customer": "Cyberdyne Systems",
++            "date": "2024-09-20",
++            "total": 850000.0,
++            "currency": "KRW",
++            "items_count": 10,
++        },
++    },
++]
++
++
++# ----------------------------
++# Helper functions
++# ----------------------------
++def get_rng(step: int) -> random.Random:
++    """Deterministic RNG per step for stable sampling."""
++    return random.Random(RANDOM_SEED + int(step))
++
++
++def pick_example(step: int, rng: random.Random) -> tuple[int, Example]:
++    """Pick an example index deterministically from `EXAMPLES`.
++
++    Uses step to create a stable cycle with minor randomness.
++    """
++    if not EXAMPLES:
++        raise RuntimeError("No seeded examples available")
++    base = step % len(EXAMPLES)
++    jitter = rng.randint(0, max(0, len(EXAMPLES) - 1))
++    idx = (base + jitter) % len(EXAMPLES)
++    return idx, EXAMPLES[idx]
++
++
++def build_user_prompt(example: Example) -> str:
++    """Construct a concise user prompt for the extraction task."""
++    return (
++        "Extract the requested fields from the text.\n"
++        f"Schema: {SCHEMA_DESCRIPTION}\n"
++        "Text:\n" + example["text"]
++    )
++
++
++_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*|```$", re.MULTILINE)
++
++
++def _strip_code_fences(text: str) -> str:
++    return _CODE_FENCE_RE.sub("", text).strip()
++
++
++def extract_json_object(text: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Attempt to parse a JSON object from arbitrary model output.
++
++    Returns (payload, error). `payload` is None when parsing fails.
++    """
++    raw = _strip_code_fences(text)
++    # First try: direct parse
++    try:
++        val = json.loads(raw)
++        if isinstance(val, dict):
++            return val, None
++        return None, "not_a_object"
++    except Exception:
++        pass
++
++    # Second try: bracket slicing from first '{' to last '}'
++    start = raw.find("{")
++    end = raw.rfind("}")
++    if start != -1 and end != -1 and end > start:
++        snippet = raw[start : end + 1]
++        try:
++            val = json.loads(snippet)
++            if isinstance(val, dict):
++                return val, None
++            return None, "not_a_object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, f"json_parse_error:{type(exc).__name__}"
++
++    return None, "no_braces_found"
++
++
++_DATE_FORMATS = (
++    "%Y-%m-%d",
++    "%Y/%m/%d",
++    "%d/%m/%Y",
++    "%m/%d/%Y",
++    "%Y.%m.%d",
++    "%d-%m-%Y",
++    "%b %d, %Y",
++    "%B %d, %Y",
++    "%d %b %Y",
++    "%d %B %Y",
++    "%Y.%m.%d",
++)
++
++
++def normalize_date(value: Any) -> Optional[str]:
++    """Normalize many date formats to YYYY-MM-DD; return None on failure."""
++    if not isinstance(value, str):
++        return None
++    s = value.strip()
++    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th
++    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
++    for fmt in _DATE_FORMATS:
++        try:
++            dt = datetime.strptime(s, fmt)
++            return dt.strftime("%Y-%m-%d")
++        except Exception:
++            continue
++    return None
++
++
++def _to_float(value: Any) -> Optional[float]:
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        s = value.strip()
++        # Remove currency symbols and thousands separators
++        s = s.replace(",", "").replace(" ", "")
++        s = re.sub(r"[A-Za-z$€£¥₩R$]", "", s)
++        try:
++            return float(s)
++        except Exception:
++            return None
++    return None
++
++
++def _to_int(value: Any) -> Optional[int]:
++    if isinstance(value, bool):  # avoid True/False as ints
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, float):
++        if value.is_integer():
++            return int(value)
++        return None
++    if isinstance(value, str):
++        s = value.strip()
++        s = re.sub(r"[^0-9-]", "", s)
++        try:
++            return int(s)
++        except Exception:
++            return None
++    return None
++
++
++def compute_reward(pred: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, Dict[str, float], Optional[str]]:
++    """Score a prediction against ground truth with dense shaping.
++
++    Reward components (0..1 each):
++    - valid_json: 1 if object present (caller should set); included here for completeness
++    - coverage: fraction of required fields present
++    - type_score: fraction of fields coercible to the right type
++    - value_score: average per-field correctness; total uses smooth relative error
++
++    Final reward = 0.2*valid_json + 0.3*coverage + 0.2*type_score + 0.3*value_score
++    """
++    required = ("invoice_id", "customer", "date", "total", "currency", "items_count")
++
++    present = {k: (k in pred) for k in required}
++    coverage = sum(1.0 for k in required if present[k]) / len(required)
++
++    # Coerce and normalize
++    invoice_id = pred.get("invoice_id") if present["invoice_id"] else None
++    customer = pred.get("customer") if present["customer"] else None
++    date_norm = normalize_date(pred.get("date")) if present["date"] else None
++    total_val = _to_float(pred.get("total")) if present["total"] else None
++    currency = str(pred.get("currency")).strip().upper() if present["currency"] else None
++    items_count = _to_int(pred.get("items_count")) if present["items_count"] else None
++
++    type_ok = {
++        "invoice_id": isinstance(invoice_id, str) and bool(invoice_id.strip()),
++        "customer": isinstance(customer, str) and bool(customer.strip()),
++        "date": isinstance(date_norm, str),
++        "total": isinstance(total_val, float),
++        "currency": isinstance(currency, str) and len(currency) >= 3,
++        "items_count": isinstance(items_count, int),
++    }
++    type_score = sum(1.0 for v in type_ok.values() if v) / len(required)
++
++    # Truth values
++    t_id = truth["invoice_id"]
++    t_customer = truth["customer"]
++    t_date = truth["date"]
++    t_total = float(truth["total"])  # already canonical
++    t_curr = truth["currency"].upper()
++    t_items = int(truth["items_count"])
++
++    # Per-field correctness (0/1), except total which is smooth
++    eq_id = 1.0 if (type_ok["invoice_id"] and str(invoice_id).strip() == t_id) else 0.0
++    eq_customer = 1.0 if (type_ok["customer"] and str(customer).strip() == t_customer) else 0.0
++    eq_date = 1.0 if (type_ok["date"] and date_norm == t_date) else 0.0
++    eq_curr = 1.0 if (type_ok["currency"] and currency == t_curr) else 0.0
++    eq_items = 1.0 if (type_ok["items_count"] and items_count == t_items) else 0.0
++
++    # Smooth score for total based on relative error
++    if type_ok["total"]:
++        rel_err = abs(total_val - t_total) / max(1.0, abs(t_total))  # 0 good, >0 bad
++        total_score = max(0.0, 1.0 - min(1.0, rel_err * 3.0))  # tolerant but informative
++    else:
++        rel_err = 1.0
++        total_score = 0.0
++
++    value_score = (eq_id + eq_customer + eq_date + total_score + eq_curr + eq_items) / 6.0
++
++    # valid_json should be set by caller; we infer from coverage>0 as a weak proxy
++    valid_json = 1.0 if coverage > 0 else 0.0
++    exact_match = 1.0 if (eq_id == eq_customer == eq_date == eq_curr == eq_items == 1.0 and total_score == 1.0) else 0.0
++
++    reward = 0.2 * valid_json + 0.3 * coverage + 0.2 * type_score + 0.3 * value_score
++
++    metrics = {
++        "valid_json": float(valid_json),
++        "field_coverage": float(coverage),
++        "type_score": float(type_score),
++        "value_score": float(value_score),
++        "exact_match": float(exact_match),
++        "total_rel_error": float(rel_err),
++    }
++
++    # Validation error summary string for metadata (scalar-only constraint)
++    missing = [k for k in required if not present[k]]
++    wrong_types = [k for k, ok in type_ok.items() if not ok and present.get(k, False)]
++    valerr: Optional[str]
++    if missing:
++        valerr = f"missing:{','.join(missing)[:80]}"
++    elif wrong_types:
++        valerr = f"types:{','.join(wrong_types)[:80]}"
++    else:
++        valerr = None
++
++    return reward, metrics, valerr
++
++
++# ----------------------------
++# System prompt (concise)
++# ----------------------------
++SYSTEM_PROMPT: str = (
++    "You are a precise information extraction model. "
++    "Extract the requested fields and answer with only a valid JSON object. "
++    "Use exact schema and types; no extra keys, no commentary."
++)
++
+diff --git a/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8be09712fe68800b29cc00b557c8ab16457fb232
+--- /dev/null
++++ b/codex_runs/json_extraction/gpt-5/20250920_234847/rollout.py
+@@ -0,0 +1,106 @@
++"""ART rollout for the JSON extraction environment.
++
++Implements a single-turn rollout that:
++- builds a concise system/user prompt
++- queries the model via the ART LocalBackend-compatible API surface
++- parses and validates structured output
++- logs scalar-only metadata and numeric metrics
++
++Reward shaping mirrors best practices: valid JSON, coverage, types, and
++value accuracy (with a smooth term for numeric closeness).
++"""
++from __future__ import annotations
++
++import requests
++import weave
++import art
++from typing import Any
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    get_rng,
++    pick_example,
++    build_user_prompt,
++    extract_json_object,
++    compute_reward,
++    EXAMPLES,
++)
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Single-step rollout for JSON extraction.
++
++    Parameters
++    - model: ART model handle (assumed LocalBackend for training/inference)
++    - step: current training step
++    - config: training config dict allowing overrides of generation params
++    """
++    rng = get_rng(step)
++    ex_idx, example = pick_example(step, rng)
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": SYSTEM_PROMPT}],
++        metadata={
++            "task": "json_extraction",
++            "project": str(TRAINING_CONFIG.get("project", "json-extract")),
++            "step": int(step),
++            "example_index": int(ex_idx),
++            "example_id": str(example["id"]),
++        },
++        reward=0.0,
++    )
++
++    user_prompt = build_user_prompt(example)
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # LocalBackend-compatible OpenAI transport (as in 2048 example)
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    # Allow host config to override generation knobs
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=max_tokens,
++        stream=False,
++        temperature=temperature,
++        top_p=top_p,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    payload, parse_err = extract_json_object(content)
++
++    # Defensive validation + reward
++    truth = example["label"]
++    if payload is None:
++        reward, shaped, _ = 0.0, {"valid_json": 0.0, "field_coverage": 0.0, "type_score": 0.0, "value_score": 0.0, "exact_match": 0.0, "total_rel_error": 1.0}, None
++        invalid = 1.0
++    else:
++        reward, shaped, _ = compute_reward(payload, truth)
++        invalid = 0.0
++
++    # Record numeric metrics (numbers only)
++    trajectory.metrics.update(shaped)
++    trajectory.metrics["invalid_solution"] = float(invalid)
++    trajectory.metrics["chars_out"] = float(len(content))
++
++    # Scalar-only metadata for aggregation
++    trajectory.metadata["parse_error"] = str(parse_err or "none")
++
++    trajectory.reward = float(reward)
++    return trajectory
++
+
