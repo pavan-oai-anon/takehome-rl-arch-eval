@@ -1,0 +1,1442 @@
+[2025-09-20T19:09:10] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910
+model: gpt-5-codex
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-20T19:09:10] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Design an ART reinforcement learning task that extracts structured JSON from unstructured data. The environment should emit a piece of text containing free-form text and metadata fields. You probably want to seed the environment with 10-20 examples. The agent must return a JSON object, ensuring the response is valid JSON and fields follow the prompted schema. Reuse the shared project scaffolding and keep the ergonomics close to the 2048 reference.
+
+[2025-09-20T19:09:13] thinking
+
+**Preparing a plan for env.py and rollout.py**
+[2025-09-20T19:09:14] exec bash -lc ls in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:09:14] bash -lc ls succeeded in 7ms:
+prompt.txt
+[2025-09-20T19:09:14] tokens used: 3,774
+
+[2025-09-20T19:10:23] thinking
+
+**Outlining environment and rollout modules**
+
+I'm mapping out the minimal RL environment and rollout setup for JSON extraction, defining seeds, configs, example data, validation logic, and async rollout with retries—mirroring 2048’s style but streamlined. Next, I'll build env.py with data and helpers, then rollout.py referencing env.
+**Designing extraction examples dataset**
+[2025-09-20T19:10:30] codex
+**Designing extraction examples dataset**
+[2025-09-20T19:11:34] exec bash -lc "cat <<'EOF' > env.py
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+RANDOM_SEED = 137
+
+TRAINING_CONFIG: dict[str, Any] = {
+    \"project\": \"json-extraction\",
+    \"model_name\": \"structured-json-agent\",
+    \"base_model\": \"meta-llama/Llama-3-8b\",
+    \"steps\": 60,
+    \"trajectories_per_group\": 4,
+    \"groups_per_step\": 3,
+    \"learning_rate\": 2e-5,
+    \"max_completion_tokens\": 256,
+    \"temperature\": 0.2,
+    \"top_p\": 0.9,
+    \"max_exceptions\": 2,
+    \"cleanup_keep_last\": 2,
+}
+
+REQUIRED_FIELDS: tuple[str, ...] = (
+    \"title\",
+    \"author\",
+    \"published_date\",
+    \"category\",
+    \"body\",
+)
+
+SYSTEM_PROMPT = (
+    \"You transform noisy notes into clean JSON. Return only strict JSON with the \"
+    \"keys title, author, published_date, category, and body. All values must be strings.\"
+)
+
+
+@dataclass(frozen=True)
+class ExtractionExample:
+    \"\"\"Static container describing a single document extraction scenario.\"\"\"
+
+    example_id: str
+    raw_text: str
+    target: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    \"\"\"Normalized validation feedback used by the rollout policy.\"\"\"
+
+    reward: float
+    invalid: bool
+    error: str
+    field_accuracy: float
+
+
+_examples: tuple[ExtractionExample, ...] = (
+    ExtractionExample(
+        example_id=\"alpha1\",
+        raw_text=(
+            \"Sender: Maya Hernandez (Marketing)\\n\"
+            \"Slack thread captured on March 18, 2024.\\n\"
+            \"Subject line states: Spring Campaign Kickoff.\\n\"
+            \"Metadata summary says Title=Spring Campaign Kickoff | Author=Maya Hernandez | Date=2024-03-18 | Category=marketing.\\n\"
+            \"Body section mentions: Outlines timeline for social ads and partner webinars.\"
+        ),
+        target={
+            \"title\": \"Spring Campaign Kickoff\",
+            \"author\": \"Maya Hernandez\",
+            \"published_date\": \"2024-03-18\",
+            \"category\": \"marketing\",
+            \"body\": \"Outlines timeline for social ads and partner webinars.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"bravo2\",
+        raw_text=(
+            \"Weekly engineering recap by Priya Shah.\\n\"
+            \"Header shows title 'Service Latency Investigation'.\\n\"
+            \"Log line: written 2024-02-27.\\n\"
+            \"Categorized as engineering in the inbox tagger.\\n\"
+            \"Detailed notes read: Root cause traced to cache stampede mitigation backlog.\"
+        ),
+        target={
+            \"title\": \"Service Latency Investigation\",
+            \"author\": \"Priya Shah\",
+            \"published_date\": \"2024-02-27\",
+            \"category\": \"engineering\",
+            \"body\": \"Root cause traced to cache stampede mitigation backlog.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"charlie3\",
+        raw_text=(
+            \"Finance memo stored under quarterly updates.\\n\"
+            \"Document title listed as 'Budget Reforecast Q2'.\\n\"
+            \"Prepared by Owen Brooks.\\n\"
+            \"Timestamp: 2024-04-05.\\n\"
+            \"Body copy: Adjusting spend toward customer education webinars.\\n\"
+            \"Tag set in archive: finance.\"
+        ),
+        target={
+            \"title\": \"Budget Reforecast Q2\",
+            \"author\": \"Owen Brooks\",
+            \"published_date\": \"2024-04-05\",
+            \"category\": \"finance\",
+            \"body\": \"Adjusting spend toward customer education webinars.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"delta4\",
+        raw_text=(
+            \"Operations checklist captured from Confluence.\\n\"
+            \"Page heading reads 'Warehouse Intake SOP Refresh'.\\n\"
+            \"Compiled by Taylor Kim on 2024-01-22.\\n\"
+            \"Ops label applied.\\n\"
+            \"Narrative paragraph: Emphasizes barcode validation before pallet staging.\"
+        ),
+        target={
+            \"title\": \"Warehouse Intake SOP Refresh\",
+            \"author\": \"Taylor Kim\",
+            \"published_date\": \"2024-01-22\",
+            \"category\": \"operations\",
+            \"body\": \"Emphasizes barcode validation before pallet staging.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"echo5\",
+        raw_text=(
+            \"HR onboarding digest compiled by Lena Ortiz.\\n\"
+            \"Summary label indicates title Onboarding Satisfaction Survey.\\n\"
+            \"Completion date logged as 2024-03-01.\\n\"
+            \"Topic bucket: hr.\\n\"
+            \"Survey findings line: Highlights mentorship pairing as top satisfaction driver.\"
+        ),
+        target={
+            \"title\": \"Onboarding Satisfaction Survey\",
+            \"author\": \"Lena Ortiz\",
+            \"published_date\": \"2024-03-01\",
+            \"category\": \"hr\",
+            \"body\": \"Highlights mentorship pairing as top satisfaction driver.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"foxtrot6\",
+        raw_text=(
+            \"Product discovery note.\\n\"
+            \"Headline: Beta Feedback Rollup.\\n\"
+            \"Reporter: Amir Saleh with date 2024-04-15.\\n\"
+            \"Filed under category product.\\n\"
+            \"Body snippet says: Customers want clearer onboarding videos and contextual tips.\"
+        ),
+        target={
+            \"title\": \"Beta Feedback Rollup\",
+            \"author\": \"Amir Saleh\",
+            \"published_date\": \"2024-04-15\",
+            \"category\": \"product\",
+            \"body\": \"Customers want clearer onboarding videos and contextual tips.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"golf7\",
+        raw_text=(
+            \"Support center escalation note.\\n\"
+            \"Note header: Priority Ticket Audit.\\n\"
+            \"Analyst: Noor Bennett recorded on 2024-02-14.\\n\"
+            \"Tag displayed: support.\\n\"
+            \"Body text indicates: Audit found response scripts missing refund scenarios.\"
+        ),
+        target={
+            \"title\": \"Priority Ticket Audit\",
+            \"author\": \"Noor Bennett\",
+            \"published_date\": \"2024-02-14\",
+            \"category\": \"support\",
+            \"body\": \"Audit found response scripts missing refund scenarios.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"hotel8\",
+        raw_text=(
+            \"Executive briefing recorded for leadership.\\n\"
+            \"Briefing title: Strategic Partnerships Outlook.\\n\"
+            \"Drafted by CEO Morgan Lee with date 2024-05-02.\\n\"
+            \"Labelled under executive.\\n\"
+            \"Body summary captures: Expecting two new fintech alliances pending compliance review.\"
+        ),
+        target={
+            \"title\": \"Strategic Partnerships Outlook\",
+            \"author\": \"Morgan Lee\",
+            \"published_date\": \"2024-05-02\",
+            \"category\": \"executive\",
+            \"body\": \"Expecting two new fintech alliances pending compliance review.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"india9\",
+        raw_text=(
+            \"Compliance bulletin uploaded to shared drive.\\n\"
+            \"Reference headline 'Policy Audit Findings'.\\n\"
+            \"Prepared by Dana Cooper, dated 2024-01-30.\\n\"
+            \"Classification: compliance.\\n\"
+            \"Bullet point states: Identified outdated retention language in vendor contracts.\"
+        ),
+        target={
+            \"title\": \"Policy Audit Findings\",
+            \"author\": \"Dana Cooper\",
+            \"published_date\": \"2024-01-30\",
+            \"category\": \"compliance\",
+            \"body\": \"Identified outdated retention language in vendor contracts.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"juliet10\",
+        raw_text=(
+            \"Lab notebook entry with header 'Prototype Thermal Test'.\\n\"
+            \"Scientist: Rui Nakamura recorded results on 2024-03-25.\\n\"
+            \"Tagged research.\\n\"
+            \"Narrative segment: Cooling loop maintained stability under 85C stress.\"
+        ),
+        target={
+            \"title\": \"Prototype Thermal Test\",
+            \"author\": \"Rui Nakamura\",
+            \"published_date\": \"2024-03-25\",
+            \"category\": \"research\",
+            \"body\": \"Cooling loop maintained stability under 85C stress.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"kilo11\",
+        raw_text=(
+            \"Logistics update email referencing 'Freight Consolidation Trial'.\\n\"
+            \"Coordinator Billie Adams posted on 2024-02-08.\\n\"
+            \"Categorized under logistics.\\n\"
+            \"Message body: Trial reduced partial loads and improved dock utilization.\"
+        ),
+        target={
+            \"title\": \"Freight Consolidation Trial\",
+            \"author\": \"Billie Adams\",
+            \"published_date\": \"2024-02-08\",
+            \"category\": \"logistics\",
+            \"body\": \"Trial reduced partial loads and improved dock utilization.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"lima12\",
+        raw_text=(
+            \"Community report delivered in town hall.\\n\"
+            \"Display title says 'Volunteer Impact Recap'.\\n\"
+            \"Narrated by Erin Blake, dated 2024-04-02.\\n\"
+            \"Label indicates community.\\n\"
+            \"Body paragraph reads: Volunteers logged 420 hours mentoring STEM students.\"
+        ),
+        target={
+            \"title\": \"Volunteer Impact Recap\",
+            \"author\": \"Erin Blake\",
+            \"published_date\": \"2024-04-02\",
+            \"category\": \"community\",
+            \"body\": \"Volunteers logged 420 hours mentoring STEM students.\",
+        },
+    ),
+)
+
+
+def get_examples() -> Sequence[ExtractionExample]:
+    \"\"\"Return the full immutable example suite.\"\"\"
+
+    return _examples
+
+
+def sample_example(rng: random.Random | None = None) -> ExtractionExample:
+    \"\"\"Select a deterministic example when seeded.\"\"\"
+
+    if rng is None:
+        rng = random.Random(RANDOM_SEED)
+    return rng.choice(_examples)
+
+
+def build_user_prompt(example: ExtractionExample) -> str:
+    \"\"\"Compose the user-facing prompt clarifying schema expectations.\"\"\"
+
+    schema_hint = json.dumps({field: \"string\" for field in REQUIRED_FIELDS}, indent=2)
+    return (
+        \"Extract the required metadata from the raw document below.\"\\
+        \" Ensure the reply is valid JSON with double-quoted keys and values.\"\\
+        \" Do not add explanations or code fences.\\n\\n\"
+        f\"Schema:\\n{schema_hint}\\n\\n\"
+        \"Document:\\n<<<\\n\"
+        f\"{example.raw_text}\\n\"
+        \">>>\"
+    )
+
+
+def validate_agent_response(raw_response: str, example: ExtractionExample) -> ValidationOutcome:
+    \"\"\"Score the agent response using strict JSON validation.\"\"\"
+
+    raw_response = raw_response.strip()
+    if not raw_response:
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"empty_response\", field_accuracy=0.0)
+
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"json_parse_error\", field_accuracy=0.0)
+
+    if not isinstance(parsed, dict):
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"not_object\", field_accuracy=0.0)
+
+    total_fields = len(REQUIRED_FIELDS)
+    correct_fields = 0
+
+    for field in REQUIRED_FIELDS:
+        if field not in parsed:
+            continue
+        value = parsed[field]
+        if not isinstance(value, str):
+            continue
+        if value.strip() == example.target[field]:
+            correct_fields += 1
+
+    field_accuracy = correct_fields / total_fields
+
+    missing = [field for field in REQUIRED_FIELDS if field not in parsed]
+    non_string = [field for field in REQUIRED_FIELDS if field in parsed and not isinstance(parsed[field], str)]
+
+    if missing:
+        return ValidationOutcome(
+            reward=field_accuracy - 1.0,
+            invalid=True,
+            error=f\"missing:{','.join(sorted(missing))}\",
+            field_accuracy=field_accuracy,
+        )
+
+    if non_string:
+        return ValidationOutcome(
+            reward=field_accuracy - 1.0,
+            invalid=True,
+            error=f\"non_string:{','.join(sorted(non_string))}\",
+            field_accuracy=field_accuracy,
+        )
+
+    if correct_fields "'!= total_fields:
+        return ValidationOutcome(
+            reward=max(field_accuracy - 0.2, -0.5),
+            invalid=False,
+            error="value_mismatch",
+            field_accuracy=field_accuracy,
+        )
+
+    return ValidationOutcome(
+        reward=1.0,
+        invalid=False,
+        error="ok",
+        field_accuracy=1.0,
+    )
+
+
+__all__ = [
+    "RANDOM_SEED",
+    "TRAINING_CONFIG",
+    "REQUIRED_FIELDS",
+    "SYSTEM_PROMPT",
+    "ExtractionExample",
+    "ValidationOutcome",
+    "get_examples",
+    "sample_example",
+    "build_user_prompt",
+    "validate_agent_response",
+]
+EOF
+' in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:11:34] bash -lc "cat <<'EOF' > env.py
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+RANDOM_SEED = 137
+
+TRAINING_CONFIG: dict[str, Any] = {
+    \"project\": \"json-extraction\",
+    \"model_name\": \"structured-json-agent\",
+    \"base_model\": \"meta-llama/Llama-3-8b\",
+    \"steps\": 60,
+    \"trajectories_per_group\": 4,
+    \"groups_per_step\": 3,
+    \"learning_rate\": 2e-5,
+    \"max_completion_tokens\": 256,
+    \"temperature\": 0.2,
+    \"top_p\": 0.9,
+    \"max_exceptions\": 2,
+    \"cleanup_keep_last\": 2,
+}
+
+REQUIRED_FIELDS: tuple[str, ...] = (
+    \"title\",
+    \"author\",
+    \"published_date\",
+    \"category\",
+    \"body\",
+)
+
+SYSTEM_PROMPT = (
+    \"You transform noisy notes into clean JSON. Return only strict JSON with the \"
+    \"keys title, author, published_date, category, and body. All values must be strings.\"
+)
+
+
+@dataclass(frozen=True)
+class ExtractionExample:
+    \"\"\"Static container describing a single document extraction scenario.\"\"\"
+
+    example_id: str
+    raw_text: str
+    target: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    \"\"\"Normalized validation feedback used by the rollout policy.\"\"\"
+
+    reward: float
+    invalid: bool
+    error: str
+    field_accuracy: float
+
+
+_examples: tuple[ExtractionExample, ...] = (
+    ExtractionExample(
+        example_id=\"alpha1\",
+        raw_text=(
+            \"Sender: Maya Hernandez (Marketing)\\n\"
+            \"Slack thread captured on March 18, 2024.\\n\"
+            \"Subject line states: Spring Campaign Kickoff.\\n\"
+            \"Metadata summary says Title=Spring Campaign Kickoff | Author=Maya Hernandez | Date=2024-03-18 | Category=marketing.\\n\"
+            \"Body section mentions: Outlines timeline for social ads and partner webinars.\"
+        ),
+        target={
+            \"title\": \"Spring Campaign Kickoff\",
+            \"author\": \"Maya Hernandez\",
+            \"published_date\": \"2024-03-18\",
+            \"category\": \"marketing\",
+            \"body\": \"Outlines timeline for social ads and partner webinars.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"bravo2\",
+        raw_text=(
+            \"Weekly engineering recap by Priya Shah.\\n\"
+            \"Header shows title 'Service Latency Investigation'.\\n\"
+            \"Log line: written 2024-02-27.\\n\"
+            \"Categorized as engineering in the inbox tagger.\\n\"
+            \"Detailed notes read: Root cause traced to cache stampede mitigation backlog.\"
+        ),
+        target={
+            \"title\": \"Service Latency Investigation\",
+            \"author\": \"Priya Shah\",
+            \"published_date\": \"2024-02-27\",
+            \"category\": \"engineering\",
+            \"body\": \"Root cause traced to cache stampede mitigation backlog.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"charlie3\",
+        raw_text=(
+            \"Finance memo stored under quarterly updates.\\n\"
+            \"Document title listed as 'Budget Reforecast Q2'.\\n\"
+            \"Prepared by Owen Brooks.\\n\"
+            \"Timestamp: 2024-04-05.\\n\"
+            \"Body copy: Adjusting spend toward customer education webinars.\\n\"
+            \"Tag set in archive: finance.\"
+        ),
+        target={
+            \"title\": \"Budget Reforecast Q2\",
+            \"author\": \"Owen Brooks\",
+            \"published_date\": \"2024-04-05\",
+            \"category\": \"finance\",
+            \"body\": \"Adjusting spend toward customer education webinars.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"delta4\",
+        raw_text=(
+            \"Operations checklist captured from Confluence.\\n\"
+            \"Page heading reads 'Warehouse Intake SOP Refresh'.\\n\"
+            \"Compiled by Taylor Kim on 2024-01-22.\\n\"
+            \"Ops label applied.\\n\"
+            \"Narrative paragraph: Emphasizes barcode validation before pallet staging.\"
+        ),
+        target={
+            \"title\": \"Warehouse Intake SOP Refresh\",
+            \"author\": \"Taylor Kim\",
+            \"published_date\": \"2024-01-22\",
+            \"category\": \"operations\",
+            \"body\": \"Emphasizes barcode validation before pallet staging.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"echo5\",
+        raw_text=(
+            \"HR onboarding digest compiled by Lena Ortiz.\\n\"
+            \"Summary label indicates title Onboarding Satisfaction Survey.\\n\"
+            \"Completion date logged as 2024-03-01.\\n\"
+            \"Topic bucket: hr.\\n\"
+            \"Survey findings line: Highlights mentorship pairing as top satisfaction driver.\"
+        ),
+        target={
+            \"title\": \"Onboarding Satisfaction Survey\",
+            \"author\": \"Lena Ortiz\",
+            \"published_date\": \"2024-03-01\",
+            \"category\": \"hr\",
+            \"body\": \"Highlights mentorship pairing as top satisfaction driver.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"foxtrot6\",
+        raw_text=(
+            \"Product discovery note.\\n\"
+            \"Headline: Beta Feedback Rollup.\\n\"
+            \"Reporter: Amir Saleh with date 2024-04-15.\\n\"
+            \"Filed under category product.\\n\"
+            \"Body snippet says: Customers want clearer onboarding videos and contextual tips.\"
+        ),
+        target={
+            \"title\": \"Beta Feedback Rollup\",
+            \"author\": \"Amir Saleh\",
+            \"published_date\": \"2024-04-15\",
+            \"category\": \"product\",
+            \"body\": \"Customers want clearer onboarding videos and contextual tips.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"golf7\",
+        raw_text=(
+            \"Support center escalation note.\\n\"
+            \"Note header: Priority Ticket Audit.\\n\"
+            \"Analyst: Noor Bennett recorded on 2024-02-14.\\n\"
+            \"Tag displayed: support.\\n\"
+            \"Body text indicates: Audit found response scripts missing refund scenarios.\"
+        ),
+        target={
+            \"title\": \"Priority Ticket Audit\",
+            \"author\": \"Noor Bennett\",
+            \"published_date\": \"2024-02-14\",
+            \"category\": \"support\",
+            \"body\": \"Audit found response scripts missing refund scenarios.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"hotel8\",
+        raw_text=(
+            \"Executive briefing recorded for leadership.\\n\"
+            \"Briefing title: Strategic Partnerships Outlook.\\n\"
+            \"Drafted by CEO Morgan Lee with date 2024-05-02.\\n\"
+            \"Labelled under executive.\\n\"
+            \"Body summary captures: Expecting two new fintech alliances pending compliance review.\"
+        ),
+        target={
+            \"title\": \"Strategic Partnerships Outlook\",
+            \"author\": \"Morgan Lee\",
+            \"published_date\": \"2024-05-02\",
+            \"category\": \"executive\",
+            \"body\": \"Expecting two new fintech alliances pending compliance review.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"india9\",
+        raw_text=(
+            \"Compliance bulletin uploaded to shared drive.\\n\"
+            \"Reference headline 'Policy Audit Findings'.\\n\"
+            \"Prepared by Dana Cooper, dated 2024-01-30.\\n\"
+            \"Classification: compliance.\\n\"
+            \"Bullet point states: Identified outdated retention language in vendor contracts.\"
+        ),
+        target={
+            \"title\": \"Policy Audit Findings\",
+            \"author\": \"Dana Cooper\",
+            \"published_date\": \"2024-01-30\",
+            \"category\": \"compliance\",
+            \"body\": \"Identified outdated retention language in vendor contracts.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"juliet10\",
+        raw_text=(
+            \"Lab notebook entry with header 'Prototype Thermal Test'.\\n\"
+            \"Scientist: Rui Nakamura recorded results on 2024-03-25.\\n\"
+            \"Tagged research.\\n\"
+            \"Narrative segment: Cooling loop maintained stability under 85C stress.\"
+        ),
+        target={
+            \"title\": \"Prototype Thermal Test\",
+            \"author\": \"Rui Nakamura\",
+            \"published_date\": \"2024-03-25\",
+            \"category\": \"research\",
+            \"body\": \"Cooling loop maintained stability under 85C stress.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"kilo11\",
+        raw_text=(
+            \"Logistics update email referencing 'Freight Consolidation Trial'.\\n\"
+            \"Coordinator Billie Adams posted on 2024-02-08.\\n\"
+            \"Categorized under logistics.\\n\"
+            \"Message body: Trial reduced partial loads and improved dock utilization.\"
+        ),
+        target={
+            \"title\": \"Freight Consolidation Trial\",
+            \"author\": \"Billie Adams\",
+            \"published_date\": \"2024-02-08\",
+            \"category\": \"logistics\",
+            \"body\": \"Trial reduced partial loads and improved dock utilization.\",
+        },
+    ),
+    ExtractionExample(
+        example_id=\"lima12\",
+        raw_text=(
+            \"Community report delivered in town hall.\\n\"
+            \"Display title says 'Volunteer Impact Recap'.\\n\"
+            \"Narrated by Erin Blake, dated 2024-04-02.\\n\"
+            \"Label indicates community.\\n\"
+            \"Body paragraph reads: Volunteers logged 420 hours mentoring STEM students.\"
+        ),
+        target={
+            \"title\": \"Volunteer Impact Recap\",
+            \"author\": \"Erin Blake\",
+            \"published_date\": \"2024-04-02\",
+            \"category\": \"community\",
+            \"body\": \"Volunteers logged 420 hours mentoring STEM students.\",
+        },
+    ),
+)
+
+
+def get_examples() -> Sequence[ExtractionExample]:
+    \"\"\"Return the full immutable example suite.\"\"\"
+
+    return _examples
+
+
+def sample_example(rng: random.Random | None = None) -> ExtractionExample:
+    \"\"\"Select a deterministic example when seeded.\"\"\"
+
+    if rng is None:
+        rng = random.Random(RANDOM_SEED)
+    return rng.choice(_examples)
+
+
+def build_user_prompt(example: ExtractionExample) -> str:
+    \"\"\"Compose the user-facing prompt clarifying schema expectations.\"\"\"
+
+    schema_hint = json.dumps({field: \"string\" for field in REQUIRED_FIELDS}, indent=2)
+    return (
+        \"Extract the required metadata from the raw document below.\"\\
+        \" Ensure the reply is valid JSON with double-quoted keys and values.\"\\
+        \" Do not add explanations or code fences.\\n\\n\"
+        f\"Schema:\\n{schema_hint}\\n\\n\"
+        \"Document:\\n<<<\\n\"
+        f\"{example.raw_text}\\n\"
+        \">>>\"
+    )
+
+
+def validate_agent_response(raw_response: str, example: ExtractionExample) -> ValidationOutcome:
+    \"\"\"Score the agent response using strict JSON validation.\"\"\"
+
+    raw_response = raw_response.strip()
+    if not raw_response:
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"empty_response\", field_accuracy=0.0)
+
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"json_parse_error\", field_accuracy=0.0)
+
+    if not isinstance(parsed, dict):
+        return ValidationOutcome(reward=-1.0, invalid=True, error=\"not_object\", field_accuracy=0.0)
+
+    total_fields = len(REQUIRED_FIELDS)
+    correct_fields = 0
+
+    for field in REQUIRED_FIELDS:
+        if field not in parsed:
+            continue
+        value = parsed[field]
+        if not isinstance(value, str):
+            continue
+        if value.strip() == example.target[field]:
+            correct_fields += 1
+
+    field_accuracy = correct_fields / total_fields
+
+    missing = [field for field in REQUIRED_FIELDS if field not in parsed]
+    non_string = [field for field in REQUIRED_FIELDS if field in parsed and not isinstance(parsed[field], str)]
+
+    if missing:
+        return ValidationOutcome(
+            reward=field_accuracy - 1.0,
+            invalid=True,
+            error=f\"missing:{','.join(sorted(missing))}\",
+            field_accuracy=field_accuracy,
+        )
+
+    if non_string:
+        return ValidationOutcome(
+            reward=field_accuracy - 1.0,
+            invalid=True,
+            error=f\"non_string:{','.join(sorted(non_string))}\",
+            field_accuracy=field_accuracy,
+        )
+
+    if correct_fields "'!= total_fields:
+        return ValidationOutcome(
+            reward=max(field_accuracy - 0.2, -0.5),
+            invalid=False,
+            error="value_mismatch",
+            field_accuracy=field_accuracy,
+        )
+
+    return ValidationOutcome(
+        reward=1.0,
+        invalid=False,
+        error="ok",
+        field_accuracy=1.0,
+    )
+
+
+__all__ = [
+    "RANDOM_SEED",
+    "TRAINING_CONFIG",
+    "REQUIRED_FIELDS",
+    "SYSTEM_PROMPT",
+    "ExtractionExample",
+    "ValidationOutcome",
+    "get_examples",
+    "sample_example",
+    "build_user_prompt",
+    "validate_agent_response",
+]
+EOF
+' succeeded in 9ms:
+
+[2025-09-20T19:11:34] tokens used: 12,186
+
+[2025-09-20T19:11:47] thinking
+
+**Designing rollout.py implementation**
+
+I'm sketching out the new rollout.py module based on the provided pseudocode, making sure to handle imports, retries, seeding randomness, and metadata/metrics recording carefully. I'll include a docstring, track completion details like finish_reason and used temperature/top_p, and keep the function robust with config fallbacks and type-safe metadata. Next, I'll create the file with this implementation.
+[2025-09-20T19:11:52] exec bash -lc "cat <<'EOF' > rollout.py
+from __future__ import annotations
+
+import random
+from typing import Any
+
+import art
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    SYSTEM_PROMPT,
+    TRAINING_CONFIG,
+    build_user_prompt,
+    sample_example,
+    validate_agent_response,
+)
+
+
+@weave.op
+@art.retry(exceptions=(RuntimeError, ValueError), max_attempts=3)
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    \"\"\"Run a single ART rollout that validates JSON extraction.\"\"\"
+
+    rng = random.Random(RANDOM_SEED + step)
+    example = sample_example(rng)
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {\"role\": \"system\", \"content\": SYSTEM_PROMPT},
+            {\"role\": \"user\", \"content\": build_user_prompt(example)},
+        ],
+        metadata={
+            \"example_id\": example.example_id,
+            \"model_name\": model.name,
+            \"step\": step,
+            \"validation_error\": \"pending\",
+            \"raw_char_count\": len(example.raw_text),
+        },
+        reward=0.0,
+    )
+
+    temperature = float(config.get(\"temperature\", TRAINING_CONFIG[\"temperature\"]))
+    top_p = float(config.get(\"top_p\", TRAINING_CONFIG[\"top_p\"]))
+    max_tokens = int(config.get(\"max_completion_tokens\", TRAINING_CONFIG[\"max_completion_tokens\"]))
+
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        temperature=temperature,
+        top_p=top_p,
+        max_completion_tokens=max_tokens,
+        stream=False,
+    )
+
+    choice = completion.choices[0]
+    content = choice.message.content or \"\"
+    trajectory.messages_and_choices.append(choice)
+
+    result = validate_agent_response(content, example)
+    trajectory.reward = result.reward
+    trajectory.metadata[\"validation_error\"] = result.error
+    trajectory.metadata[\"finish_reason\"] = choice.finish_reason or \"none\"
+
+    trajectory.metrics[\"invalid_solution\"] = 1.0 if result.invalid else 0.0
+    trajectory.metrics[\"field_accuracy\"] = result.field_accuracy
+    trajectory.metrics[\"used_temperature\"] = temperature
+    trajectory.metrics[\"used_top_p\"] = top_p
+    trajectory.metrics[\"max_completion_tokens\"] = float(max_tokens)
+
+    if result.invalid:
+        trajectory.metrics[\"reward_penalty\"] = result.reward
+    else:
+        trajectory.metrics[\"reward_penalty\"] = 0.0
+
+    return trajectory
+
+
+__all__ = [\"rollout\"]
+EOF
+" in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:11:52] bash -lc "cat <<'EOF' > rollout.py
+from __future__ import annotations
+
+import random
+from typing import Any
+
+import art
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    SYSTEM_PROMPT,
+    TRAINING_CONFIG,
+    build_user_prompt,
+    sample_example,
+    validate_agent_response,
+)
+
+
+@weave.op
+@art.retry(exceptions=(RuntimeError, ValueError), max_attempts=3)
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    \"\"\"Run a single ART rollout that validates JSON extraction.\"\"\"
+
+    rng = random.Random(RANDOM_SEED + step)
+    example = sample_example(rng)
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {\"role\": \"system\", \"content\": SYSTEM_PROMPT},
+            {\"role\": \"user\", \"content\": build_user_prompt(example)},
+        ],
+        metadata={
+            \"example_id\": example.example_id,
+            \"model_name\": model.name,
+            \"step\": step,
+            \"validation_error\": \"pending\",
+            \"raw_char_count\": len(example.raw_text),
+        },
+        reward=0.0,
+    )
+
+    temperature = float(config.get(\"temperature\", TRAINING_CONFIG[\"temperature\"]))
+    top_p = float(config.get(\"top_p\", TRAINING_CONFIG[\"top_p\"]))
+    max_tokens = int(config.get(\"max_completion_tokens\", TRAINING_CONFIG[\"max_completion_tokens\"]))
+
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        temperature=temperature,
+        top_p=top_p,
+        max_completion_tokens=max_tokens,
+        stream=False,
+    )
+
+    choice = completion.choices[0]
+    content = choice.message.content or \"\"
+    trajectory.messages_and_choices.append(choice)
+
+    result = validate_agent_response(content, example)
+    trajectory.reward = result.reward
+    trajectory.metadata[\"validation_error\"] = result.error
+    trajectory.metadata[\"finish_reason\"] = choice.finish_reason or \"none\"
+
+    trajectory.metrics[\"invalid_solution\"] = 1.0 if result.invalid else 0.0
+    trajectory.metrics[\"field_accuracy\"] = result.field_accuracy
+    trajectory.metrics[\"used_temperature\"] = temperature
+    trajectory.metrics[\"used_top_p\"] = top_p
+    trajectory.metrics[\"max_completion_tokens\"] = float(max_tokens)
+
+    if result.invalid:
+        trajectory.metrics[\"reward_penalty\"] = result.reward
+    else:
+        trajectory.metrics[\"reward_penalty\"] = 0.0
+
+    return trajectory
+
+
+__all__ = [\"rollout\"]
+EOF
+" succeeded in 12ms:
+
+[2025-09-20T19:11:52] tokens used: 17,242
+
+[2025-09-20T19:11:53] thinking
+
+**Verifying directory contents**
+[2025-09-20T19:11:53] exec bash -lc ls in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:11:53] bash -lc ls succeeded in 7ms:
+env.py
+prompt.txt
+rollout.py
+[2025-09-20T19:11:53] tokens used: 18,067
+
+[2025-09-20T19:12:12] thinking
+
+**Summarizing final preparation and referencing**
+[2025-09-20T19:12:13] exec bash -lc 'nl -ba env.py' in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:12:13] bash -lc 'nl -ba env.py' succeeded in 7ms:
+     1	from __future__ import annotations
+     2	
+     3	import json
+     4	import random
+     5	from dataclasses import dataclass
+     6	from typing import Any, Mapping, Sequence
+     7	
+     8	RANDOM_SEED = 137
+     9	
+    10	TRAINING_CONFIG: dict[str, Any] = {
+    11	    "project": "json-extraction",
+    12	    "model_name": "structured-json-agent",
+    13	    "base_model": "meta-llama/Llama-3-8b",
+    14	    "steps": 60,
+    15	    "trajectories_per_group": 4,
+    16	    "groups_per_step": 3,
+    17	    "learning_rate": 2e-5,
+    18	    "max_completion_tokens": 256,
+    19	    "temperature": 0.2,
+    20	    "top_p": 0.9,
+[2025-09-20T19:12:13] tokens used: 19,244
+
+[2025-09-20T19:12:14] thinking
+
+**Preparing for rollout step**
+[2025-09-20T19:12:14] exec bash -lc 'nl -ba rollout.py' in /home/azureuser/probable-goggles-1/codex_runs/json_extraction/20250920_190910/.
+[2025-09-20T19:12:14] bash -lc 'nl -ba rollout.py' succeeded in 7ms:
+     1	from __future__ import annotations
+     2	
+     3	import random
+     4	from typing import Any
+     5	
+     6	import art
+     7	import weave
+     8	from openai import AsyncOpenAI
+     9	
+    10	from env import (
+    11	    RANDOM_SEED,
+    12	    SYSTEM_PROMPT,
+    13	    TRAINING_CONFIG,
+    14	    build_user_prompt,
+    15	    sample_example,
+    16	    validate_agent_response,
+    17	)
+    18	
+    19	
+    20	@weave.op
+[2025-09-20T19:12:14] tokens used: 22,671
+
+[2025-09-20T19:12:21] thinking
+
+**Finalizing response format**
+[2025-09-20T19:12:21] codex
+
+**Changes**
+- Added configurable JSON-extraction environment with seeded document corpus, schema-aware prompt builder, and strict reward validation helpers (`env.py:8`, `env.py:279`, `env.py:294`).
+- Implemented ART rollout that samples deterministic examples, invokes the local backend via OpenAI-compatible client, and records scalar metadata/metrics for training (`rollout.py:20`, `rollout.py:61`).
+
+**Next Steps**
+- 1. Install runtime deps as needed, e.g. `uv pip install art openai weave`.
+- 2. Wire these modules into the host `training.py` and run a short gather/train cycle to confirm trajectories and rewards behave as expected.
+[2025-09-20T19:12:22] tokens used: 24,341
