@@ -264,7 +264,14 @@ async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
         ),
     )
 
-    backend = LocalBackend(in_process=True, path="./.art")
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
     await model.register(backend)
 
     if os.getenv("WANDB_API_KEY"):

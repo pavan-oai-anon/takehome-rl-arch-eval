@@ -12,9 +12,9 @@ class TrainingConfig:
 
     project: str = "game-24"
     model_name: str = "agent-24"
-    base_model: str = "Qwen/Qwen2.5-1.5B"
-    steps: int = 10
-    trajectories_per_group: int = 8
+    base_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    steps: int = 1000
+    trajectories_per_group: int = 64
     groups_per_step: int = 2
     learning_rate: float = 1e-5
     max_completion_tokens: int = 192

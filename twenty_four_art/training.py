@@ -34,7 +34,13 @@ async def setup_model(config: TrainingConfig) -> tuple[art.TrainableModel, Local
         ),
     )
 
-    backend = LocalBackend(in_process=True, path="./.art")
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
     await model.register(backend)
 
     weave_enabled = False

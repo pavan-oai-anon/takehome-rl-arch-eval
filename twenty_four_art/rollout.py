@@ -63,12 +63,13 @@ async def rollout(model: art.Model, scenario: Scenario24) -> art.Trajectory:
     client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
 
     game = generate_game()
+    digit_metadata = {f"digit_{index}": value for index, value in enumerate(game.digits, start=1)}
     trajectory = art.Trajectory(
         messages_and_choices=[{"role": "system", "content": SYSTEM_MESSAGE}],
         metadata={
             "puzzle_id": game.id,
-            "digits": game.digits,
             "step": scenario.step,
+            **digit_metadata,
         },
         reward=0.0,
     )
@@ -100,6 +101,7 @@ async def rollout(model: art.Model, scenario: Scenario24) -> art.Trajectory:
             trajectory.reward = max(0.1, metrics["normalized_reward"])  # encourage near misses
     except InvalidExpressionError as error:
         trajectory.reward = -1.0
-        trajectory.metrics["error"] = str(error)
+        trajectory.metadata["error"] = str(error)
+        trajectory.metrics["invalid_solution"] = 1.0
 
     return trajectory
