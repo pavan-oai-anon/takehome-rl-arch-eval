@@ -61,8 +61,8 @@ class TrainingConfig:
         # override the base model with ours and training steps, trajectories per group, groups per step
         config.base_model = "Qwen/Qwen2.5-1.5B-Instruct"
         config.steps = 100
-        config.trajectories_per_group = 64
-        config.groups_per_step = 2
+        config.trajectories_per_group = 24
+        config.groups_per_step = 12
         return config
 
     def as_dict(self) -> dict[str, Any]:
