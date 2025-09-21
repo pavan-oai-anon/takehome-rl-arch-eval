@@ -1,9 +1,8 @@
 Rubric – Malicious Code Detection Environment
 
 Award points for environment/reward craftsmanship:
-- 2 pts: Static analysis heuristics (network calls, file wipes, credential access) populate signals used in rewards.
-- 2 pts: Reward logic grants distinct scores for correct classification, partial credit for right reasoning with wrong label, and penalties for contradictions.
-- 2 pts: JSON schema check enforces exact response format and surfaces descriptive errors.
-- 2 pts: Metadata logs heuristic flags and raw snippet context to aid debugging.
-- 2 pts: Unit tests or fixtures cover benign vs malicious examples across languages/file types.
 - 3 pts: Sample code snippets that are malicious are not ovbious in their comments / code. It's by the nature of their code they are malicious, not other things.
+- 2 pt: The samples seeded in the envionment are a variety of different languages, and not just one language.
+- 2 pt: The samples seeded in the environment have a variety of difficulty - they are not all trivial examples, or exceptionally difficult to figure out if they are malicious or not.
+- 2 pt: The rollouts are setup to extract out data in a structured format to make the judgement of correctness easier.
+- 1 pt: The environment has a sufficient number of samples, more than 10.
