@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         default="gpt-4.1",
         help="Model name for the code-interpreter evaluation step (default: gpt-4.1)",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=10,
+        help="Number of evaluation runs to perform (default: 10)",
+    )
     return parser.parse_args()
 
 
@@ -195,38 +201,65 @@ def main() -> None:
     user_prompt = load_user_prompt(user_prompt_path)
     client = OpenAI()
 
-    plan = request_evaluation_plan(client, args.gpt5_model, user_prompt)
-
     peft_model, tokenizer, device = load_peft_model(model_path)
-    model_response = generate_with_model(
-        peft_model,
-        tokenizer,
-        device,
-        plan.system_message,
-        plan.user_message,
-        args.max_new_tokens,
-        args.temperature,
-        args.top_p,
-    )
 
-    evaluation = evaluate_with_code_interpreter(
-        client,
-        args.evaluator_model,
-        plan,
-        model_response,
-    )
+    runs: list[dict[str, Any]] = []
 
-    report = {
+    for run_idx in range(1, args.runs + 1):
+        plan = request_evaluation_plan(client, args.gpt5_model, user_prompt)
+        model_response = generate_with_model(
+            peft_model,
+            tokenizer,
+            device,
+            plan.system_message,
+            plan.user_message,
+            args.max_new_tokens,
+            args.temperature,
+            args.top_p,
+        )
+        evaluation = evaluate_with_code_interpreter(
+            client,
+            args.evaluator_model,
+            plan,
+            model_response,
+        )
+        runs.append(
+            {
+                "plan": plan.__dict__,
+                "model_response": model_response,
+                "evaluation": evaluation,
+            }
+        )
+        print(
+            f"Run {run_idx}/{args.runs}: score={evaluation.get('score')} passed={evaluation.get('passed')}"
+        )
+
+    scores = [float(run["evaluation"].get("score", 0.0)) for run in runs]
+    passes = [bool(run["evaluation"].get("passed", False)) for run in runs]
+
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    pass_rate = sum(passes) / len(passes) if passes else 0.0
+    max_score = max(scores) if scores else 0.0
+    min_score = min(scores) if scores else 0.0
+
+    summary = {
         "model_path": str(model_path),
         "user_prompt_path": str(user_prompt_path),
-        "plan": plan.__dict__,
-        "model_response": model_response,
-        "evaluation": evaluation,
+        "runs": runs,
+        "aggregate": {
+            "runs": len(runs),
+            "average_score": avg_score,
+            "pass_rate": pass_rate,
+            "max_score": max_score,
+            "min_score": min_score,
+        },
     }
 
     output_path = Path(args.output).resolve()
-    output_path.write_text(json.dumps(report, indent=2))
-    print(f"Evaluation written to {output_path}")
+    output_path.write_text(json.dumps(summary, indent=2))
+    print(
+        f"Evaluation written to {output_path} | avg_score={avg_score:.3f} | pass_rate={pass_rate:.2%}"
+    )
 
 
 if __name__ == "__main__":
