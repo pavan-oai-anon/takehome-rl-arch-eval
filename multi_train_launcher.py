@@ -1,4 +1,4 @@
-"""Sequential launcher for running training.py on multiple Codex runs."""
+"""Multi-launcher for running training.py across multiple Codex runs."""
 from __future__ import annotations
 
 import argparse
@@ -9,14 +9,14 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-
 DEFAULT_TIMEOUT_SECONDS = 600  # 10 minutes
+MAX_CONCURRENT_JOBS = 2
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch training.py sequentially in separate subprocesses with a fixed timeout. "
+            "Launch training.py in separate subprocesses (up to two at a time) with a fixed timeout. "
             "Each positional JOB argument accepts a comma-separated list of Codex run "
             "directories that will be passed to training.py in a single invocation."
         )
@@ -42,7 +42,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--training-args",
-        default=[],
         nargs=argparse.REMAINDER,
         help=(
             "Optional additional arguments to append to every training.py invocation. "
@@ -58,57 +57,79 @@ def build_command(python: str, job_paths: Sequence[str], extra_args: Sequence[st
     return command
 
 
-def run_job(
-    job_index: int,
-    job_paths: Sequence[str],
-    *,
-    python_exec: str,
-    timeout: int,
-    extra_args: Sequence[str],
-) -> int:
-    command = build_command(python_exec, job_paths, extra_args)
-    display_command = " ".join(shlex.quote(part) for part in command)
-    print(f"[job {job_index}] starting: {display_command}")
-
-    start = time.time()
-    try:
-        result = subprocess.run(command, cwd=Path.cwd(), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        elapsed = time.time() - start
-        print(
-            f"[job {job_index}] timed out after {elapsed:.1f}s (limit {timeout}s). Command was: {display_command}"
-        )
-        return 124  # mimic timeout exit code convention
-
-    elapsed = time.time() - start
-    if result.returncode == 0:
-        print(f"[job {job_index}] completed successfully in {elapsed:.1f}s")
-    else:
-        print(f"[job {job_index}] failed in {elapsed:.1f}s with exit code {result.returncode}")
-    return result.returncode
-
-
 def main() -> None:
     args = parse_args()
 
-    extra_args = args.training_args
+    extra_args = args.training_args or []
+    if extra_args and extra_args[0] == "--":
+        extra_args = extra_args[1:]
 
-    overall_status = 0
+    jobs: list[tuple[int, list[str]]] = []
     for idx, job in enumerate(args.jobs, start=1):
         job_paths = [segment.strip() for segment in job.split(",") if segment.strip()]
         if not job_paths:
             print(f"[job {idx}] skipped (no valid paths specified)")
             continue
+        jobs.append((idx, job_paths))
 
-        return_code = run_job(
-            idx,
-            job_paths,
-            python_exec=args.python,
-            timeout=args.timeout,
-            extra_args=extra_args,
-        )
-        if return_code != 0 and overall_status == 0:
-            overall_status = return_code
+    overall_status = 0
+    active: list[dict[str, object]] = []
+    job_cursor = 0
+
+    while job_cursor < len(jobs) or active:
+        while job_cursor < len(jobs) and len(active) < MAX_CONCURRENT_JOBS:
+            idx, job_paths = jobs[job_cursor]
+            job_cursor += 1
+
+            command = build_command(args.python, job_paths, extra_args)
+            display_command = " ".join(shlex.quote(part) for part in command)
+            print(f"[job {idx}] starting: {display_command}")
+
+            process = subprocess.Popen(command, cwd=Path.cwd())
+            active.append(
+                {
+                    "index": idx,
+                    "paths": job_paths,
+                    "process": process,
+                    "display": display_command,
+                    "start": time.time(),
+                }
+            )
+
+        if not active:
+            break
+
+        time.sleep(1)
+        for job in list(active):
+            process: subprocess.Popen = job["process"]  # type: ignore[assignment]
+            idx = job["index"]  # type: ignore[assignment]
+            display_command = job["display"]  # type: ignore[assignment]
+            start_time = job["start"]  # type: ignore[assignment]
+            elapsed = time.time() - start_time
+
+            retcode = process.poll()
+            if retcode is None:
+                if elapsed > args.timeout:
+                    print(
+                        f"[job {idx}] timed out after {elapsed:.1f}s (limit {args.timeout}s). Command was: {display_command}"
+                    )
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                    active.remove(job)
+                    if overall_status == 0:
+                        overall_status = 124
+                continue
+
+            if retcode == 0:
+                print(f"[job {idx}] completed successfully in {elapsed:.1f}s")
+            else:
+                print(f"[job {idx}] failed in {elapsed:.1f}s with exit code {retcode}")
+                if overall_status == 0:
+                    overall_status = retcode
+            active.remove(job)
 
     sys.exit(overall_status)
 

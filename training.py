@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import os
 import random
+import re
 import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime
@@ -177,7 +178,7 @@ async def setup_model(
         init_args=art.dev.InitArgs(max_seq_length=8192),
         engine_args=art.dev.EngineArgs(
             enforce_eager=True,
-            gpu_memory_utilization=0.8,
+            gpu_memory_utilization=0.4,
         ),
     )
 
@@ -459,12 +460,18 @@ async def main() -> None:
             sys.modules["env"] = task.env_module
             sys.modules["rollout"] = task.rollout_module
 
-            model_dir_name = task.task_dir.parent.name
-            timestamp_component = task.task_dir.name
-            suffix_parts = [part for part in (model_dir_name, timestamp_component) if part]
-            unique_suffix = "-".join(suffix_parts) if suffix_parts else datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_model_name = task.config.model_name
-            task.config.model_name = f"{original_model_name}-{unique_suffix}"
+            try:
+                relative_path = task.task_dir.relative_to(Path.cwd())
+            except ValueError:
+                relative_path = task.task_dir
+            relevant_parts = relative_path.parts[-3:] if len(relative_path.parts) >= 3 else relative_path.parts
+            raw_name = "-".join(relevant_parts)
+            sanitized_name = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_name)
+            if not sanitized_name:
+                sanitized_name = datetime.now().strftime("run-%Y%m%d-%H%M%S")
+
+            task.config.model_name = sanitized_name
+            task.rollout_config["model_name"] = sanitized_name
 
             model, weave_enabled = await setup_model(
                 task.config,
@@ -472,8 +479,6 @@ async def main() -> None:
                 task_dir=task.task_dir,
                 random_seed=task.random_seed,
             )
-
-            task.rollout_config["model_name"] = task.config.model_name
 
             await run_training(
                 model,
