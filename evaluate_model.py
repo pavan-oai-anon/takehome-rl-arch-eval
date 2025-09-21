@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -31,11 +30,10 @@ def parse_args() -> argparse.Namespace:
             "Path to the PEFT model checkpoint directory or a Codex run folder (e.g. codex_runs/task/model/timestamp)"
         ),
     )
-    parser.add_argument("user_prompt_path", help="Path to the user prompt text file that describes the task")
     parser.add_argument(
         "--output",
-        default="evaluation_report.json",
-        help="Where to write the evaluation JSON report (default: evaluation_report.json)",
+        default=None,
+        help="Where to write the evaluation JSON report (default: codex run folder /evaluation_report.json)",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -197,9 +195,15 @@ def evaluate_with_code_interpreter(
     return data
 
 
-def resolve_model_checkpoint(model_input: Path) -> Path:
+def resolve_model_checkpoint(model_input: Path) -> tuple[Path, str]:
     if (model_input / "config.json").exists():  # direct checkpoint directory
-        return model_input
+        parts = model_input.parts
+        if "models" in parts:
+            idx = parts.index("models")
+            task = parts[idx - 1] if idx > 0 else "unknown"
+        else:
+            task = "unknown"
+        return model_input, task
 
     run_parts = model_input.parts
     # Expect codex_runs/<task>/<model>/<run_timestamp>
@@ -257,7 +261,7 @@ def resolve_model_checkpoint(model_input: Path) -> Path:
 
     checkpoint_dir = checkpoints[0]
 
-    return checkpoint_dir
+    return checkpoint_dir, task
 
 
 def determine_output_path(run_input: Path, explicit_output: str | None) -> Path:
@@ -277,14 +281,15 @@ def determine_output_path(run_input: Path, explicit_output: str | None) -> Path:
 def main() -> None:
     args = parse_args()
     input_path = Path(args.model_path).resolve()
-    user_prompt_path = Path(args.user_prompt_path).resolve()
 
     if not input_path.exists():
         raise FileNotFoundError(f"Model path {input_path} does not exist")
-    if not user_prompt_path.exists():
-        raise FileNotFoundError(f"User prompt path {user_prompt_path} does not exist")
 
-    model_path = resolve_model_checkpoint(input_path)
+    model_path, task_name = resolve_model_checkpoint(input_path)
+    user_prompt_path = Path("user_prompts") / f"{task_name}.txt"
+    if not user_prompt_path.exists():
+        raise FileNotFoundError(f"User prompt {user_prompt_path} not found for inferred task '{task_name}'")
+
     output_path = determine_output_path(input_path, args.output)
 
     user_prompt = load_user_prompt(user_prompt_path)
@@ -332,6 +337,7 @@ def main() -> None:
     min_score = min(scores) if scores else 0.0
 
     summary = {
+        "task": task_name,
         "model_path": str(model_path),
         "user_prompt_path": str(user_prompt_path),
         "runs": runs,
