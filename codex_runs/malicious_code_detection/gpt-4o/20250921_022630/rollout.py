@@ -8,8 +8,7 @@ import weave
 from env import get_snippet, TRAINING_CONFIG
 
 
-@weave.op
-@art.retry
+
 async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
     client = art.AsyncOpenAI(
         base_url=model.inference_base_url,
