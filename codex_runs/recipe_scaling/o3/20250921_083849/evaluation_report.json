@@ -1,0 +1,265 @@
+{
+  "task": "recipe_scaling",
+  "model_path": ".art/recipe_scaling/models/recipe_scaling-o3-20250921_083849/checkpoints/0009",
+  "user_prompt_path": "user_prompts/recipe_scaling.txt",
+  "runs": [
+    {
+      "plan": {
+        "system_message": "You are a recipe scaling assistant. Given a base recipe (ingredients with quantities, units, and original servings) and a requested serving size, return ONLY a JSON object with the scaled ingredients. Do not include any prose. Format:\n{\n  \"ingredients\": [\n    {\"name\": \"...\", \"quantity\": <number>, \"unit\": \"...\"},\n    ...\n  ]\n}\nRules:\n- Include all and only the ingredients provided (no extras, none omitted).\n- Keep each ingredient name exactly as given.\n- Scale quantities proportionally by target_servings / original_servings.\n- Keep units unchanged; do not convert units.\n- quantity must be a number (int or float), not a string, and should use decimals (e.g., 2.25) rather than fractions.\n- Optional: you may include a top-level \"servings\" field with the target serving count as a number.\n- Return valid JSON only. No comments, no trailing commas, no additional fields.",
+        "user_message": "Scale this recipe to 6 servings.\n\nOriginal servings: 4\nIngredients:\n- Flour: 2 cups\n- Milk: 1.5 cups\n- Egg: 1 piece\n- Sugar: 2 tbsp\n- Baking powder: 2 tsp",
+        "evaluation_instructions": "Goal: Verify the model scales all ingredients from the base recipe to the requested servings and outputs valid JSON in the required format.\n\nBase recipe (ground truth):\n- Original servings: 4\n- Ingredients (name, quantity, unit):\n  1) Flour, 2, cups\n  2) Milk, 1.5, cups\n  3) Egg, 1, piece\n  4) Sugar, 2, tbsp\n  5) Baking powder, 2, tsp\n\nRequested servings: 6\nScale factor = 6 / 4 = 1.5\nExpected scaled quantities:\n- Flour: 3 cups\n- Milk: 2.25 cups\n- Egg: 1.5 piece\n- Sugar: 3 tbsp\n- Baking powder: 3 tsp\n\nValidation steps:\n1) Parse the output as JSON. If parsing fails or the structure is not an object with an \"ingredients\" array of objects each containing string \"name\", numeric \"quantity\", and string \"unit\" keys, mark formatting error.\n2) Ingredient set check:\n   - Names must match exactly the provided names: {\"Flour\", \"Milk\", \"Egg\", \"Sugar\", \"Baking powder\"}.\n   - Flag omitted if any of these are missing. Flag extra if any additional names are present.\n3) Units check: Units must match the provided units for each ingredient exactly.\n4) Quantity evaluation:\n   - For each ingredient i, compute expected_i and predicted_i.\n   - percent_error_i = abs(predicted_i - expected_i) / expected_i * 100.\n5) Scoring:\n   - If formatting OK AND no omitted or extra ingredients AND all percent_error_i == 0 (exact match within float tolerance 1e-9): reward = +1.\n   - Else if formatting OK AND no omitted or extra ingredients AND for all ingredients percent_error_i <= 5: reward = +0.5.\n   - Else: reward = -1.\n6) Metadata to record:\n   - per_ingredient_pct_error: map from ingredient name to percent_error_i (rounded to 3 decimals).\n   - omitted_or_extra: boolean true if any ingredient omitted or any extra present.\n   - formatting_ok: boolean.\n   - scale_factor: 1.5.\n\nNotes for evaluator:\n- Quantities must be numeric (int or float). Numeric strings (e.g., \"3\") count as formatting error.\n- Fractions like \"1 1/2\" also count as formatting error.\n- Minor floating differences within 1e-9 can be treated as exact.\n- Units must not be converted or changed.",
+        "notes": "Keep the task simple for a small model: 5 ingredients, simple scale factor 1.5. Ingredient names are short to reduce string-matching errors. Require strict JSON and exact field names to test formatting. The evaluator should be case-sensitive on names and units as specified. Encourage decimals, not fractions. Optional top-level \"servings\" may be present but is not required."
+      },
+      "model_response": "{\n  \"ingredients\": [\n    {\"name\": \"Flour\", \"quantity\": 3, \"unit\": \"cup\"},\n    {\"name\": \"Milk\", \"quantity\": 1.875, \"unit\": \"cup\"},\n    {\"name\": \"Egg\", \"quantity\": 0.5, \"unit\": \"piece\"},\n    {\"name\": \"Sugar\", \"quantity\": 1, \"unit\": \"tbsp\"},\n    {\"name\": \"Baking powder\", \"quantity\": 0.4, \"unit\": \"tsp\"}\n  ]\n}",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The response fails on multiple criteria: (1) The units are incorrect\u2014they use the singular form ('cup' instead of 'cups'), which does not match the base recipe as required. (2) Most ingredient quantities are incorrect: Milk is 1.875 instead of 2.25, Egg is 0.5 instead of 1.5, Sugar is 1 instead of 3, and Baking powder is 0.4 instead of 3. (3) JSON structure and type formatting are correct, and ingredient names are present and correctly spelled\u2014no extras or omissions. But due to serious scaling and units errors, the score is -1 as per the rubric.",
+        "passed": false,
+        "per_ingredient_pct_error": {
+          "Flour": 0.0,
+          "Milk": 16.667,
+          "Egg": 66.667,
+          "Sugar": 66.667,
+          "Baking powder": 86.667
+        },
+        "omitted_or_extra": false,
+        "formatting_ok": true,
+        "scale_factor": 1.5
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a recipe scaling assistant. Given a base recipe (ingredients with quantity, unit, and original servings) and a requested serving count, scale every ingredient proportionally. Output only a top-level JSON array of ingredient objects, where each object has exactly: name (string), quantity (number), unit (string). Do not include any extra text, keys, or commentary. Keep ingredient names and units exactly as provided. Do not convert units. Quantities may be decimal numbers.",
+        "user_message": "Scale this recipe to 6 servings. Return only a top-level JSON array of the scaled ingredients.\n\nBase recipe:\n{\n  \"recipe_name\": \"Lemonade\",\n  \"original_servings\": 4,\n  \"ingredients\": [\n    { \"name\": \"water\",  \"quantity\": 1,   \"unit\": \"liter\" },\n    { \"name\": \"lemons\", \"quantity\": 4,   \"unit\": \"piece\" },\n    { \"name\": \"sugar\",  \"quantity\": 100, \"unit\": \"g\" }\n  ]\n}",
+        "evaluation_instructions": "Task: Verify that the model scales each ingredient from 4 servings to 6 servings (scale factor = 6/4 = 1.5) and returns a single top-level JSON array of ingredient objects with fields: name (string), quantity (number), unit (string).\n\nExpected scaled ingredients:\n- water: 1 \u00d7 1.5 = 1.5 liter\n- lemons: 4 \u00d7 1.5 = 6 piece\n- sugar: 100 \u00d7 1.5 = 150 g\n\nFormatting requirements (incorrect formatting triggers -1 penalty):\n- The response must be valid JSON and must be a single top-level JSON array (e.g., [ { ... }, { ... } ]).\n- Each array element must be an object with exactly the keys: name (string), quantity (number), unit (string).\n- No extra keys, no wrapping objects, and no non-JSON text.\n- Ingredient names and units must match the base recipe exactly (case-sensitive).\n\nIngredient completeness (penalties):\n- If any base ingredient is missing, or if any extra ingredient not in the base list is present, apply a -1 penalty.\n\nScoring logic:\n- If formatting is correct AND all and only the base ingredients are present AND all quantities match expected exactly: reward = +1.\n- Else if formatting is correct AND all and only the base ingredients are present AND every ingredient\u2019s percentage error is < 5%: reward = +0.5.\n- Else if formatting is correct but errors \u2265 5% for any ingredient: reward = 0.\n- If formatting is incorrect OR any ingredient is missing/extra: reward = -1.\n\nMetadata to record per submission:\n- For each ingredient i, percentage_error_i = abs(predicted_i - expected_i) / expected_i * 100.\n- omitted_ingredient (boolean): true if any expected ingredient is missing.\n- extra_ingredient (boolean): true if any ingredient not in the base list appears.\n\nCanonical expected output (values may be formatted with decimals as needed):\n[\n  { \"name\": \"water\",  \"quantity\": 1.5, \"unit\": \"liter\" },\n  { \"name\": \"lemons\", \"quantity\": 6,   \"unit\": \"piece\" },\n  { \"name\": \"sugar\",  \"quantity\": 150,  \"unit\": \"g\" }\n]",
+        "notes": "This is a simple proportional scaling test with a 1.5x factor. Keep names and units unchanged to avoid penalties (\"water\", \"lemons\", \"sugar\"; units: \"liter\", \"piece\", \"g\"). Quantities must be numeric; 1.5 is acceptable as a float. No rounding requirement beyond numeric representation. The expected response is a top-level JSON array only."
+      },
+      "model_response": "[\n  {\n    \"name\": \"water\",\n    \"quantity\": 1.5,\n    \"unit\": \"liter\"\n  },\n  {\n    \"name\": \"lemons\",\n    \"quantity\": 3,\n    \"unit\": \"piece\"\n  },\n  {\n    \"name\": \"sugar\",\n    \"quantity\": 150,\n    \"unit\": \"g\"\n  }\n]",
+      "evaluation": {
+        "score": -1,
+        "reasoning": "The response meets JSON formatting rules and includes only the expected keys, but the scaled quantity of 'lemons' is 3 instead of 6. All other ingredients are correct, but this is a critical error since an ingredient's quantity was not scaled properly (3 is not within 5% of 6). No extra ingredients are present, and formatting is otherwise correct. However, the 'lemons' value constitutes an error \u2265 5%.",
+        "passed": false,
+        "percentage_error_lemons": 50.0,
+        "percentage_error_water": 0.0,
+        "percentage_error_sugar": 0.0,
+        "omitted_ingredient": false,
+        "extra_ingredient": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You scale cooking recipes proportionally. Given an original recipe with a serving size and a target serving size, multiply each ingredient quantity by (requested_servings / original_servings). Keep ingredient names and units exactly as provided. Do not add or remove ingredients. Output only a JSON array of ingredient objects, each with keys: name (string), quantity (number), unit (string). Do not include any extra text, explanations, or keys. Do not convert units. If needed, you may use decimals (up to 2 decimal places).",
+        "user_message": "Original recipe (serves 4):\n- water: 1 liter\n- lemon juice: 200 ml\n- sugar: 100 g\n\nRequested servings: 10\n\nReturn only a JSON array of ingredient objects with name, quantity, unit. Keep names and units exactly as shown.",
+        "evaluation_instructions": "Task: The model must scale all ingredient quantities from 4 servings to 10 servings, keeping names and units unchanged, and output only a JSON array of objects with keys name, quantity, unit.\n\nScale factor: 10 / 4 = 2.5\nExpected scaled ingredients:\n- water: 2.5 liter\n- lemon juice: 500 ml\n- sugar: 250 g\n\nValidation steps:\n1) Parse response as JSON. It must be a top-level JSON array. Each element must be an object with exactly the keys: name (string), quantity (number), unit (string). Any extra top-level keys, extra fields, or non-JSON text means incorrect formatting.\n2) Normalize ingredient names by lowercasing and trimming spaces. Units must match exactly the originals (case-sensitive): \"liter\", \"ml\", \"g\".\n3) Check for completeness: all three ingredients must be present, none extra. Names must match the three expected names exactly after normalization: \"water\", \"lemon juice\", \"sugar\".\n4) Quantity correctness: For each ingredient, expected_quantity = base_quantity * 2.5. Compute percentage error per ingredient as: pct_error = 100 * abs(predicted - expected) / expected. Use numeric quantities only (integers or floats).\n\nScoring:\n- If formatting is invalid OR any ingredient missing OR any extra ingredient present: reward = -1.\n- Else, if all three quantities match exactly (within a tiny float tolerance, e.g., absolute difference <= 1e-6): reward = +1.\n- Else, if all three ingredients are present, units correct, and each ingredient's pct_error < 5%: reward = +0.5.\n- Else: reward = -1.\n\nMetadata to record:\n- percentage_errors: map of ingredient name -> pct_error (as a number, not string)\n- omitted_ingredients: list of expected ingredients not found\n- extra_ingredients: list of returned ingredients not expected\n- formatting_ok: boolean\n- units_ok: boolean (true only if all units match exactly)\n- scale_factor: 2.5\n- expected_quantities: {\"water\": 2.5, \"lemon juice\": 500, \"sugar\": 250}\n\nNotes on matching:\n- Ingredient name matching is case-insensitive and trimmed of surrounding whitespace.\n- Units must match exactly as given; do not accept converted units.\n- Quantities should be numeric; strings like \"2.5\" as text should be treated as formatting error.",
+        "notes": "Simple 3-ingredient lemonade to keep the task easy for a small model. Units are mixed but require no conversion; the model should scale quantities directly. Instruct the model to output only a JSON array for straightforward parsing. Expected results: water 2.5 liter; lemon juice 500 ml; sugar 250 g."
+      },
+      "model_response": "[{\"name\":\"water\",\"quantity\":2.5,\"unit\":\"liter\"},{\"name\":\"lemon juice\",\"quantity\":50,\"unit\":\"ml\"},{\"name\":\"sugar\",\"quantity\":250,\"unit\":\"g\"}]",
+      "evaluation": {
+        "score": -1,
+        "reasoning": "Formatting not correct. The scaled quantity for lemon juice is 50 ml instead of 500 ml. This is a 90% error, which is unacceptable. All units are correct, and the formatting as a JSON array is valid, but a critical error exists in one ingredient's quantity.",
+        "passed": false,
+        "formatting_ok": true,
+        "units_ok": true,
+        "percentage_errors": {
+          "water": 0.0,
+          "lemon juice": 90.0,
+          "sugar": 0.0
+        },
+        "omitted_ingredients": [],
+        "extra_ingredients": [],
+        "scale_factor": 2.5,
+        "expected_quantities": {
+          "water": 2.5,
+          "lemon juice": 500,
+          "sugar": 250
+        }
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a recipe scaling assistant. Scale all ingredients proportionally from the original servings to the requested servings. Output must be a single JSON object with exactly one top-level key: \"ingredients\". The value must be an array of objects, each with the keys: \"name\" (string), \"quantity\" (number), and \"unit\" (string). Keep ingredient names and units exactly as provided. Do not add or remove ingredients. Quantities must be numbers (not strings). Do not include any extra text or fields.",
+        "user_message": "Original recipe (serves 4):\n- All-purpose flour: 2 cups\n- Milk: 1.5 cups\n- Sugar: 2 tbsp\n- Baking powder: 2 tsp\n- Salt: 0.5 tsp\n\nScale this recipe to serve 6. Return only the scaled recipe in the required JSON format.",
+        "evaluation_instructions": "Task: Check proportional scaling of all ingredients from 4 to 6 servings (scale factor s = 6/4 = 1.5) and JSON formatting.\n\nExpected scaled quantities:\n- All-purpose flour: 3 cups\n- Milk: 2.25 cups\n- Sugar: 3 tbsp\n- Baking powder: 3 tsp\n- Salt: 0.75 tsp\n\nParsing and schema:\n1) Response must be valid JSON.\n2) Top-level must be an object with exactly one key: \"ingredients\".\n3) \"ingredients\" must be an array of objects. Each object must have keys: name (string), quantity (number), unit (string).\n4) Names and units must match the originals exactly:\n   Names: {\"All-purpose flour\", \"Milk\", \"Sugar\", \"Baking powder\", \"Salt\"}\n   Units: {\"cups\" for flour and milk, \"tbsp\" for sugar, \"tsp\" for baking powder and salt}\n5) No extra or missing ingredients.\n\nScoring:\n- If JSON is invalid or schema violations occur (e.g., wrong/missing keys, non-numeric quantity), reward = -1 and formatting_ok = false.\n- Else, determine omissions/extras by comparing the set of ingredient names to the expected set.\n  - If any omitted or any extra, reward = -1.\n- Else compute percentage error for each ingredient as: 100 * abs(predicted - expected) / expected.\n  - If all absolute differences are exactly zero (within tolerance 1e-9), reward = +1.\n  - Else if all percentage errors < 5%, reward = +0.5.\n  - Else reward = 0.\n\nMetadata to report:\n- percent_error_per_ingredient: map from ingredient name to its percentage error (float).\n- omitted_any: boolean.\n- extra_any: boolean.\n- formatting_ok: boolean.\n\nNotes on numeric handling:\n- Quantities are compared numerically; rounding is allowed but values must be numbers.\n- Tolerance for exact match is 1e-9 absolute difference to account for floating-point serialization.",
+        "notes": "Simple 5-ingredient scaling with a clean 1.5x factor to keep arithmetic easy for a small model. Units and names are fixed; require exact schema to test formatting. Expected output quantities: flour 3, milk 2.25, sugar 3, baking powder 3, salt 0.75. The evaluator will compute per-ingredient percentage errors and flags for omissions/extras."
+      },
+      "model_response": "```json\n{\n  \"ingredients\": [\n    {\n      \"name\": \"All-purpose flour\",\n      \"quantity\": 3,\n      \"unit\": \"cups\"\n    },\n    {\n      \"name\": \"Milk\",\n      \"quantity\": 1.875,\n      \"unit\": \"cups\"\n    },\n    {\n      \"name\": \"Sugar\",\n      \"quantity\": 3,\n      \"unit\": \"tbsp\"\n    },\n    {\n      \"name\": \"Baking powder\",\n      \"quantity\": 3,\n      \"unit\": \"tsp\"\n    },\n    {\n      \"name\": \"Salt\",\n      \"quantity\": 1.5,\n      \"unit\": \"tsp\"\n    }\n  ]\n}\n```",
+      "evaluation": {
+        "score": 0,
+        "passed": false,
+        "reasoning": "The response is valid JSON with proper schema and ingredient names/units. There are no omitted or extra ingredients. However, the scaling is incorrect for 2 ingredients: milk is 1.875 (should be 2.25, 16.67% error), and salt is 1.5 (should be 0.75, 100% error). This results in two percentage errors greater than 5%, so the score is 0.",
+        "percent_error_per_ingredient": {
+          "All-purpose flour": 0.0,
+          "Milk": 16.666666666666664,
+          "Sugar": 0.0,
+          "Baking powder": 0.0,
+          "Salt": 100.0
+        },
+        "omitted_any": false,
+        "extra_any": false,
+        "formatting_ok": true
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a helpful assistant that scales cooking recipes to a requested serving size by multiplying each ingredient quantity by the scale factor: target_servings / original_servings. Output strictly valid JSON only, with no extra commentary. Use the exact ingredient names and units provided. Do not add or remove ingredients. Return a JSON object with an \"ingredients\" array of objects, each having: name (string), quantity (number), unit (string).",
+        "user_message": "Scale the following recipe to 5 servings. Return only JSON with an \"ingredients\" array of {name, quantity, unit} and no extra text.\n\nOriginal recipe:\n- servings: 2\n- ingredients:\n  - {\"name\": \"spaghetti\", \"quantity\": 200, \"unit\": \"g\"}\n  - {\"name\": \"olive oil\", \"quantity\": 1, \"unit\": \"tablespoon\"}\n  - {\"name\": \"garlic\", \"quantity\": 2, \"unit\": \"clove\"}\n  - {\"name\": \"cherry tomatoes\", \"quantity\": 250, \"unit\": \"g\"}\n  - {\"name\": \"basil\", \"quantity\": 10, \"unit\": \"g\"}\n  - {\"name\": \"salt\", \"quantity\": 0.5, \"unit\": \"teaspoon\"}\n  - {\"name\": \"black pepper\", \"quantity\": 0.25, \"unit\": \"teaspoon\"}",
+        "evaluation_instructions": "Goal: Verify proportional scaling from 2 to 5 servings (scale factor = 2.5) and correct JSON formatting.\n\nExpected scaled ingredients (name, quantity, unit):\n- spaghetti: 500 g\n- olive oil: 2.5 tablespoon\n- garlic: 5 clove\n- cherry tomatoes: 625 g\n- basil: 25 g\n- salt: 1.25 teaspoon\n- black pepper: 0.625 teaspoon\n\nValidation steps:\n1) Parsing and structure\n- Response must be valid JSON. If it cannot be parsed as JSON -> bad_format = true.\n- Accepted top-level structures (in order of preference):\n  a) Object with key \"ingredients\" (array of ingredient objects), optional extra keys allowed (e.g., \"servings\").\n  b) Raw array of ingredient objects (acceptable).\n- Each ingredient object must include: name (string), quantity (number), unit (string). quantity must be numeric (int or float), not a string.\n\n2) Ingredients integrity\n- Ingredient names and units must match exactly the originals (case-sensitive, same spacing):\n  [\"spaghetti\", \"olive oil\", \"garlic\", \"cherry tomatoes\", \"basil\", \"salt\", \"black pepper\"].\n- No omissions (all 7 present) and no extras.\n- Exactly one entry per expected ingredient.\n\n3) Quantity checks\n- Compute percentage error per ingredient = abs(predicted - expected) / expected * 100.\n- Collect metadata: per-ingredient percentage errors, flags has_omissions, has_extras, bad_format.\n\nScoring:\n- If bad_format = true OR any omission/extra ingredient -> score = -1.\n- Else if all ingredients present with no extras and every percentage error == 0 (exact scaling) -> score = +1.\n- Else if all ingredients present with no extras and every percentage error < 5% -> score = +0.5.\n- Else -> score = -1.\n\nNotes for evaluator:\n- Expected exact quantities (factor 2.5):\n  spaghetti 500, olive oil 2.5, garlic 5, cherry tomatoes 625, basil 25, salt 1.25, black pepper 0.625.\n- Do not penalize numeric formatting differences like 2.500 vs 2.5 as long as numeric equality holds within floating-point comparison.",
+        "notes": "Keep the ingredient names and units exactly as provided. Quantities must be numeric (no strings). Decimals are allowed; 0.625 is valid. The model should not add ingredients (e.g., water, cheese) or change units. Accept either a top-level object with an \"ingredients\" array (preferred) or a bare array of ingredient objects."
+      },
+      "model_response": "```json\n{\n  \"ingredients\": [\n    {\n      \"name\": \"spaghetti\",\n      \"quantity\": 100,\n      \"unit\": \"g\"\n    },\n    {\n      \"name\": \"olive oil\",\n      \"quantity\": 3,\n      \"unit\": \"tablespoon\"\n    },\n    {\n      \"name\": \"garlic\",\n      \"quantity\": 1,\n      \"unit\": \"clove\"\n    },\n    {\n      \"name\": \"cherry tomatoes\",\n      \"quantity\": 125,\n      \"unit\": \"g\"\n    },\n    {\n      \"name\": \"basil\",\n      \"quantity\": 5,\n      \"unit\": \"g\"\n    },\n    {\n      \"name\": \"salt\",\n      \"quantity\": 0.25,\n      \"unit\": \"teaspoon\"\n    },\n    {\n      \"name\": \"black pepper\",\n      \"quantity\": 0.125,\n      \"unit\": \"teaspoon\"\n    }\n  ]\n}\n```",
+      "evaluation": {
+        "score": -1,
+        "passed": false,
+        "reasoning": "The scaled ingredient quantities are incorrect for all listed ingredients and do not match the expected scale factor of 2.5. For example, 'spaghetti' is listed as 100g instead of 500g. No ingredient is scaled correctly. There are no extra or missing ingredients and the format is valid, but the quantities are very wrong. Thus, score is -1.",
+        "per_ingredient_percentage_error": {
+          "spaghetti": 80,
+          "olive oil": 20,
+          "garlic": 80,
+          "cherry tomatoes": 80,
+          "basil": 80,
+          "salt": 80,
+          "black pepper": 80
+        },
+        "has_omissions": false,
+        "has_extras": false,
+        "bad_format": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a helpful assistant that scales cooking recipes to a requested number of servings by multiplying each ingredient quantity proportionally. Output requirements:\n- Return ONLY a JSON array of ingredient objects (no surrounding text), where each object has: name (string), quantity (number), unit (string).\n- Do not change ingredient names or units; only scale quantities.\n- Keep the same ingredient set as provided (no extras or omissions).\n- Use numeric quantities (integers or decimals) without units embedded in the quantity.",
+        "user_message": "Scale the following recipe to 6 servings. Return only a JSON array of {name, quantity, unit} objects.\n\nRecipe: Fluffy Pancakes\nOriginal servings: 4\nIngredients:\n- all-purpose flour: 240 g\n- milk: 360 ml\n- egg: 2 pcs\n- sugar: 30 g\n- baking powder: 8 g\n- butter (melted): 30 g\n- salt: 1 g",
+        "evaluation_instructions": "Goal: Verify proportional scaling from 4 to 6 servings (scale factor = 1.5) and strict JSON formatting.\n\n1) Parse and validate format:\n- The model output must be valid JSON representing a top-level array.\n- Each array element must be an object with keys: name (string), quantity (number), unit (string).\n- If JSON parsing fails or required keys/types are missing, score = -1 (formatting penalty).\n\n2) Ingredient set validation:\n- Expected ingredient names (exact match):\n  [\"all-purpose flour\", \"milk\", \"egg\", \"sugar\", \"baking powder\", \"butter (melted)\", \"salt\"].\n- Units must match exactly the provided units: [g, ml, pcs, g, g, g, g] respectively.\n- If any expected ingredient is omitted or any extra ingredient appears, score = -1. Record flags omitted=true/false and extra=true/false.\n\n3) Quantity scaling check:\n- Compute expected quantities with factor 1.5:\n  all-purpose flour: 240 * 1.5 = 360 g\n  milk: 360 * 1.5 = 540 ml\n  egg: 2 * 1.5 = 3 pcs\n  sugar: 30 * 1.5 = 45 g\n  baking powder: 8 * 1.5 = 12 g\n  butter (melted): 30 * 1.5 = 45 g\n  salt: 1 * 1.5 = 1.5 g\n- For each ingredient i, compute percent error: abs(pred_i - exp_i) / exp_i * 100. Use epsilon 1e-9 for float comparisons.\n\n4) Scoring:\n- If format invalid OR any ingredient missing/extra: score = -1.\n- Else if all quantities match exactly within epsilon (|pred-exp| <= 1e-9 for all): score = +1.\n- Else if all present, no extras, and every ingredient has percent error < 5%: score = +0.5.\n- Else: score = -1.\n\n5) Metadata to log per test:\n- percent_error_per_ingredient: map from ingredient name to its percent error.\n- omitted_ingredient: boolean (true if any expected ingredient missing).\n- extra_ingredient: boolean (true if any unexpected ingredient present).",
+        "notes": "This test checks straightforward proportional scaling by a factor of 1.5 and strict JSON-only output. Units and ingredient names must be preserved exactly. Quantities are chosen to yield simple results, with one fractional value (1.5 g salt) and an integer egg count (3 pcs). The scoring follows the described +1/ +0.5 / -1 scheme, and evaluation should record per-ingredient percentage errors with omission/extra flags."
+      },
+      "model_response": "```json\n[\n    {\n        \"name\": \"all-purpose flour\",\n        \"quantity\": 120,\n        \"unit\": \"g\"\n    },\n    {\n        \"name\": \"milk\",\n        \"quantity\": 90,\n        \"unit\": \"ml\"\n    },\n    {\n        \"name\": \"egg\",\n        \"quantity\": 1,\n        \"unit\": \"\"\n    },\n    {\n        \"name\": \"sugar\",\n        \"quantity\": 45,\n        \"unit\": \"g\"\n    },\n    {\n        \"name\": \"baking powder\",\n        \"quantity\": 2,\n        \"unit\": \"g\"\n    },\n    {\n        \"name\": \"butter (melted)\",\n        \"quantity\": 15,\n        \"unit\": \"g\"\n    },\n    {\n        \"name\": \"salt\",\n        \"quantity\": 0.5,\n        \"unit\": \"g\"\n    }\n]\n```",
+      "evaluation": {
+        "score": -1,
+        "passed": false,
+        "reasoning": "The response fails on multiple criteria: quantities are not scaled correctly (they are divided instead of multiplied by 1.5), units for eggs are wrong (empty string instead of 'pcs'), and all percent errors for ingredients except 'sugar' (which happens to align by chance) are 50-95%. All expected ingredients are present, and no extras appear, but formatting and scaling errors mean the test does not pass.",
+        "percent_error_per_ingredient": {
+          "all-purpose flour": 66.6667,
+          "milk": 83.3333,
+          "egg": 66.6667,
+          "sugar": 0,
+          "baking powder": 83.3333,
+          "butter (melted)": 66.6667,
+          "salt": 66.6667
+        },
+        "omitted_ingredient": false,
+        "extra_ingredient": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a recipe scaling assistant. Given a base recipe with ingredient quantities, units, and original servings, scale all ingredient quantities proportionally to the requested serving size. Output JSON only, with this exact shape: {\"ingredients\": [{\"name\": string, \"quantity\": number, \"unit\": string}, ...]}. Rules: - Keep ingredient names exactly as provided. - Keep units exactly as provided. - quantity must be a number (no fractions as strings, no units inside quantity). - Do not add or remove ingredients. - Do not include any extra fields or text outside the JSON object.",
+        "user_message": "Scale this recipe to the target servings.\n\nOriginal servings: 4\nTarget servings: 6\n\nBase recipe ingredients:\n- name: \"spaghetti\", quantity: 400, unit: \"g\"\n- name: \"canned tomatoes\", quantity: 800, unit: \"g\"\n- name: \"olive oil\", quantity: 2, unit: \"tbsp\"\n- name: \"garlic\", quantity: 4, unit: \"clove\"\n\nReturn only the scaled recipe in JSON with the exact structure: {\"ingredients\": [{\"name\", \"quantity\", \"unit\"}]}",
+        "evaluation_instructions": "Parse the model's output as JSON. Validation steps:\n1) Formatting and schema:\n   - Must be valid JSON.\n   - Top-level object must contain only the key \"ingredients\" mapping to an array.\n   - Each ingredient object must contain exactly the keys: name (string), quantity (number), unit (string).\n   - No extra keys anywhere and no extra top-level fields or text.\n2) Ingredient set and units:\n   - Ingredient names must match exactly this set: [\"spaghetti\", \"canned tomatoes\", \"olive oil\", \"garlic\"].\n   - No missing or extra ingredients.\n   - Units must match exactly: spaghetti \"g\", canned tomatoes \"g\", olive oil \"tbsp\", garlic \"clove\".\n3) Quantity correctness:\n   - Compute scale factor = target_servings / original_servings = 6 / 4 = 1.5.\n   - Expected quantities:\n       spaghetti: 400 * 1.5 = 600\n       canned tomatoes: 800 * 1.5 = 1200\n       olive oil: 2 * 1.5 = 3\n       garlic: 4 * 1.5 = 6\n   - For each ingredient i, compute percentage error: err_i = (abs(pred_i - expected_i) / expected_i) * 100.\n4) Reward logic:\n   - If formatting or schema invalid, or any ingredient missing/extra, or any unit/name mismatch: reward = -1. Also set omitted_or_extra = true.\n   - Else, if all ingredients present with correct names/units:\n       - If all quantities are exactly equal to expected (within a tight tolerance, e.g., abs(pred - expected) <= 1e-9): reward = +1.\n       - Else if every ingredient has err_i < 5%: reward = +0.5.\n       - Else: reward = 0.\n5) Metadata to record:\n   - For each ingredient, record percentage error err_i (as a number in percent).\n   - Record a boolean flag omitted_or_extra indicating whether any ingredient was missing or extra.\n",
+        "notes": "Ground truth scaled recipe for reference:\n{\n  \"ingredients\": [\n    {\"name\": \"spaghetti\", \"quantity\": 600, \"unit\": \"g\"},\n    {\"name\": \"canned tomatoes\", \"quantity\": 1200, \"unit\": \"g\"},\n    {\"name\": \"olive oil\", \"quantity\": 3, \"unit\": \"tbsp\"},\n    {\"name\": \"garlic\", \"quantity\": 6, \"unit\": \"clove\"}\n  ]\n}\nKeep the test simple for small models; exact numbers are integers after scaling by 1.5."
+      },
+      "model_response": "```json\n{\n  \"ingredients\": [\n    {\n      \"name\": \"spaghetti\",\n      \"quantity\": 1000,\n      \"unit\": \"g\"\n    },\n    {\n      \"name\": \"canned tomatoes\",\n      \"quantity\": 1200,\n      \"unit\": \"g\"\n    },\n    {\n      \"name\": \"olive oil\",\n      \"quantity\": 2,\n      \"unit\": \"tbsp\"\n    },\n    {\n      \"name\": \"garlic\",\n      \"quantity\": 4,\n      \"unit\": \"clove\"\n    }\n  ]\n}\n```",
+      "evaluation": {
+        "score": -1,
+        "passed": false,
+        "reasoning": "The model's output includes incorrect ingredient quantities for spaghetti, olive oil, and garlic, and all are far outside the required tolerance. Furthermore, all ingredients are present with correct names and units, but the schema is valid. However, spaghetti's quantity is 1000 (should be 600), olive oil is 2 (should be 3), and garlic is 4 (should be 6), so none are within a 5% error. This constitutes a score of 0 per reward rules. However, on reviewing the reward logic, schema is valid and ingredient set is valid, so score should actually be 0 (not -1) unless I missed another error. Let's recompute ingredients to ensure details:",
+        "ingredient_errors": {
+          "spaghetti": 66.67,
+          "canned tomatoes": 0.0,
+          "olive oil": 33.33,
+          "garlic": 33.33
+        },
+        "omitted_or_extra": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You scale cooking recipes up or down to a requested number of servings by multiplying each ingredient quantity by the factor target_servings / original_servings. Return only valid JSON with a single top-level object containing an \"ingredients\" array. Each ingredient must be an object with keys: name (string), quantity (number), unit (string). Keep ingredient names and units exactly as provided (same spelling and unit labels). Do not add or remove ingredients. No extra commentary.",
+        "user_message": "Scale this recipe from 4 servings to 6 servings.\n\nRecipe: Simple Stovetop Rice (4 servings)\nIngredients:\n- rice: 2 cups\n- water: 4 cups\n- salt: 1 tsp\n- oil: 1 tbsp\n\nPlease return JSON with a top-level \"ingredients\" array of objects {\"name\", \"quantity\", \"unit\"}. Quantities may be decimals.",
+        "evaluation_instructions": "Task: Verify the model scaled all ingredients from 4 to 6 servings (factor = 6/4 = 1.5) and returned properly formatted JSON.\n\nExpected scaled ingredients (order does not matter):\n- {name: \"rice\",  quantity: 3,   unit: \"cups\"}\n- {name: \"water\", quantity: 6,   unit: \"cups\"}\n- {name: \"salt\",  quantity: 1.5, unit: \"tsp\"}\n- {name: \"oil\",   quantity: 1.5, unit: \"tbsp\"}\n\nValidation steps:\n1) Parse output as JSON. It must contain a single top-level object with an \"ingredients\" array. Each element must have string fields \"name\" and \"unit\", and a numeric field \"quantity\".\n2) Ingredient set must match exactly the base recipe (names and units must match exactly, case-sensitive; no missing or extra ingredients). Duplicate names are not allowed.\n3) Compute expected = base_quantity * 1.5 for each ingredient. Compute percentage error per ingredient as 100 * abs(predicted - expected) / expected.\n4) Metadata to record:\n   - error_percent_per_ingredient: map of ingredient name -> percentage error (float)\n   - omitted_ingredients: list of any missing names (empty if none)\n   - extra_ingredients: list of any unexpected names (empty if none)\n   - formatting_valid: boolean indicating JSON format and schema correctness\n\nScoring:\n- If formatting_valid is false OR there are any omitted_ingredients or extra_ingredients, score = -1.\n- Else if for all ingredients percentage error == 0 within a numeric tolerance of 1e-6 (i.e., abs diff <= 1e-6), score = +1.\n- Else if for all ingredients percentage error < 5%, score = +0.5.\n- Else score = 0.\n\nNotes on units and rounding:\n- Units must match exactly the base units (\"cups\", \"tsp\", \"tbsp\").\n- Quantities may be integers or decimals. Use raw numeric comparison; do not require any specific rounding beyond the 1e-6 tolerance for exact-match.",
+        "notes": "Simple 4-ingredient recipe with a 1.5x scaling factor keeps arithmetic easy for smaller models. The evaluation checks strict JSON formatting, exact ingredient set, unit preservation, and proportional scaling. Expected values are rice 3 cups, water 6 cups, salt 1.5 tsp, oil 1.5 tbsp. Partial credit granted if all ingredients are within 5%."
+      },
+      "model_response": "```json\n{\n  \"ingredients\": [\n    {\n      \"name\": \"rice\",\n      \"quantity\": 3,\n      \"unit\": \"cups\"\n    },\n    {\n      \"name\": \"water\",\n      \"quantity\": 6,\n      \"unit\": \"cups\"\n    },\n    {\n      \"name\": \"salt\",\n      \"quantity\": 0.5,\n      \"unit\": \"tsp\"\n    },\n    {\n      \"name\": \"oil\",\n      \"quantity\": 1.5,\n      \"unit\": \"tablespoons\"\n    }\n  ]\n}\n```",
+      "evaluation": {
+        "score": -1,
+        "reasoning": "Formatting is invalid: 'oil' unit was changed from 'tbsp' to 'tablespoons', and 'salt' quantity is incorrect (0.5 instead of 1.5). The JSON schema is otherwise correct and there are no extra or omitted ingredients.",
+        "passed": false,
+        "error_percent_per_ingredient": {
+          "rice": 0.0,
+          "water": 0.0,
+          "salt": 66.66666666666666,
+          "oil": 0.0
+        },
+        "omitted_ingredients": [],
+        "extra_ingredients": [],
+        "formatting_valid": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a recipe scaler. Given a base recipe with ingredient quantities, units, and the original number of servings, scale all ingredient quantities proportionally to a requested number of servings. Output ONLY JSON with the following structure: { \"ingredients\": [ { \"name\": string, \"quantity\": number, \"unit\": string }, ... ], \"servings\": number }. Do not include any extra text. Keep ingredient names and units exactly as provided. Do not convert units. Do not omit or add ingredients.",
+        "user_message": "Scale this recipe to 6 servings.\n\nOriginal recipe (makes 4 servings):\n- water: 4 cups\n- lemon juice: 1 cup\n- sugar: 6 tbsp\n\nReturn ONLY JSON with keys: ingredients (list of objects with name, quantity, unit) and servings (the requested servings).",
+        "evaluation_instructions": "Goal: Verify the model scales the provided base recipe from 4 servings to 6 servings (scale factor = 6/4 = 1.5) and returns valid JSON in the required schema.\n\nBase recipe:\n- original_servings = 4\n- requested_servings = 6\n- scale_factor = 1.5\n- ingredients_base = [\n  {name: \"water\", quantity: 4, unit: \"cups\"},\n  {name: \"lemon juice\", quantity: 1, unit: \"cup\"},\n  {name: \"sugar\", quantity: 6, unit: \"tbsp\"}\n]\n\nExpected scaled quantities:\n- water: 4 * 1.5 = 6 cups\n- lemon juice: 1 * 1.5 = 1.5 cup\n- sugar: 6 * 1.5 = 9 tbsp\n\nValidation steps:\n1) Parse output as JSON. If parsing fails or top-level is not an object, reward = -1 (format error).\n2) The JSON must have:\n   - key \"ingredients\" as an array\n   - key \"servings\" as a number equal to 6 (if present; if absent, do not penalize solely for missing this field, but prefer it be present). Each ingredient object must include keys: name (string), quantity (number), unit (string). If schema not met, reward = -1 (format error).\n3) Normalize ingredient names by lowercasing and trimming whitespace. Units must match exactly the base units (case-sensitive string match). If any unit differs from the base for that ingredient, reward = -1 (format error: unit mismatch).\n4) Check for missing or extra ingredients by comparing the set of normalized names to {\"water\", \"lemon juice\", \"sugar\"}.\n   - If any are missing or any extra are present, reward = -1. Set metadata omitted_or_extra = true.\n5) For each ingredient present, compute expected_quantity = base_quantity * 1.5 and percentage_error = abs(model_quantity - expected_quantity) / expected_quantity * 100.\n6) Reward logic (assuming JSON valid, correct units, and no missing/extra ingredients):\n   - If all percentage_error == 0 (exact numeric match), reward = +1.\n   - Else if for all ingredients percentage_error < 5, reward = +0.5.\n   - Else reward = 0.\n\nMetadata to return alongside scoring (for logging):\n- per_ingredient_errors: array of {name, expected_quantity, model_quantity, unit, percentage_error} for each base ingredient (if an ingredient is missing, set model_quantity = null and percentage_error = null for that name).\n- omitted_or_extra: boolean flag indicating presence of any missing or extra ingredient.\n- format_ok: boolean indicating JSON/schema validity and unit matching.\n\nNotes on comparisons:\n- Quantities must be numbers (not strings). Accept integers or decimals.\n- Do not penalize for including the top-level \"servings\" field as long as it equals 6 if present.\n- Ingredient name matching is case-insensitive for identity; unit strings must match exactly as given in the base recipe.\n- Ignore extra keys inside ingredient objects beyond name/quantity/unit.\n",
+        "notes": "This test uses a simple lemonade recipe to minimize rounding complexity. Expected output example (for reference during manual checks, not to be shown to the model): {\"ingredients\": [{\"name\": \"water\", \"quantity\": 6, \"unit\": \"cups\"}, {\"name\": \"lemon juice\", \"quantity\": 1.5, \"unit\": \"cup\"}, {\"name\": \"sugar\", \"quantity\": 9, \"unit\": \"tbsp\"}], \"servings\": 6}. Keep the evaluation strict on JSON formatting, presence of all ingredients, and unit fidelity, while allowing partial credit for <5% numeric error."
+      },
+      "model_response": "{\n    \"ingredients\": [\n        {\n            \"name\": \"water\",\n            \"quantity\": 6,\n            \"unit\": \"cups\"\n        },\n        {\n            \"name\": \"lemon juice\",\n            \"quantity\": 1.5,\n            \"unit\": \"cup\"\n        },\n        {\n            \"name\": \"sugar\",\n            \"quantity\": 9,\n            \"unit\": \"tablespoons\"\n        }\n    ],\n    \"servings\": 6\n}",
+      "evaluation": {
+        "score": 0,
+        "reasoning": "The output returned a valid JSON object with the correct top-level schema, correct ingredient names (case-insensitive match), correct ingredient counts (no omissions or extras), but there is a critical format error: for 'sugar', the unit was changed from 'tbsp' (in the base recipe) to 'tablespoons' (in the model output). Unit strings must match *exactly*, so this is a schema violation, and per policy, this earns a score of 0.",
+        "passed": false,
+        "per_ingredient_errors": [
+          {
+            "name": "water",
+            "expected_quantity": 6,
+            "model_quantity": 6,
+            "unit": "cups",
+            "percentage_error": 0.0
+          },
+          {
+            "name": "lemon juice",
+            "expected_quantity": 1.5,
+            "model_quantity": 1.5,
+            "unit": "cup",
+            "percentage_error": 0.0
+          },
+          {
+            "name": "sugar",
+            "expected_quantity": 9,
+            "model_quantity": 9,
+            "unit": "tablespoons",
+            "percentage_error": 0.0
+          }
+        ],
+        "omitted_or_extra": false,
+        "format_ok": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a recipe scaling assistant. Scale all ingredient quantities proportionally from the original servings to the requested servings. Keep ingredient names and units exactly as given. Output only a valid JSON object with the following shape: {\"servings\": number, \"ingredients\": [{\"name\": string, \"quantity\": number, \"unit\": string}, ...]}. Do not include any extra commentary, explanations, or keys.",
+        "user_message": "Please scale this recipe to 3 servings.\n\nOriginal servings: 4\nIngredients:\n- name: water, quantity: 800, unit: ml\n- name: lemon juice, quantity: 200, unit: ml\n- name: sugar, quantity: 100, unit: g\n- name: ice cubes, quantity: 8, unit: piece\n\nReturn the scaled recipe in the specified JSON format.",
+        "evaluation_instructions": "Task: Verify that the model scales all ingredient quantities from 4 servings to 3 servings and returns the result in the required JSON format.\n\nExpected scaling factor: 3 / 4 = 0.75\nExpected scaled ingredients:\n- water: 800 ml * 0.75 = 600 ml\n- lemon juice: 200 ml * 0.75 = 150 ml\n- sugar: 100 g * 0.75 = 75 g\n- ice cubes: 8 piece * 0.75 = 6 piece\n\nValidation steps:\n1) Parse output as JSON. It must be a single JSON object with keys:\n   - servings: number (should be 3)\n   - ingredients: array of objects. Each object must have exactly: name (string), quantity (number), unit (string).\n   No extra top-level keys and no extra fields inside ingredient objects.\n2) Check formatting. If not valid JSON or schema mismatch, score = -1 and stop.\n3) Check ingredient set and units:\n   - Ingredient names must match exactly: [\"water\", \"lemon juice\", \"sugar\", \"ice cubes\"].\n   - Units must match exactly: water (\"ml\"), lemon juice (\"ml\"), sugar (\"g\"), ice cubes (\"piece\").\n   - If any ingredient is missing or any extra ingredient is present, or any unit differs, set omitted_or_extra = true.\n4) Compute expected quantities as above. For each ingredient i, compute percent error: err_i = abs(pred_i - exp_i) / exp_i * 100.\n   - Provide metadata percent_error_per_ingredient as a mapping from ingredient name to err_i (rounded to 2 decimals).\n   - Provide omitted_or_extra boolean flag as defined in step 3.\n5) Scoring:\n   - If formatting invalid or omitted_or_extra = true: score = -1.\n   - Else, if all percent errors are exactly 0.00 (within exact arithmetic; small floating rounding up to 0.01% is acceptable): score = +1.\n   - Else, if all percent errors < 5%: score = +0.5.\n   - Else: score = 0.\n\nNotes for implementer:\n- Treat numeric quantities as floats when parsing; quantities may include decimals.\n- For the \"exact\" case, allow tiny float noise: consider values equal if |pred - expected| <= 0.005 when expected <= 100, or relative error <= 0.01% otherwise.\n- The servings field should be 3; if missing or not 3, treat as formatting/schema error.",
+        "notes": "This test uses simple integer targets to avoid rounding ambiguity. Units and ingredient names must match exactly to simplify automated checking. Accept decimal quantities if the model chooses to emit them, but evaluate by percent error. The evaluator should reject outputs that include additional commentary or keys beyond the specified schema."
+      },
+      "model_response": "{\"servings\": 3, \"ingredients\": [{\"name\": \"water\", \"quantity\": 600, \"unit\": \"ml\"}, {\"name\": \"lemon juice\", \"quantity\": 50, \"unit\": \"ml\"}, {\"name\": \"sugar\", \"quantity\": 75, \"unit\": \"g\"}, {\"name\": \"ice cubes\", \"quantity\": 6, \"unit\": \"piece\"}]}",
+      "evaluation": {
+        "score": 0,
+        "reasoning": "The model's output has a serious scaling error: 'lemon juice' should be 150 ml, but the model outputted 50 ml. All other ingredients are correctly scaled. The JSON format and schema are otherwise valid, all names and units match, servings is correct, and there are no extra keys. Percent errors: water (0%), lemon juice (66.67%), sugar (0%), ice cubes (0%). Since at least one percent error >= 5%, the score is 0.",
+        "passed": false,
+        "percent_error_per_ingredient": {
+          "water": 0,
+          "lemon juice": 66.67,
+          "sugar": 0,
+          "ice cubes": 0
+        },
+        "omitted_or_extra": false
+      }
+    }
+  ],
+  "aggregate": {
+    "runs": 10,
+    "average_score": -0.6,
+    "pass_rate": 0.0,
+    "max_score": 0.0,
+    "min_score": -1.0
+  }
+}

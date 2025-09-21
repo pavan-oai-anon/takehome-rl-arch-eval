@@ -1,0 +1,154 @@
+{
+  "task": "typo_correction",
+  "model_path": ".art/typo_correction/models/typo_correction-o4-mini-20250921_024112/checkpoints/0010",
+  "user_prompt_path": "user_prompts/typo_correction.txt",
+  "runs": [
+    {
+      "plan": {
+        "system_message": "You are a text-correction agent for short product reviews. Your job is to fix common spelling and grammar mistakes while preserving the original meaning. Output only the corrected review in plain text with no extra commentary, labels, quotes, or formatting.",
+        "user_message": "Difficulty: easy\nThe headphones are realy good for the price, but the batterry life isnt great",
+        "evaluation_instructions": "Scoring: exact match after trimming leading/trailing whitespace.\n- The response must contain only the corrected review (no extra words, labels, or quotes).\n- Correct spelling, basic grammar, and punctuation while preserving meaning.\n- Expected corrected review (gold):\nThe headphones are really good for the price, but the battery life isn't great.\nAny deviation from the gold text (apart from leading/trailing whitespace) is incorrect.",
+        "notes": "This test mirrors the ART RL task: one noisy review per episode with an optional difficulty label. The model must return a single corrected review verbatim. Common pitfalls include leaving misspellings (realy, batterry), missing the apostrophe in isn't, or omitting the final period. Keep the task simple to suit a small model."
+      },
+      "model_response": "The headphones are really good for the price, but the battery life isn't great.",
+      "evaluation": {
+        "score": 1.0,
+        "reasoning": "The model's response exactly matches the expected corrected review after trimming whitespace. All spelling errors ('realy', 'batterry', 'isnt') are corrected, the apostrophe is used correctly, meaning is preserved, punctuation is correct, and no extra text is present.",
+        "passed": true
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent in an ART RL task that fixes typos in short product reviews. You will receive one noisy review and an optional difficulty label. Return only the corrected review in plain text with spelling and basic grammar fixed. Do not add quotes, explanations, or any extra commentary.",
+        "user_message": "Difficulty: easy\nNoisy review: This vaccum is realy noisey and dosen't pick up dirt good, but the battery last long.",
+        "evaluation_instructions": "Expected exact output (case- and punctuation-sensitive):\nThis vacuum is really noisy and doesn't pick up dirt well, but the battery lasts long.\n\nScoring rules:\n- Accept only an exact string match after trimming leading/trailing whitespace.\n- No added or missing words, no quotes, no commentary, and no extra lines.\n- American English spelling; keep the sentence structure unchanged aside from correcting errors.",
+        "notes": "Simple, single-sentence review with common spelling and grammar errors (vaccum\u2192vacuum, realy\u2192really, noisey\u2192noisy, dosen't\u2192doesn't, good\u2192well, last\u2192lasts). Includes optional difficulty label. Designed for small models; expects a verbatim corrected review."
+      },
+      "model_response": "This vacuum is really noisy and doesn't pick up dirt very well, but the battery lasts longer.",
+      "evaluation": {
+        "score": 0.8,
+        "reasoning": "The model fixed most spelling and grammar errors correctly but changed 'pick up dirt good' to 'pick up dirt very well' instead of 'pick up dirt well', and 'the battery lasts long' to 'the battery lasts longer.' The output contains minor additions and changes to phrasing, so it is close, but not an exact match.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a typo-fixing assistant for short product reviews. You will receive one noisy review and an optional difficulty label. Return only the corrected review in plain text with spelling and basic grammar fixed. Do not add or remove meaning, do not paraphrase, and do not include any extra commentary, labels, or quotes.",
+        "user_message": "Difficulty: easy\nReview: Ths blender werks well, but it's to loud.",
+        "evaluation_instructions": "Goal: The assistant must output only the corrected review text, with spelling and basic grammar fixed, preserving the original meaning and style.\nGold response (exact string): This blender works well, but it's too loud.\nScoring:\n- Pass if and only if the output matches the gold response exactly (case, spacing, punctuation), with no extra text, quotes, or labels.\n- Fail if any additional words, explanations, or formatting are included; if any words are changed beyond fixing the errors; or if there are remaining spelling/grammar errors.\nNotes for judging:\n- Preserve contractions as they appear unless they are incorrect.\n- Do not restructure the sentence beyond necessary corrections.\n- Trim leading/trailing whitespace.",
+        "notes": "A simple one-sentence review with three common errors: Ths->This, werks->works, to->too. Suitable for a small model. Tests strict verbatim output and minimal, precise corrections."
+      },
+      "model_response": "This blender works well, but it is too loud.",
+      "evaluation": {
+        "score": 0.7,
+        "reasoning": "The model fixed all spelling errors and corrected 'to' to 'too', but changed 'it's' to 'it is', which alters the style by expanding the contraction unnecessarily. The gold response uses the contraction, and strict verbatim output is required.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You fix typos in short product reviews. The environment will provide one noisy review per turn plus an optional difficulty label. Output only the corrected review in plain text, with no extra words, quotes, or formatting.",
+        "user_message": "difficulty: easy\nnoisy_review:\nThis coffe maker is greaat, brews fast and dosen't leak. Highly reccomended.",
+        "evaluation_instructions": "Goal: The model must return the corrected review verbatim, with no extra commentary.\n- Trim leading/trailing whitespace before comparison.\n- The output must match exactly:\nThis coffee maker is great, brews fast and doesn't leak. Highly recommended.\n- Do not allow quotes, markdown, or any additional text.\n- Fail if any misspellings remain, if unnecessary words are added/removed, punctuation is altered beyond necessary corrections, or casing differs from the target.",
+        "notes": "Gold answer: This coffee maker is great, brews fast and doesn't leak. Highly recommended.\nThis test checks common spelling fixes (coffee, great, doesn't, recommended) and enforces exact, commentary-free output."
+      },
+      "model_response": "This coffee maker is great, brews quickly and doesn't leak. Highly recommended.",
+      "evaluation": {
+        "score": 0.8,
+        "passed": false,
+        "reason": "The model improved many spelling issues, but altered the phrase 'brews fast' to 'brews quickly' which is an unnecessary change. The output deviates from the gold answer, which requires an exact match."
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that fixes typos in short product reviews. Return only the corrected review as plain text. Do not add or remove information, do not include explanations, quotes, or extra commentary. Preserve the original meaning and tone while correcting spelling, grammar, and punctuation.",
+        "user_message": "difficulty: medium\nnoisy_review: I realy wanted to like these earbud's. Sound is ok but the conection keeps droping and the left bud dies after 20 minuts. The case feels cheep, too. Would of kept them if the mic wasnt so bad, cus I take alot of calls. Returning it tmrw.",
+        "evaluation_instructions": "Task: Correct the spelling and grammar of the noisy review. Constraints: Output only the corrected review text with no extra commentary. Preserve meaning; do not add or remove content beyond necessary corrections. Expected output (exact match, case- and punctuation-sensitive; trim leading/trailing whitespace):\nI really wanted to like these earbuds. Sound is okay, but the connection keeps dropping and the left bud dies after 20 minutes. The case feels cheap, too. Would have kept them if the mic wasn't so bad, because I take a lot of calls. Returning them tomorrow.",
+        "notes": "This single-turn test mimics the environment surfacing one noisy review with an optional difficulty label. It targets common errors: misspellings (realy, conection, minuts, cheep), doubled consonants (droping\u2192dropping), contraction and apostrophe misuse (earbud's\u2192earbuds, wasnt\u2192wasn't), phrase correction (Would of\u2192Would have, cus\u2192because, alot\u2192a lot), pronoun agreement (it\u2192them), and informal abbreviation expansion (tmrw\u2192tomorrow). The model must return only the corrected review, verbatim."
+      },
+      "model_response": "I really wanted to like these earbuds. Sound is ok, but the connection keeps dropping and the left bud dies after 20 minutes. The case feels cheap, too. It would have been worth keeping them if the microphone wasn't so bad since I take a lot of calls. Returning it tomorrow.",
+      "evaluation": {
+        "score": 0.55,
+        "reasoning": "The model corrected most spelling and grammar errors (e.g., 'realy' to 'really', 'conection' to 'connection', 'droping' to 'dropping', 'minuts' to 'minutes', 'cheep' to 'cheap', 'Would of' to 'would have', 'wasnt' to 'wasn't', 'cus' to 'since', 'alot' to 'a lot', and 'tmrw' to 'tomorrow'). However, it did not exactly preserve meaning: it expanded the phrase 'Would of kept them if the mic wasnt so bad, cus I take alot of calls' to 'It would have been worth keeping them if the microphone wasn't so bad since I take a lot of calls', introducing the phrase 'It would have been worth...' which was absent in the original. Also, it left 'Returning it tomorrow.' rather than 'Returning them tomorrow.', deviating from the expected output. Lastly, it changed 'Sound is ok' to 'Sound is ok, but the connection...', introducing a comma that is present in the expected output, but left 'ok' as 'ok' instead of 'okay' as required. Thus, the output fulfills the main corrections but fails subtle exactness on content and a few wording points.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent in an ART reinforcement learning environment. Your task each episode is to correct spelling and basic grammar in a single short product review. Output only the corrected review in plain text. No quotes, no labels, no explanations. Do not add or remove ideas; only fix typos, capitalization, and simple agreement. Use US English.",
+        "user_message": "difficulty: easy\nreview: Thes headphones are amazng, battery last for days and the sound is crisp. Would defintely reccomend.",
+        "evaluation_instructions": "- Goal: The model must return the corrected review verbatim, with no extra commentary or formatting.\n- Expected exact output (after trimming leading/trailing whitespace):\n  These headphones are amazing, battery lasts for days and the sound is crisp. Would definitely recommend.\n- Validation steps:\n  1) Ensure the response contains only the corrected review text (no quotes, prefixes like 'Corrected:', or trailing notes).\n  2) Trim leading/trailing whitespace before comparison; comparison is otherwise case- and punctuation-sensitive.\n  3) If any words are added/removed beyond necessary typo/grammar fixes, or if meaning changes, mark as incorrect.\n- Common failure modes to reject:\n  \u2022 Extra commentary or formatting (e.g., explanations, markdown, brackets).\n  \u2022 Partial corrections (e.g., fixing some typos but missing others).\n  \u2022 Rewriting the sentence more extensively than needed.",
+        "notes": "This test mirrors a single-episode ART task that surfaces one noisy review and an optional difficulty label. The review includes common errors (spelling and subject\u2013verb agreement). The agent should produce only the corrected review in plain text, aligned with the 2048 reference style constraints (no extra tokens or metadata)."
+      },
+      "model_response": "The headphones are amazing, the battery lasts for days, and the sound is crystal clear. I would definitely recommend them.",
+      "evaluation": {
+        "score": 0.25,
+        "reasoning": "The model response introduced new words ('crystal clear', 'I would recommend them') and changed the structure of the review, which alters the original meaning and extends beyond correcting spelling and grammar errors. It also removed the concise style of the review. Corrections should have been minimal and in strict adherence to the given text.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You fix typos in short product reviews. Return only the corrected review in plain text with no extra commentary or formatting. Keep the original meaning and tone, correcting common spelling, grammar, and punctuation mistakes. Do not add or remove information.",
+        "user_message": "[difficulty: easy]\nGreat vacum cleaner! It pick up dust fast and dosen't make much noise.",
+        "evaluation_instructions": "The model must output exactly: \"Great vacuum cleaner! It picks up dust fast and doesn't make much noise.\" No extra words, labels, or quotes. Comparison should be exact after trimming leading/trailing whitespace. Any deviation (e.g., missing apostrophe, unchanged verb form, altered punctuation, or added commentary) is incorrect.",
+        "notes": "This test mirrors the RL task: one noisy review per episode, optional difficulty label present but should be ignored. The expected corrections are: vacum -> vacuum, pick -> picks (subject-verb agreement), dosen't -> doesn't (spelling and apostrophe). Output must be a single plain-text line with the corrected review only."
+      },
+      "model_response": "Great vacuum cleaner! It picks up dust quickly and doesn't make much noise.",
+      "evaluation": {
+        "score": 0.7,
+        "reasoning": "The model correctly fixed the spelling errors 'vacum' to 'vacuum', 'dosen't' to 'doesn't', and corrected the verb to 'picks'. However, it incorrectly changed 'fast' to 'quickly', which is an unnecessary alteration not requested in the instructions. All other aspects are correct.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that fixes typos and simple grammar in short product reviews. You may receive an optional difficulty label plus a noisy review. Output only the corrected review as plain text, with no extra commentary, explanations, or quotes.",
+        "user_message": "Difficulty: medium\nNoisy review: This coffe maker is grate! I'v used it for two week and its been working perfect. The only think I dont like is the cord is to short.",
+        "evaluation_instructions": "Goal: The model must return the corrected review verbatim, with no extra text. Trim leading/trailing whitespace before comparison; otherwise require an exact match (punctuation and capitalization must match). Expected answer:\nThis coffee maker is great! I've used it for two weeks and it's been working perfectly. The only thing I don't like is the cord is too short.",
+        "notes": "This test includes common errors: coffe->coffee, grate->great, I'v->I've, week->weeks, its->it's, perfect->perfectly, think->thing, dont->don't, to->too. The difficulty label is present but should not affect output format. The model should output only the corrected review text."
+      },
+      "model_response": "This coffee maker is great! I've used it for two weeks and it's been working perfectly. The only thing I don't like is the cord is too short.",
+      "evaluation": {
+        "score": 1.0,
+        "reasoning": "The model's output matches the expected corrected review exactly, with all typos and grammar issues fixed. There is no extra text or missing corrections.",
+        "passed": true
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that receives a single noisy product review (with an optional difficulty label). Your task is to output only the corrected review in plain text. Do not include any extra words, labels, quotes, or commentary. Preserve the original meaning and sentence boundaries while fixing common spelling and basic grammar mistakes.",
+        "user_message": "Episode: 1\nDifficulty: easy\nNoisy review:\nThis coffe maker is amazng! It brews fast and the taste is great. I highly recomend it.",
+        "evaluation_instructions": "Goal: The model must return the corrected review verbatim, with no extra text.\nExpected exact output:\nThis coffee maker is amazing! It brews fast and the taste is great. I highly recommend it.\nScoring:\n- Strip leading/trailing whitespace from the model output before comparison.\n- The content must match the expected string exactly (same casing, spaces, and punctuation).\n- Any additional characters (e.g., quotes, labels, explanations, extra lines) result in failure.\n- Do not accept alternative rewrites or paraphrases; only typo/grammar fixes are allowed.",
+        "notes": "Simple case aimed at small models. Common misspellings corrected: coffe->coffee, amazng->amazing, recomend->recommend. Ensure the exclamation mark and periods are preserved as in the expected output."
+      },
+      "model_response": "This coffee maker is amazing! It brews quickly and the taste is great. I highly recommend it.",
+      "evaluation": {
+        "score": 0.7,
+        "reasoning": "The model fixed all spelling errors and most grammar mistakes. However, it paraphrased 'brews fast' as 'brews quickly', which is not allowed according to the instructions. All other aspects (no extra text, punctuation, etc.) are correct.",
+        "passed": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that fixes typos and simple grammar errors in short product reviews. You will receive one noisy review and an optional difficulty label. Return only the corrected review in plain text with no extra commentary, no quotes, and no metadata.",
+        "user_message": "Difficulty: easy\nReview: The toaster work great, but it heats up to slow and the crumb tray is hard to clean.",
+        "evaluation_instructions": "Expected exact output (after trimming leading/trailing whitespace):\n\"The toaster works great, but it heats up too slowly and the crumb tray is hard to clean.\"\n\nScoring rules:\n- The response must match the expected string exactly (case, spacing, and punctuation), with no extra text or quotes.\n- Do not accept additional commentary, explanations, or formatting.\n- Minor differences (e.g., missing period) should be marked incorrect to enforce verbatim output.",
+        "notes": "This test mirrors the environment: one noisy review plus an optional difficulty label. The sample includes common errors (subject\u2013verb agreement: work\u2192works; to/too: to\u2192too; adjective\u2192adverb: slow\u2192slowly). The task is simple enough for a small model and checks strict adherence to the verbatim corrected output requirement."
+      },
+      "model_response": "The toaster works great, but it heats up too slowly and the crumb tray is difficult to clean.",
+      "evaluation": {
+        "score": 0.7,
+        "reasoning": "The model fixed the grammar and typos correctly but changed 'hard to clean' to 'difficult to clean,' which does not match the expected verbatim output. It also used 'too slowly' correctly, but any deviation from the expected review should be penalized for this strict task.",
+        "passed": false
+      }
+    }
+  ],
+  "aggregate": {
+    "runs": 10,
+    "average_score": 0.72,
+    "pass_rate": 0.2,
+    "max_score": 1.0,
+    "min_score": 0.25
+  }
+}

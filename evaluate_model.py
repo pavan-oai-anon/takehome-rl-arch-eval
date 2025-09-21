@@ -12,7 +12,7 @@ import torch
 from openai import OpenAI
 from unsloth import FastLanguageModel
 from dotenv import load_dotenv
-from tenacity import retry
+from tenacity import retry, stop_after_attempt, wait_exponential
 load_dotenv()
 
 @dataclass
@@ -143,6 +143,7 @@ def generate_with_model(
     temperature: float,
     top_p: float,
 ) -> str:
+    print("starting generate_with_model")
     messages = []
     if system_message:
         messages.append({"role": "system", "content": system_message})
@@ -163,18 +164,20 @@ def generate_with_model(
             top_p=top_p,
         )
     generated = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+    print("done with generate_with_model")
     return generated.strip()
 
-@retry
+@retry(stop=stop_after_attempt(4), wait=wait_exponential(min=0.5, max=3))
 def evaluate_with_code_interpreter(
     client: OpenAI,
     evaluator_model: str,
     plan: EvaluationPlan,
     model_response: str,
 ) -> Dict[str, Any]:
+    print("starting evaluate_with_code_interpreter")
     instructions = (
         "You are a meticulous evaluator. Use the python code tool when helpful to check correctness. "
-        "Return a JSON object with keys score (0-1.0) non-integer scores are allowed, reasoning, passed (boolean)."
+        "Return a JSON object with keys score (0-1.0) non-negative non-integer scores are allowed, reasoning, passed (boolean)."
     )
     evaluation_prompt = (
         "Task description notes:\n" + plan.notes + "\n\n"
@@ -182,18 +185,21 @@ def evaluate_with_code_interpreter(
         "User input sent to model:\n" + plan.user_message + "\n\n"
         "Model response:\n" + model_response + "\n\n"
         "Evaluation instructions:\n" + plan.evaluation_instructions + "\n"
+        "Make sure that your output is just a json object. You can use the code_interpreter tool to help validate a response from the model if needed - but in most cases it shouldn't be needed."
     )
     resp = client.responses.create(
         model=evaluator_model,
         tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
         instructions=instructions,
         input=evaluation_prompt,
+        timeout=120,
     )
     text = collect_response_text(resp)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Evaluator did not return valid JSON: {text}") from exc
+    print("done with evaluate_with_code_interpreter")
     return data
 
 
