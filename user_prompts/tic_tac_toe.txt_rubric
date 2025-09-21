@@ -1,0 +1,8 @@
+Rubric – Tic-Tac-Toe Environment (10 pts total)
+
+Award points for environment/reward craftsmanship:
+- 2 pts: Board parser validates legal moves, enforces turn order, and rejects occupied squares with clear errors.
+- 2 pts: Reward structure differentiates wins (+1), draws (e.g., +0.1 or 0), losses (-1), and illegal moves (-1) with documented rationale.
+- 2 pts: Game state transitions correctly update board, toggle turns, and detect terminal conditions (win/draw) before issuing reward.
+- 2 pts: Metadata includes board snapshot/hash, move chosen, winner/draw flag, and illegal move indicators.
+- 2 pts: Unit tests or scripted scenarios cover win/draw/illegal-move paths to confirm validator behavior.

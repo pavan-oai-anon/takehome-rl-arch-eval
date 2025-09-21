@@ -1,0 +1,37 @@
+{
+  "total_points": 6.0,
+  "criteria": [
+    {
+      "description": "Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.",
+      "max_points": 2,
+      "awarded_points": 1.5,
+      "justification": "Presence and extras are enforced via name matching and missing/extra checks; units are required to match exactly and mismatches are penalized. However, duplicate ingredient entries with the same name are not explicitly detected (map dedupes), so 'present once' is not fully validated. Quantities are validated against ground-truth scaled amounts via relative error."
+    },
+    {
+      "description": "Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Implements +1 for <1e-6 avg relative error, +0.5 for <=5% with no missing/extra, and -1 for parse errors, unit mismatches, missing/excess ingredients, or larger errors."
+    },
+    {
+      "description": "Supports multiple unit types (weight, volume, count) and documents how scaling is handled for each.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Recipes include grams (g), milliliters (ml), and pieces (pc). Quantities are scaled numerically while units remain unchanged; Ingredient.quantity is documented as base units (e.g., grams, millilitres)."
+    },
+    {
+      "description": "Metadata logs per-ingredient percentage error, total absolute error, and flags for omissions/extras.",
+      "max_points": 2,
+      "awarded_points": 0.5,
+      "justification": "Logs avg_pct_error and boolean flags (missing_flag, extra_flag), and parse_error. Does not record per-ingredient percentage errors or a total absolute error metric."
+    },
+    {
+      "description": "Unit tests or fixtures cover upscale, downscale, and fractional-serving scenarios to verify validator behavior.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No unit tests or fixtures present covering scaling scenarios."
+    }
+  ],
+  "notes": "Core reward logic is solid and conforms to the rubric thresholds. Consider adding explicit duplicate-name detection, per-ingredient error logging (and total absolute error), and a small test suite covering upscaling, downscaling, and fractional-serving edge cases."
+}
+

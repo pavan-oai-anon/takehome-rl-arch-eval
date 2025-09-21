@@ -1,0 +1,36 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {
+      "description": "Reward function properly executes the expression and checks to see if the expression equals 24.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Expression is safely evaluated via AST; exact match determined by abs(value-24) <= EPSILON and rewarded with EXACT_SOLUTION_REWARD."
+    },
+    {
+      "description": "Reward function makes sure that the expression uses all four digits exactly once.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Digit usage verified with multiset equality (numbers_match_episode). Exact reward gated on used_all_digits; bonus for adherence."
+    },
+    {
+      "description": "Environment and prompting is setup to elicit thinking / reasoning in a <thinking> tag or some equivalent manner.",
+      "max_points": 5,
+      "awarded_points": 0,
+      "justification": "Prompts require only a <solution> tag and explicitly forbid extra text; no thinking/reasoning channel provided."
+    },
+    {
+      "description": "Reward function is smooth, where even if the expression is not exactly 24, there is a positive reward for being close to 24.",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "_smooth_reward provides a linear closeness signal clipped at CLIPPED_ERROR; near-misses receive positive reward plus small bonus for correct digit usage."
+    },
+    {
+      "description": "There is either a penalty for not following the formatting the prompt demands, or a reward for following the formatting the prompt demands.",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Missing/malformed <solution> XML or empty solution yields reward = -1.0 and marks invalid_solution, penalizing formatting violations."
+    }
+  ],
+  "notes": "Robust safe evaluation and rule checks with clear metrics. No reasoning/<thinking> tag is present, which is the main missing rubric element."
+}

@@ -1,0 +1,2913 @@
+[2025-09-21T08:38:49] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/recipe_scaling/gpt-5/20250921_083849
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T08:38:49] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+Make sure to use the codex tools to create the files needed for this - I don't just want example output.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Scale cooking recipes up or down for different serving sizes, adjusting all ingredients proportionally. Create an ART RL setup where env.py defines base recipes (ingredient quantities, units, original servings) and rollout.py accepts an agent response containing the scaled recipe in a clear JSON format (e.g., list of ingredient objects with `name`, `quantity`, `unit`). Reward is highest when the agent scales quantities exactly to the requested servings (+1), partial credit if off by <5% (+0.5), and penalties for missing ingredients or incorrect formatting (-1). Include metadata for percentage error per ingredient and a flag if any ingredient is omitted or extra. Follow the same scaffolding style as the other prompts with configurable recipes in env.py and the rollout logic handling validation.
+[2025-09-21T08:39:21] codex
+
+I’m going to add two files: env.py with recipes, config, and helpers; and rollout.py implementing the ART rollout, parsing JSON outputs, computing errors, and shaping rewards with scalar metadata and numeric metrics.
+[2025-09-21T08:39:53] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+"""Shared environment and helpers for the Recipe Scaling ART task.
+
+This module centralizes tweakable constants, base recipes, and prompt helpers.
+Keep hyperparameters near the top for easy modification.
+
+Assumptions:
+- The host project wires up training; we only expose config and rollout helpers.
+- Inference/training uses a LocalBackend; no GPU selection logic here.
+
+Installation (if needed):
+- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, TypedDict
+
+
+# -----------------------------
+# Tunables & training constants
+# -----------------------------
+RANDOM_SEED: int = 7
+
+# Minimal training config expected by host training harness.
+TRAINING_CONFIG: dict[str, Any] = {
+    "project": "recipe-scaling",
+    "model_name": "agent-recipe-001",
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "steps": 30,
+    "trajectories_per_group": 12,
+    "groups_per_step": 1,
+    "learning_rate": 2e-5,
+    "max_completion_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_exceptions": 12,
+    # Keep last N checkpoints when cleaning up between steps
+    "cleanup_keep_last": 1,
+}
+
+
+# -----------------------------
+# Recipe data model & registry
+# -----------------------------
+class Ingredient(TypedDict):
+    name: str
+    quantity: float
+    unit: str
+
+
+class Recipe(TypedDict):
+    name: str
+    servings: int
+    ingredients: List[Ingredient]
+
+
+# A small pool of base recipes. Quantities are realistic but simple.
+# Units are canonicalized to a short form to ease validation.
+BASE_RECIPES: list[Recipe] = [
+    {
+        "name": "Fluffy Pancakes",
+        "servings": 4,
+        "ingredients": [
+            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
+            {"name": "milk", "quantity": 300.0, "unit": "ml"},
+            {"name": "egg", "quantity": 2.0, "unit": "pc"},
+            {"name": "sugar", "quantity": 25.0, "unit": "g"},
+            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
+            {"name": "salt", "quantity": 2.0, "unit": "g"},
+            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
+        ],
+    },
+    {
+        "name": "Tomato Soup",
+        "servings": 3,
+        "ingredients": [
+            {"name": "tomato", "quantity": 600.0, "unit": "g"},
+            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
+            {"name": "onion", "quantity": 100.0, "unit": "g"},
+            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
+            {"name": "salt", "quantity": 4.0, "unit": "g"},
+            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
+        ],
+    },
+    {
+        "name": "Simple Pasta",
+        "servings": 2,
+        "ingredients": [
+            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
+            {"name": "garlic", "quantity": 6.0, "unit": "g"},
+            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
+            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
+            {"name": "salt", "quantity": 3.0, "unit": "g"},
+            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
+        ],
+    },
+]
+
+
+# -----------------------------
+# Unit and name normalization
+# -----------------------------
+UNIT_SYNONYMS: dict[str, str] = {
+    # mass
+    "gram": "g",
+    "grams": "g",
+    "g": "g",
+    # volume
+    "milliliter": "ml",
+    "milliliters": "ml",
+    "ml": "ml",
+    "tablespoon": "tbsp",
+    "tablespoons": "tbsp",
+    "tbsp": "tbsp",
+    "teaspoon": "tsp",
+    "teaspoons": "tsp",
+    "tsp": "tsp",
+    # count
+    "pc": "pc",
+    "piece": "pc",
+    "pieces": "pc",
+    "egg": "pc",
+    "eggs": "pc",
+}
+
+
+def canonical_unit(unit: str) -> str:
+    """Return a canonical short unit string (lowercase)."""
+    u = unit.strip().lower()
+    return UNIT_SYNONYMS.get(u, u)
+
+
+def normalize_name(name: str) -> str:
+    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
+    s = name.lower().strip()
+    # Keep letters/numbers/spaces, replace others with space, then collapse
+    out = []
+    prev_space = False
+    for ch in s:
+        if ch.isalnum() or ch.isspace():
+            if ch.isspace():
+                if not prev_space:
+                    out.append(" ")
+                prev_space = True
+            else:
+                out.append(ch)
+                prev_space = False
+        else:
+            if not prev_space:
+                out.append(" ")
+                prev_space = True
+    return "".join(out).strip()
+
+
+# -----------------------------
+# Prompt helpers
+# -----------------------------
+SYSTEM_PROMPT: str = (
+    "You scale cooking recipes. Respond ONLY with JSON. "
+    "JSON schema: {\"servings\": int, \"ingredients\": ["
+    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
+    "No explanations, no code fences, no prose."
+)
+
+
+def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
+    """Create a compact user prompt describing the scaling task.
+
+    The agent must scale all ingredient quantities proportionally from the
+    provided base servings to the requested target servings and return strict
+    JSON per SYSTEM_PROMPT.
+    """
+    lines = [
+        f"Base recipe: {recipe['name']}",
+        f"Original servings: {recipe['servings']}",
+        "Ingredients (name, quantity, unit):",
+    ]
+    for ing in recipe["ingredients"]:
+        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
+    lines.append(f"Target servings: {target_servings}")
+    lines.append(
+        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
+    )
+    return "\n".join(lines)
+
+
+def recipe_for_step(step: int) -> Recipe:
+    """Deterministically select a recipe from BASE_RECIPES for the given step."""
+    idx = step % len(BASE_RECIPES)
+    recipe = BASE_RECIPES[idx]
+    # Canonicalize units for safety
+    canonicalized: Recipe = {
+        "name": recipe["name"],
+        "servings": int(recipe["servings"]),
+        "ingredients": [
+            {
+                "name": i["name"],
+                "quantity": float(i["quantity"]),
+                "unit": canonical_unit(i["unit"]),
+            }
+            for i in recipe["ingredients"]
+        ],
+    }
+    return canonicalized
+
+
+def suggested_target_servings(original: int, step: int) -> int:
+    """Pick a simple but varying target servings value.
+
+    Uses the step to avoid randomness: cycles through a small, interesting set.
+    """
+    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
+    options = [1, 2, 3, 4, 6, 8, 10, 12]
+    # Avoid asking for the same value; pick the next option.
+    try:
+        j = (options.index(original) + (1 + (step % 3))) % len(options)
+    except ValueError:
+        j = (step + original) % len(options)
+    target = options[j]
+    return target
+
+
+__all__ = [
+    "RANDOM_SEED",
+    "TRAINING_CONFIG",
+    "Ingredient",
+    "Recipe",
+    "BASE_RECIPES",
+    "SYSTEM_PROMPT",
+    "build_user_prompt",
+    "recipe_for_step",
+    "normalize_name",
+    "canonical_unit",
+    "suggested_target_servings",
+]
+
+[2025-09-21T08:39:53] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A env.py
+[2025-09-21T08:39:53] turn diff:
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6c63bebad0267b2ee7adee54b4491531440937
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+@@ -0,0 +1,236 @@
++"""Shared environment and helpers for the Recipe Scaling ART task.
++
++This module centralizes tweakable constants, base recipes, and prompt helpers.
++Keep hyperparameters near the top for easy modification.
++
++Assumptions:
++- The host project wires up training; we only expose config and rollout helpers.
++- Inference/training uses a LocalBackend; no GPU selection logic here.
++
++Installation (if needed):
++- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, TypedDict
++
++
++# -----------------------------
++# Tunables & training constants
++# -----------------------------
++RANDOM_SEED: int = 7
++
++# Minimal training config expected by host training harness.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "recipe-scaling",
++    "model_name": "agent-recipe-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 30,
++    "trajectories_per_group": 12,
++    "groups_per_step": 1,
++    "learning_rate": 2e-5,
++    "max_completion_tokens": 256,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    "max_exceptions": 12,
++    # Keep last N checkpoints when cleaning up between steps
++    "cleanup_keep_last": 1,
++}
++
++
++# -----------------------------
++# Recipe data model & registry
++# -----------------------------
++class Ingredient(TypedDict):
++    name: str
++    quantity: float
++    unit: str
++
++
++class Recipe(TypedDict):
++    name: str
++    servings: int
++    ingredients: List[Ingredient]
++
++
++# A small pool of base recipes. Quantities are realistic but simple.
++# Units are canonicalized to a short form to ease validation.
++BASE_RECIPES: list[Recipe] = [
++    {
++        "name": "Fluffy Pancakes",
++        "servings": 4,
++        "ingredients": [
++            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
++            {"name": "milk", "quantity": 300.0, "unit": "ml"},
++            {"name": "egg", "quantity": 2.0, "unit": "pc"},
++            {"name": "sugar", "quantity": 25.0, "unit": "g"},
++            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 2.0, "unit": "g"},
++            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Tomato Soup",
++        "servings": 3,
++        "ingredients": [
++            {"name": "tomato", "quantity": 600.0, "unit": "g"},
++            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
++            {"name": "onion", "quantity": 100.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
++            {"name": "salt", "quantity": 4.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Simple Pasta",
++        "servings": 2,
++        "ingredients": [
++            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
++            {"name": "garlic", "quantity": 6.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
++            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 3.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++]
++
++
++# -----------------------------
++# Unit and name normalization
++# -----------------------------
++UNIT_SYNONYMS: dict[str, str] = {
++    # mass
++    "gram": "g",
++    "grams": "g",
++    "g": "g",
++    # volume
++    "milliliter": "ml",
++    "milliliters": "ml",
++    "ml": "ml",
++    "tablespoon": "tbsp",
++    "tablespoons": "tbsp",
++    "tbsp": "tbsp",
++    "teaspoon": "tsp",
++    "teaspoons": "tsp",
++    "tsp": "tsp",
++    # count
++    "pc": "pc",
++    "piece": "pc",
++    "pieces": "pc",
++    "egg": "pc",
++    "eggs": "pc",
++}
++
++
++def canonical_unit(unit: str) -> str:
++    """Return a canonical short unit string (lowercase)."""
++    u = unit.strip().lower()
++    return UNIT_SYNONYMS.get(u, u)
++
++
++def normalize_name(name: str) -> str:
++    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
++    s = name.lower().strip()
++    # Keep letters/numbers/spaces, replace others with space, then collapse
++    out = []
++    prev_space = False
++    for ch in s:
++        if ch.isalnum() or ch.isspace():
++            if ch.isspace():
++                if not prev_space:
++                    out.append(" ")
++                prev_space = True
++            else:
++                out.append(ch)
++                prev_space = False
++        else:
++            if not prev_space:
++                out.append(" ")
++                prev_space = True
++    return "".join(out).strip()
++
++
++# -----------------------------
++# Prompt helpers
++# -----------------------------
++SYSTEM_PROMPT: str = (
++    "You scale cooking recipes. Respond ONLY with JSON. "
++    "JSON schema: {\"servings\": int, \"ingredients\": ["
++    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
++    "No explanations, no code fences, no prose."
++)
++
++
++def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
++    """Create a compact user prompt describing the scaling task.
++
++    The agent must scale all ingredient quantities proportionally from the
++    provided base servings to the requested target servings and return strict
++    JSON per SYSTEM_PROMPT.
++    """
++    lines = [
++        f"Base recipe: {recipe['name']}",
++        f"Original servings: {recipe['servings']}",
++        "Ingredients (name, quantity, unit):",
++    ]
++    for ing in recipe["ingredients"]:
++        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
++    lines.append(f"Target servings: {target_servings}")
++    lines.append(
++        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
++    )
++    return "\n".join(lines)
++
++
++def recipe_for_step(step: int) -> Recipe:
++    """Deterministically select a recipe from BASE_RECIPES for the given step."""
++    idx = step % len(BASE_RECIPES)
++    recipe = BASE_RECIPES[idx]
++    # Canonicalize units for safety
++    canonicalized: Recipe = {
++        "name": recipe["name"],
++        "servings": int(recipe["servings"]),
++        "ingredients": [
++            {
++                "name": i["name"],
++                "quantity": float(i["quantity"]),
++                "unit": canonical_unit(i["unit"]),
++            }
++            for i in recipe["ingredients"]
++        ],
++    }
++    return canonicalized
++
++
++def suggested_target_servings(original: int, step: int) -> int:
++    """Pick a simple but varying target servings value.
++
++    Uses the step to avoid randomness: cycles through a small, interesting set.
++    """
++    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
++    options = [1, 2, 3, 4, 6, 8, 10, 12]
++    # Avoid asking for the same value; pick the next option.
++    try:
++        j = (options.index(original) + (1 + (step % 3))) % len(options)
++    except ValueError:
++        j = (step + original) % len(options)
++    target = options[j]
++    return target
++
++
++__all__ = [
++    "RANDOM_SEED",
++    "TRAINING_CONFIG",
++    "Ingredient",
++    "Recipe",
++    "BASE_RECIPES",
++    "SYSTEM_PROMPT",
++    "build_user_prompt",
++    "recipe_for_step",
++    "normalize_name",
++    "canonical_unit",
++    "suggested_target_servings",
++]
++
+
+[2025-09-21T08:39:53] tokens used: 8,743
+[2025-09-21T08:39:53] turn diff:
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6c63bebad0267b2ee7adee54b4491531440937
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+@@ -0,0 +1,236 @@
++"""Shared environment and helpers for the Recipe Scaling ART task.
++
++This module centralizes tweakable constants, base recipes, and prompt helpers.
++Keep hyperparameters near the top for easy modification.
++
++Assumptions:
++- The host project wires up training; we only expose config and rollout helpers.
++- Inference/training uses a LocalBackend; no GPU selection logic here.
++
++Installation (if needed):
++- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, TypedDict
++
++
++# -----------------------------
++# Tunables & training constants
++# -----------------------------
++RANDOM_SEED: int = 7
++
++# Minimal training config expected by host training harness.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "recipe-scaling",
++    "model_name": "agent-recipe-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 30,
++    "trajectories_per_group": 12,
++    "groups_per_step": 1,
++    "learning_rate": 2e-5,
++    "max_completion_tokens": 256,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    "max_exceptions": 12,
++    # Keep last N checkpoints when cleaning up between steps
++    "cleanup_keep_last": 1,
++}
++
++
++# -----------------------------
++# Recipe data model & registry
++# -----------------------------
++class Ingredient(TypedDict):
++    name: str
++    quantity: float
++    unit: str
++
++
++class Recipe(TypedDict):
++    name: str
++    servings: int
++    ingredients: List[Ingredient]
++
++
++# A small pool of base recipes. Quantities are realistic but simple.
++# Units are canonicalized to a short form to ease validation.
++BASE_RECIPES: list[Recipe] = [
++    {
++        "name": "Fluffy Pancakes",
++        "servings": 4,
++        "ingredients": [
++            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
++            {"name": "milk", "quantity": 300.0, "unit": "ml"},
++            {"name": "egg", "quantity": 2.0, "unit": "pc"},
++            {"name": "sugar", "quantity": 25.0, "unit": "g"},
++            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 2.0, "unit": "g"},
++            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Tomato Soup",
++        "servings": 3,
++        "ingredients": [
++            {"name": "tomato", "quantity": 600.0, "unit": "g"},
++            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
++            {"name": "onion", "quantity": 100.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
++            {"name": "salt", "quantity": 4.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Simple Pasta",
++        "servings": 2,
++        "ingredients": [
++            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
++            {"name": "garlic", "quantity": 6.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
++            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 3.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++]
++
++
++# -----------------------------
++# Unit and name normalization
++# -----------------------------
++UNIT_SYNONYMS: dict[str, str] = {
++    # mass
++    "gram": "g",
++    "grams": "g",
++    "g": "g",
++    # volume
++    "milliliter": "ml",
++    "milliliters": "ml",
++    "ml": "ml",
++    "tablespoon": "tbsp",
++    "tablespoons": "tbsp",
++    "tbsp": "tbsp",
++    "teaspoon": "tsp",
++    "teaspoons": "tsp",
++    "tsp": "tsp",
++    # count
++    "pc": "pc",
++    "piece": "pc",
++    "pieces": "pc",
++    "egg": "pc",
++    "eggs": "pc",
++}
++
++
++def canonical_unit(unit: str) -> str:
++    """Return a canonical short unit string (lowercase)."""
++    u = unit.strip().lower()
++    return UNIT_SYNONYMS.get(u, u)
++
++
++def normalize_name(name: str) -> str:
++    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
++    s = name.lower().strip()
++    # Keep letters/numbers/spaces, replace others with space, then collapse
++    out = []
++    prev_space = False
++    for ch in s:
++        if ch.isalnum() or ch.isspace():
++            if ch.isspace():
++                if not prev_space:
++                    out.append(" ")
++                prev_space = True
++            else:
++                out.append(ch)
++                prev_space = False
++        else:
++            if not prev_space:
++                out.append(" ")
++                prev_space = True
++    return "".join(out).strip()
++
++
++# -----------------------------
++# Prompt helpers
++# -----------------------------
++SYSTEM_PROMPT: str = (
++    "You scale cooking recipes. Respond ONLY with JSON. "
++    "JSON schema: {\"servings\": int, \"ingredients\": ["
++    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
++    "No explanations, no code fences, no prose."
++)
++
++
++def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
++    """Create a compact user prompt describing the scaling task.
++
++    The agent must scale all ingredient quantities proportionally from the
++    provided base servings to the requested target servings and return strict
++    JSON per SYSTEM_PROMPT.
++    """
++    lines = [
++        f"Base recipe: {recipe['name']}",
++        f"Original servings: {recipe['servings']}",
++        "Ingredients (name, quantity, unit):",
++    ]
++    for ing in recipe["ingredients"]:
++        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
++    lines.append(f"Target servings: {target_servings}")
++    lines.append(
++        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
++    )
++    return "\n".join(lines)
++
++
++def recipe_for_step(step: int) -> Recipe:
++    """Deterministically select a recipe from BASE_RECIPES for the given step."""
++    idx = step % len(BASE_RECIPES)
++    recipe = BASE_RECIPES[idx]
++    # Canonicalize units for safety
++    canonicalized: Recipe = {
++        "name": recipe["name"],
++        "servings": int(recipe["servings"]),
++        "ingredients": [
++            {
++                "name": i["name"],
++                "quantity": float(i["quantity"]),
++                "unit": canonical_unit(i["unit"]),
++            }
++            for i in recipe["ingredients"]
++        ],
++    }
++    return canonicalized
++
++
++def suggested_target_servings(original: int, step: int) -> int:
++    """Pick a simple but varying target servings value.
++
++    Uses the step to avoid randomness: cycles through a small, interesting set.
++    """
++    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
++    options = [1, 2, 3, 4, 6, 8, 10, 12]
++    # Avoid asking for the same value; pick the next option.
++    try:
++        j = (options.index(original) + (1 + (step % 3))) % len(options)
++    except ValueError:
++        j = (step + original) % len(options)
++    target = options[j]
++    return target
++
++
++__all__ = [
++    "RANDOM_SEED",
++    "TRAINING_CONFIG",
++    "Ingredient",
++    "Recipe",
++    "BASE_RECIPES",
++    "SYSTEM_PROMPT",
++    "build_user_prompt",
++    "recipe_for_step",
++    "normalize_name",
++    "canonical_unit",
++    "suggested_target_servings",
++]
++
+
+[2025-09-21T08:40:32] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+"""ART rollout for the Recipe Scaling task.
+
+This rollout asks the model to scale a base recipe to a target serving count,
+returning strict JSON. We compute per-ingredient percent errors, apply
+defensive validation, and shape rewards to be informative while honoring the
+requested rules:
+- Exact scaling => reward +1.0
+- If max abs % error < 5% and formatting valid => +0.5
+- Missing ingredients or invalid formatting => -1.0
+
+We also record scalar metadata for diagnostics and numeric metrics for ART.
+"""
+from __future__ import annotations
+
+import json
+import math
+from typing import Any, Dict, Tuple
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    SYSTEM_PROMPT,
+    build_user_prompt,
+    recipe_for_step,
+    normalize_name,
+    canonical_unit,
+    suggested_target_servings,
+)
+
+
+def _safe_float(x: Any) -> Tuple[float, bool]:
+    """Try to interpret x as float. Return (value, ok)."""
+    try:
+        if isinstance(x, bool):  # exclude booleans
+            return 0.0, False
+        return float(x), True
+    except Exception:
+        return 0.0, False
+
+
+def _parse_agent_json(text: str) -> Tuple[dict[str, Any] | None, str | None]:
+    """Extract a JSON object from the assistant response.
+
+    Returns (data, error_message). If parsing fails or schema invalid, data is None.
+    """
+    s = text.strip()
+    # Heuristic: if model included code fences, strip them
+    if s.startswith("```") and s.endswith("```"):
+        s = s.strip("`")
+        # remove optional language tag
+        s = s.split('\n', 1)[-1]
+
+    try:
+        data = json.loads(s)
+    except Exception as exc:
+        return None, f"json_parse_error: {type(exc).__name__}"
+
+    if not isinstance(data, dict):
+        return None, "top_level_not_object"
+    if "ingredients" not in data or "servings" not in data:
+        return None, "missing_required_keys"
+    ings = data.get("ingredients")
+    if not isinstance(ings, list) or len(ings) == 0:
+        return None, "ingredients_not_list_or_empty"
+
+    # Basic ingredient validation; we allow extra fields but require core keys.
+    for idx, ing in enumerate(ings):
+        if not isinstance(ing, dict):
+            return None, f"ingredient_{idx}_not_object"
+        if not all(k in ing for k in ("name", "quantity", "unit")):
+            return None, f"ingredient_{idx}_missing_keys"
+        qv, ok = _safe_float(ing["quantity"])
+        if not ok:
+            return None, f"ingredient_{idx}_quantity_not_number"
+        if not isinstance(ing["name"], str) or not isinstance(ing["unit"], str):
+            return None, f"ingredient_{idx}_name_or_unit_not_string"
+
+    return data, None
+
+
+def _percent_error(expected: float, actual: float) -> float:
+    denom = max(abs(expected), 1e-9)
+    return abs(actual - expected) / denom * 100.0
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Collect a single scaling attempt trajectory for a selected recipe.
+
+    The config argument is merged with TRAINING_CONFIG for decoding options.
+    """
+    # Merge decode config with defaults
+    cfg = {**TRAINING_CONFIG, **(config or {})}
+
+    # Prepare scenario
+    recipe = recipe_for_step(step)
+    target_servings = suggested_target_servings(recipe["servings"], step)
+    factor = float(target_servings) / float(recipe["servings"])
+
+    # Build messages
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(recipe, target_servings)},
+        ],
+        metadata={
+            # Scalar-only metadata for ART aggregation
+            "task": "recipe-scaling",
+            "recipe_name": recipe["name"],
+            "step": step,
+            "orig_servings": recipe["servings"],
+            "target_servings": target_servings,
+            "scale_factor": factor,
+            "invalid_solution": 0.0,
+            "missing_any": 0.0,
+            "extra_any": 0.0,
+            "parse_error_flag": 0.0,
+        },
+        reward=0.0,
+    )
+
+    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
+
+    # Model inference
+    completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        max_completion_tokens=int(cfg.get("max_completion_tokens", 256)),
+        temperature=float(cfg.get("temperature", 0.7)),
+        top_p=float(cfg.get("top_p", 0.9)),
+        stream=False,
+    )
+
+    choice = completion.choices[0]
+    content = choice.message.content or ""
+    trajectory.messages_and_choices.append(choice)
+
+    # Parse & validate
+    data, parse_err = _parse_agent_json(content)
+    if parse_err:
+        trajectory.metadata["parse_error"] = parse_err
+        trajectory.metadata["parse_error_flag"] = 1.0
+        trajectory.metadata["invalid_solution"] = 1.0
+        trajectory.reward = -1.0
+        # Minimal metrics for failed parse
+        trajectory.metrics["mean_abs_pct_error"] = 100.0
+        trajectory.metrics["max_abs_pct_error"] = 100.0
+        trajectory.metrics["matched_count"] = 0.0
+        trajectory.metrics["omitted_count"] = float(len(recipe["ingredients"]))
+        trajectory.metrics["extra_count"] = 0.0
+        return trajectory
+
+    # Build indices for comparison
+    base_map: dict[str, tuple[float, str]] = {}
+    for ing in recipe["ingredients"]:
+        base_map[normalize_name(ing["name"])[:48]] = (float(ing["quantity"]), canonical_unit(ing["unit"]))
+
+    agent_ings = data.get("ingredients", [])
+    agent_map: dict[str, tuple[float, str, str]] = {}  # norm_name -> (qty, unit, raw_name)
+    for ing in agent_ings:
+        nm = normalize_name(str(ing["name"]))[:48]
+        qty, _ = _safe_float(ing["quantity"])  # already validated
+        agent_map[nm] = (qty, canonical_unit(str(ing["unit"])), str(ing["name"]))
+
+    # Compare
+    omitted = 0
+    extra = 0
+    unit_mismatch = 0
+    errors: list[float] = []
+    max_err = 0.0
+    matched = 0
+
+    for norm_name, (base_qty, base_unit) in base_map.items():
+        expected = base_qty * factor
+        if norm_name not in agent_map:
+            omitted += 1
+            trajectory.metadata[f"err_{norm_name}_pct"] = 100.0  # missing
+            continue
+        qty, unit, _raw = agent_map[norm_name]
+        if unit != base_unit:
+            unit_mismatch += 1
+        e = _percent_error(expected, qty)
+        errors.append(e)
+        matched += 1
+        max_err = max(max_err, e)
+        trajectory.metadata[f"err_{norm_name}_pct"] = float(e)
+
+    for norm_name in agent_map.keys():
+        if norm_name not in base_map:
+            extra += 1
+
+    # Metrics
+    mean_err = float(sum(errors) / len(errors)) if errors else (100.0 if omitted else 0.0)
+    trajectory.metrics["mean_abs_pct_error"] = mean_err
+    trajectory.metrics["max_abs_pct_error"] = float(max_err if errors else (100.0 if omitted else 0.0))
+    trajectory.metrics["matched_count"] = float(matched)
+    trajectory.metrics["omitted_count"] = float(omitted)
+    trajectory.metrics["extra_count"] = float(extra)
+    trajectory.metrics["unit_mismatch_count"] = float(unit_mismatch)
+
+    # Metadata flags (scalar-only)
+    trajectory.metadata["missing_any"] = 1.0 if omitted > 0 else 0.0
+    trajectory.metadata["extra_any"] = 1.0 if extra > 0 else 0.0
+    trajectory.metadata["unit_mismatch_any"] = 1.0 if unit_mismatch > 0 else 0.0
+
+    # Reward logic per spec with gentle shaping. Never exceed [−1, 1].
+    if omitted > 0:
+        trajectory.metadata["invalid_solution"] = 1.0
+        reward = -1.0  # Missing required ingredients is a hard failure
+    else:
+        reward = 0.0
+        if max_err < 0.5:
+            reward = 1.0
+        elif max_err < 5.0:
+            reward = 0.5
+
+        # Smooth shaping: small bonus for low mean error, small penalty for extras.
+        # This keeps gradients informative without violating the primary rules.
+        shaping = max(0.0, 0.3 * (1.0 - min(mean_err / 10.0, 1.0)))
+        reward = min(1.0, reward + shaping)
+        reward -= min(0.3, 0.05 * extra)
+
+        # If schema is off but parsed, penalize strongly (should be caught above).
+        # Kept for clarity and future extension.
+    trajectory.reward = float(max(-1.0, min(1.0, reward)))
+
+    # Record the reported servings if present
+    srv_val, srv_ok = _safe_float(data.get("servings"))
+    if srv_ok:
+        trajectory.metrics["agent_servings"] = srv_val
+        trajectory.metadata["agent_servings_int"] = int(round(srv_val))
+    else:
+        trajectory.metadata["agent_servings_parse_fail"] = 1.0
+
+    return trajectory
+
+[2025-09-21T08:40:32] apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+A rollout.py
+[2025-09-21T08:40:32] turn diff:
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6c63bebad0267b2ee7adee54b4491531440937
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+@@ -0,0 +1,236 @@
++"""Shared environment and helpers for the Recipe Scaling ART task.
++
++This module centralizes tweakable constants, base recipes, and prompt helpers.
++Keep hyperparameters near the top for easy modification.
++
++Assumptions:
++- The host project wires up training; we only expose config and rollout helpers.
++- Inference/training uses a LocalBackend; no GPU selection logic here.
++
++Installation (if needed):
++- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, TypedDict
++
++
++# -----------------------------
++# Tunables & training constants
++# -----------------------------
++RANDOM_SEED: int = 7
++
++# Minimal training config expected by host training harness.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "recipe-scaling",
++    "model_name": "agent-recipe-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 30,
++    "trajectories_per_group": 12,
++    "groups_per_step": 1,
++    "learning_rate": 2e-5,
++    "max_completion_tokens": 256,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    "max_exceptions": 12,
++    # Keep last N checkpoints when cleaning up between steps
++    "cleanup_keep_last": 1,
++}
++
++
++# -----------------------------
++# Recipe data model & registry
++# -----------------------------
++class Ingredient(TypedDict):
++    name: str
++    quantity: float
++    unit: str
++
++
++class Recipe(TypedDict):
++    name: str
++    servings: int
++    ingredients: List[Ingredient]
++
++
++# A small pool of base recipes. Quantities are realistic but simple.
++# Units are canonicalized to a short form to ease validation.
++BASE_RECIPES: list[Recipe] = [
++    {
++        "name": "Fluffy Pancakes",
++        "servings": 4,
++        "ingredients": [
++            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
++            {"name": "milk", "quantity": 300.0, "unit": "ml"},
++            {"name": "egg", "quantity": 2.0, "unit": "pc"},
++            {"name": "sugar", "quantity": 25.0, "unit": "g"},
++            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 2.0, "unit": "g"},
++            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Tomato Soup",
++        "servings": 3,
++        "ingredients": [
++            {"name": "tomato", "quantity": 600.0, "unit": "g"},
++            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
++            {"name": "onion", "quantity": 100.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
++            {"name": "salt", "quantity": 4.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Simple Pasta",
++        "servings": 2,
++        "ingredients": [
++            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
++            {"name": "garlic", "quantity": 6.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
++            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 3.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++]
++
++
++# -----------------------------
++# Unit and name normalization
++# -----------------------------
++UNIT_SYNONYMS: dict[str, str] = {
++    # mass
++    "gram": "g",
++    "grams": "g",
++    "g": "g",
++    # volume
++    "milliliter": "ml",
++    "milliliters": "ml",
++    "ml": "ml",
++    "tablespoon": "tbsp",
++    "tablespoons": "tbsp",
++    "tbsp": "tbsp",
++    "teaspoon": "tsp",
++    "teaspoons": "tsp",
++    "tsp": "tsp",
++    # count
++    "pc": "pc",
++    "piece": "pc",
++    "pieces": "pc",
++    "egg": "pc",
++    "eggs": "pc",
++}
++
++
++def canonical_unit(unit: str) -> str:
++    """Return a canonical short unit string (lowercase)."""
++    u = unit.strip().lower()
++    return UNIT_SYNONYMS.get(u, u)
++
++
++def normalize_name(name: str) -> str:
++    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
++    s = name.lower().strip()
++    # Keep letters/numbers/spaces, replace others with space, then collapse
++    out = []
++    prev_space = False
++    for ch in s:
++        if ch.isalnum() or ch.isspace():
++            if ch.isspace():
++                if not prev_space:
++                    out.append(" ")
++                prev_space = True
++            else:
++                out.append(ch)
++                prev_space = False
++        else:
++            if not prev_space:
++                out.append(" ")
++                prev_space = True
++    return "".join(out).strip()
++
++
++# -----------------------------
++# Prompt helpers
++# -----------------------------
++SYSTEM_PROMPT: str = (
++    "You scale cooking recipes. Respond ONLY with JSON. "
++    "JSON schema: {\"servings\": int, \"ingredients\": ["
++    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
++    "No explanations, no code fences, no prose."
++)
++
++
++def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
++    """Create a compact user prompt describing the scaling task.
++
++    The agent must scale all ingredient quantities proportionally from the
++    provided base servings to the requested target servings and return strict
++    JSON per SYSTEM_PROMPT.
++    """
++    lines = [
++        f"Base recipe: {recipe['name']}",
++        f"Original servings: {recipe['servings']}",
++        "Ingredients (name, quantity, unit):",
++    ]
++    for ing in recipe["ingredients"]:
++        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
++    lines.append(f"Target servings: {target_servings}")
++    lines.append(
++        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
++    )
++    return "\n".join(lines)
++
++
++def recipe_for_step(step: int) -> Recipe:
++    """Deterministically select a recipe from BASE_RECIPES for the given step."""
++    idx = step % len(BASE_RECIPES)
++    recipe = BASE_RECIPES[idx]
++    # Canonicalize units for safety
++    canonicalized: Recipe = {
++        "name": recipe["name"],
++        "servings": int(recipe["servings"]),
++        "ingredients": [
++            {
++                "name": i["name"],
++                "quantity": float(i["quantity"]),
++                "unit": canonical_unit(i["unit"]),
++            }
++            for i in recipe["ingredients"]
++        ],
++    }
++    return canonicalized
++
++
++def suggested_target_servings(original: int, step: int) -> int:
++    """Pick a simple but varying target servings value.
++
++    Uses the step to avoid randomness: cycles through a small, interesting set.
++    """
++    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
++    options = [1, 2, 3, 4, 6, 8, 10, 12]
++    # Avoid asking for the same value; pick the next option.
++    try:
++        j = (options.index(original) + (1 + (step % 3))) % len(options)
++    except ValueError:
++        j = (step + original) % len(options)
++    target = options[j]
++    return target
++
++
++__all__ = [
++    "RANDOM_SEED",
++    "TRAINING_CONFIG",
++    "Ingredient",
++    "Recipe",
++    "BASE_RECIPES",
++    "SYSTEM_PROMPT",
++    "build_user_prompt",
++    "recipe_for_step",
++    "normalize_name",
++    "canonical_unit",
++    "suggested_target_servings",
++]
++
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d4c4f8fe69a0870a143d9fc1575370d11eb1334
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+@@ -0,0 +1,242 @@
++"""ART rollout for the Recipe Scaling task.
++
++This rollout asks the model to scale a base recipe to a target serving count,
++returning strict JSON. We compute per-ingredient percent errors, apply
++defensive validation, and shape rewards to be informative while honoring the
++requested rules:
++- Exact scaling => reward +1.0
++- If max abs % error < 5% and formatting valid => +0.5
++- Missing ingredients or invalid formatting => -1.0
++
++We also record scalar metadata for diagnostics and numeric metrics for ART.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import Any, Dict, Tuple
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    build_user_prompt,
++    recipe_for_step,
++    normalize_name,
++    canonical_unit,
++    suggested_target_servings,
++)
++
++
++def _safe_float(x: Any) -> Tuple[float, bool]:
++    """Try to interpret x as float. Return (value, ok)."""
++    try:
++        if isinstance(x, bool):  # exclude booleans
++            return 0.0, False
++        return float(x), True
++    except Exception:
++        return 0.0, False
++
++
++def _parse_agent_json(text: str) -> Tuple[dict[str, Any] | None, str | None]:
++    """Extract a JSON object from the assistant response.
++
++    Returns (data, error_message). If parsing fails or schema invalid, data is None.
++    """
++    s = text.strip()
++    # Heuristic: if model included code fences, strip them
++    if s.startswith("```") and s.endswith("```"):
++        s = s.strip("`")
++        # remove optional language tag
++        s = s.split('\n', 1)[-1]
++
++    try:
++        data = json.loads(s)
++    except Exception as exc:
++        return None, f"json_parse_error: {type(exc).__name__}"
++
++    if not isinstance(data, dict):
++        return None, "top_level_not_object"
++    if "ingredients" not in data or "servings" not in data:
++        return None, "missing_required_keys"
++    ings = data.get("ingredients")
++    if not isinstance(ings, list) or len(ings) == 0:
++        return None, "ingredients_not_list_or_empty"
++
++    # Basic ingredient validation; we allow extra fields but require core keys.
++    for idx, ing in enumerate(ings):
++        if not isinstance(ing, dict):
++            return None, f"ingredient_{idx}_not_object"
++        if not all(k in ing for k in ("name", "quantity", "unit")):
++            return None, f"ingredient_{idx}_missing_keys"
++        qv, ok = _safe_float(ing["quantity"])
++        if not ok:
++            return None, f"ingredient_{idx}_quantity_not_number"
++        if not isinstance(ing["name"], str) or not isinstance(ing["unit"], str):
++            return None, f"ingredient_{idx}_name_or_unit_not_string"
++
++    return data, None
++
++
++def _percent_error(expected: float, actual: float) -> float:
++    denom = max(abs(expected), 1e-9)
++    return abs(actual - expected) / denom * 100.0
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect a single scaling attempt trajectory for a selected recipe.
++
++    The config argument is merged with TRAINING_CONFIG for decoding options.
++    """
++    # Merge decode config with defaults
++    cfg = {**TRAINING_CONFIG, **(config or {})}
++
++    # Prepare scenario
++    recipe = recipe_for_step(step)
++    target_servings = suggested_target_servings(recipe["servings"], step)
++    factor = float(target_servings) / float(recipe["servings"])
++
++    # Build messages
++    trajectory = art.Trajectory(
++        messages_and_choices=[
++            {"role": "system", "content": SYSTEM_PROMPT},
++            {"role": "user", "content": build_user_prompt(recipe, target_servings)},
++        ],
++        metadata={
++            # Scalar-only metadata for ART aggregation
++            "task": "recipe-scaling",
++            "recipe_name": recipe["name"],
++            "step": step,
++            "orig_servings": recipe["servings"],
++            "target_servings": target_servings,
++            "scale_factor": factor,
++            "invalid_solution": 0.0,
++            "missing_any": 0.0,
++            "extra_any": 0.0,
++            "parse_error_flag": 0.0,
++        },
++        reward=0.0,
++    )
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    # Model inference
++    completion = await client.chat.completions.create(
++        model=model.name,
++        messages=trajectory.messages(),
++        max_completion_tokens=int(cfg.get("max_completion_tokens", 256)),
++        temperature=float(cfg.get("temperature", 0.7)),
++        top_p=float(cfg.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse & validate
++    data, parse_err = _parse_agent_json(content)
++    if parse_err:
++        trajectory.metadata["parse_error"] = parse_err
++        trajectory.metadata["parse_error_flag"] = 1.0
++        trajectory.metadata["invalid_solution"] = 1.0
++        trajectory.reward = -1.0
++        # Minimal metrics for failed parse
++        trajectory.metrics["mean_abs_pct_error"] = 100.0
++        trajectory.metrics["max_abs_pct_error"] = 100.0
++        trajectory.metrics["matched_count"] = 0.0
++        trajectory.metrics["omitted_count"] = float(len(recipe["ingredients"]))
++        trajectory.metrics["extra_count"] = 0.0
++        return trajectory
++
++    # Build indices for comparison
++    base_map: dict[str, tuple[float, str]] = {}
++    for ing in recipe["ingredients"]:
++        base_map[normalize_name(ing["name"])[:48]] = (float(ing["quantity"]), canonical_unit(ing["unit"]))
++
++    agent_ings = data.get("ingredients", [])
++    agent_map: dict[str, tuple[float, str, str]] = {}  # norm_name -> (qty, unit, raw_name)
++    for ing in agent_ings:
++        nm = normalize_name(str(ing["name"]))[:48]
++        qty, _ = _safe_float(ing["quantity"])  # already validated
++        agent_map[nm] = (qty, canonical_unit(str(ing["unit"])), str(ing["name"]))
++
++    # Compare
++    omitted = 0
++    extra = 0
++    unit_mismatch = 0
++    errors: list[float] = []
++    max_err = 0.0
++    matched = 0
++
++    for norm_name, (base_qty, base_unit) in base_map.items():
++        expected = base_qty * factor
++        if norm_name not in agent_map:
++            omitted += 1
++            trajectory.metadata[f"err_{norm_name}_pct"] = 100.0  # missing
++            continue
++        qty, unit, _raw = agent_map[norm_name]
++        if unit != base_unit:
++            unit_mismatch += 1
++        e = _percent_error(expected, qty)
++        errors.append(e)
++        matched += 1
++        max_err = max(max_err, e)
++        trajectory.metadata[f"err_{norm_name}_pct"] = float(e)
++
++    for norm_name in agent_map.keys():
++        if norm_name not in base_map:
++            extra += 1
++
++    # Metrics
++    mean_err = float(sum(errors) / len(errors)) if errors else (100.0 if omitted else 0.0)
++    trajectory.metrics["mean_abs_pct_error"] = mean_err
++    trajectory.metrics["max_abs_pct_error"] = float(max_err if errors else (100.0 if omitted else 0.0))
++    trajectory.metrics["matched_count"] = float(matched)
++    trajectory.metrics["omitted_count"] = float(omitted)
++    trajectory.metrics["extra_count"] = float(extra)
++    trajectory.metrics["unit_mismatch_count"] = float(unit_mismatch)
++
++    # Metadata flags (scalar-only)
++    trajectory.metadata["missing_any"] = 1.0 if omitted > 0 else 0.0
++    trajectory.metadata["extra_any"] = 1.0 if extra > 0 else 0.0
++    trajectory.metadata["unit_mismatch_any"] = 1.0 if unit_mismatch > 0 else 0.0
++
++    # Reward logic per spec with gentle shaping. Never exceed [−1, 1].
++    if omitted > 0:
++        trajectory.metadata["invalid_solution"] = 1.0
++        reward = -1.0  # Missing required ingredients is a hard failure
++    else:
++        reward = 0.0
++        if max_err < 0.5:
++            reward = 1.0
++        elif max_err < 5.0:
++            reward = 0.5
++
++        # Smooth shaping: small bonus for low mean error, small penalty for extras.
++        # This keeps gradients informative without violating the primary rules.
++        shaping = max(0.0, 0.3 * (1.0 - min(mean_err / 10.0, 1.0)))
++        reward = min(1.0, reward + shaping)
++        reward -= min(0.3, 0.05 * extra)
++
++        # If schema is off but parsed, penalize strongly (should be caught above).
++        # Kept for clarity and future extension.
++    trajectory.reward = float(max(-1.0, min(1.0, reward)))
++
++    # Record the reported servings if present
++    srv_val, srv_ok = _safe_float(data.get("servings"))
++    if srv_ok:
++        trajectory.metrics["agent_servings"] = srv_val
++        trajectory.metadata["agent_servings_int"] = int(round(srv_val))
++    else:
++        trajectory.metadata["agent_servings_parse_fail"] = 1.0
++
++    return trajectory
++
+
+[2025-09-21T08:40:32] tokens used: 14,164
+[2025-09-21T08:40:32] turn diff:
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6c63bebad0267b2ee7adee54b4491531440937
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+@@ -0,0 +1,236 @@
++"""Shared environment and helpers for the Recipe Scaling ART task.
++
++This module centralizes tweakable constants, base recipes, and prompt helpers.
++Keep hyperparameters near the top for easy modification.
++
++Assumptions:
++- The host project wires up training; we only expose config and rollout helpers.
++- Inference/training uses a LocalBackend; no GPU selection logic here.
++
++Installation (if needed):
++- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, TypedDict
++
++
++# -----------------------------
++# Tunables & training constants
++# -----------------------------
++RANDOM_SEED: int = 7
++
++# Minimal training config expected by host training harness.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "recipe-scaling",
++    "model_name": "agent-recipe-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 30,
++    "trajectories_per_group": 12,
++    "groups_per_step": 1,
++    "learning_rate": 2e-5,
++    "max_completion_tokens": 256,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    "max_exceptions": 12,
++    # Keep last N checkpoints when cleaning up between steps
++    "cleanup_keep_last": 1,
++}
++
++
++# -----------------------------
++# Recipe data model & registry
++# -----------------------------
++class Ingredient(TypedDict):
++    name: str
++    quantity: float
++    unit: str
++
++
++class Recipe(TypedDict):
++    name: str
++    servings: int
++    ingredients: List[Ingredient]
++
++
++# A small pool of base recipes. Quantities are realistic but simple.
++# Units are canonicalized to a short form to ease validation.
++BASE_RECIPES: list[Recipe] = [
++    {
++        "name": "Fluffy Pancakes",
++        "servings": 4,
++        "ingredients": [
++            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
++            {"name": "milk", "quantity": 300.0, "unit": "ml"},
++            {"name": "egg", "quantity": 2.0, "unit": "pc"},
++            {"name": "sugar", "quantity": 25.0, "unit": "g"},
++            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 2.0, "unit": "g"},
++            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Tomato Soup",
++        "servings": 3,
++        "ingredients": [
++            {"name": "tomato", "quantity": 600.0, "unit": "g"},
++            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
++            {"name": "onion", "quantity": 100.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
++            {"name": "salt", "quantity": 4.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Simple Pasta",
++        "servings": 2,
++        "ingredients": [
++            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
++            {"name": "garlic", "quantity": 6.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
++            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 3.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++]
++
++
++# -----------------------------
++# Unit and name normalization
++# -----------------------------
++UNIT_SYNONYMS: dict[str, str] = {
++    # mass
++    "gram": "g",
++    "grams": "g",
++    "g": "g",
++    # volume
++    "milliliter": "ml",
++    "milliliters": "ml",
++    "ml": "ml",
++    "tablespoon": "tbsp",
++    "tablespoons": "tbsp",
++    "tbsp": "tbsp",
++    "teaspoon": "tsp",
++    "teaspoons": "tsp",
++    "tsp": "tsp",
++    # count
++    "pc": "pc",
++    "piece": "pc",
++    "pieces": "pc",
++    "egg": "pc",
++    "eggs": "pc",
++}
++
++
++def canonical_unit(unit: str) -> str:
++    """Return a canonical short unit string (lowercase)."""
++    u = unit.strip().lower()
++    return UNIT_SYNONYMS.get(u, u)
++
++
++def normalize_name(name: str) -> str:
++    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
++    s = name.lower().strip()
++    # Keep letters/numbers/spaces, replace others with space, then collapse
++    out = []
++    prev_space = False
++    for ch in s:
++        if ch.isalnum() or ch.isspace():
++            if ch.isspace():
++                if not prev_space:
++                    out.append(" ")
++                prev_space = True
++            else:
++                out.append(ch)
++                prev_space = False
++        else:
++            if not prev_space:
++                out.append(" ")
++                prev_space = True
++    return "".join(out).strip()
++
++
++# -----------------------------
++# Prompt helpers
++# -----------------------------
++SYSTEM_PROMPT: str = (
++    "You scale cooking recipes. Respond ONLY with JSON. "
++    "JSON schema: {\"servings\": int, \"ingredients\": ["
++    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
++    "No explanations, no code fences, no prose."
++)
++
++
++def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
++    """Create a compact user prompt describing the scaling task.
++
++    The agent must scale all ingredient quantities proportionally from the
++    provided base servings to the requested target servings and return strict
++    JSON per SYSTEM_PROMPT.
++    """
++    lines = [
++        f"Base recipe: {recipe['name']}",
++        f"Original servings: {recipe['servings']}",
++        "Ingredients (name, quantity, unit):",
++    ]
++    for ing in recipe["ingredients"]:
++        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
++    lines.append(f"Target servings: {target_servings}")
++    lines.append(
++        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
++    )
++    return "\n".join(lines)
++
++
++def recipe_for_step(step: int) -> Recipe:
++    """Deterministically select a recipe from BASE_RECIPES for the given step."""
++    idx = step % len(BASE_RECIPES)
++    recipe = BASE_RECIPES[idx]
++    # Canonicalize units for safety
++    canonicalized: Recipe = {
++        "name": recipe["name"],
++        "servings": int(recipe["servings"]),
++        "ingredients": [
++            {
++                "name": i["name"],
++                "quantity": float(i["quantity"]),
++                "unit": canonical_unit(i["unit"]),
++            }
++            for i in recipe["ingredients"]
++        ],
++    }
++    return canonicalized
++
++
++def suggested_target_servings(original: int, step: int) -> int:
++    """Pick a simple but varying target servings value.
++
++    Uses the step to avoid randomness: cycles through a small, interesting set.
++    """
++    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
++    options = [1, 2, 3, 4, 6, 8, 10, 12]
++    # Avoid asking for the same value; pick the next option.
++    try:
++        j = (options.index(original) + (1 + (step % 3))) % len(options)
++    except ValueError:
++        j = (step + original) % len(options)
++    target = options[j]
++    return target
++
++
++__all__ = [
++    "RANDOM_SEED",
++    "TRAINING_CONFIG",
++    "Ingredient",
++    "Recipe",
++    "BASE_RECIPES",
++    "SYSTEM_PROMPT",
++    "build_user_prompt",
++    "recipe_for_step",
++    "normalize_name",
++    "canonical_unit",
++    "suggested_target_servings",
++]
++
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d4c4f8fe69a0870a143d9fc1575370d11eb1334
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+@@ -0,0 +1,242 @@
++"""ART rollout for the Recipe Scaling task.
++
++This rollout asks the model to scale a base recipe to a target serving count,
++returning strict JSON. We compute per-ingredient percent errors, apply
++defensive validation, and shape rewards to be informative while honoring the
++requested rules:
++- Exact scaling => reward +1.0
++- If max abs % error < 5% and formatting valid => +0.5
++- Missing ingredients or invalid formatting => -1.0
++
++We also record scalar metadata for diagnostics and numeric metrics for ART.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import Any, Dict, Tuple
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    build_user_prompt,
++    recipe_for_step,
++    normalize_name,
++    canonical_unit,
++    suggested_target_servings,
++)
++
++
++def _safe_float(x: Any) -> Tuple[float, bool]:
++    """Try to interpret x as float. Return (value, ok)."""
++    try:
++        if isinstance(x, bool):  # exclude booleans
++            return 0.0, False
++        return float(x), True
++    except Exception:
++        return 0.0, False
++
++
++def _parse_agent_json(text: str) -> Tuple[dict[str, Any] | None, str | None]:
++    """Extract a JSON object from the assistant response.
++
++    Returns (data, error_message). If parsing fails or schema invalid, data is None.
++    """
++    s = text.strip()
++    # Heuristic: if model included code fences, strip them
++    if s.startswith("```") and s.endswith("```"):
++        s = s.strip("`")
++        # remove optional language tag
++        s = s.split('\n', 1)[-1]
++
++    try:
++        data = json.loads(s)
++    except Exception as exc:
++        return None, f"json_parse_error: {type(exc).__name__}"
++
++    if not isinstance(data, dict):
++        return None, "top_level_not_object"
++    if "ingredients" not in data or "servings" not in data:
++        return None, "missing_required_keys"
++    ings = data.get("ingredients")
++    if not isinstance(ings, list) or len(ings) == 0:
++        return None, "ingredients_not_list_or_empty"
++
++    # Basic ingredient validation; we allow extra fields but require core keys.
++    for idx, ing in enumerate(ings):
++        if not isinstance(ing, dict):
++            return None, f"ingredient_{idx}_not_object"
++        if not all(k in ing for k in ("name", "quantity", "unit")):
++            return None, f"ingredient_{idx}_missing_keys"
++        qv, ok = _safe_float(ing["quantity"])
++        if not ok:
++            return None, f"ingredient_{idx}_quantity_not_number"
++        if not isinstance(ing["name"], str) or not isinstance(ing["unit"], str):
++            return None, f"ingredient_{idx}_name_or_unit_not_string"
++
++    return data, None
++
++
++def _percent_error(expected: float, actual: float) -> float:
++    denom = max(abs(expected), 1e-9)
++    return abs(actual - expected) / denom * 100.0
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect a single scaling attempt trajectory for a selected recipe.
++
++    The config argument is merged with TRAINING_CONFIG for decoding options.
++    """
++    # Merge decode config with defaults
++    cfg = {**TRAINING_CONFIG, **(config or {})}
++
++    # Prepare scenario
++    recipe = recipe_for_step(step)
++    target_servings = suggested_target_servings(recipe["servings"], step)
++    factor = float(target_servings) / float(recipe["servings"])
++
++    # Build messages
++    trajectory = art.Trajectory(
++        messages_and_choices=[
++            {"role": "system", "content": SYSTEM_PROMPT},
++            {"role": "user", "content": build_user_prompt(recipe, target_servings)},
++        ],
++        metadata={
++            # Scalar-only metadata for ART aggregation
++            "task": "recipe-scaling",
++            "recipe_name": recipe["name"],
++            "step": step,
++            "orig_servings": recipe["servings"],
++            "target_servings": target_servings,
++            "scale_factor": factor,
++            "invalid_solution": 0.0,
++            "missing_any": 0.0,
++            "extra_any": 0.0,
++            "parse_error_flag": 0.0,
++        },
++        reward=0.0,
++    )
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    # Model inference
++    completion = await client.chat.completions.create(
++        model=model.name,
++        messages=trajectory.messages(),
++        max_completion_tokens=int(cfg.get("max_completion_tokens", 256)),
++        temperature=float(cfg.get("temperature", 0.7)),
++        top_p=float(cfg.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse & validate
++    data, parse_err = _parse_agent_json(content)
++    if parse_err:
++        trajectory.metadata["parse_error"] = parse_err
++        trajectory.metadata["parse_error_flag"] = 1.0
++        trajectory.metadata["invalid_solution"] = 1.0
++        trajectory.reward = -1.0
++        # Minimal metrics for failed parse
++        trajectory.metrics["mean_abs_pct_error"] = 100.0
++        trajectory.metrics["max_abs_pct_error"] = 100.0
++        trajectory.metrics["matched_count"] = 0.0
++        trajectory.metrics["omitted_count"] = float(len(recipe["ingredients"]))
++        trajectory.metrics["extra_count"] = 0.0
++        return trajectory
++
++    # Build indices for comparison
++    base_map: dict[str, tuple[float, str]] = {}
++    for ing in recipe["ingredients"]:
++        base_map[normalize_name(ing["name"])[:48]] = (float(ing["quantity"]), canonical_unit(ing["unit"]))
++
++    agent_ings = data.get("ingredients", [])
++    agent_map: dict[str, tuple[float, str, str]] = {}  # norm_name -> (qty, unit, raw_name)
++    for ing in agent_ings:
++        nm = normalize_name(str(ing["name"]))[:48]
++        qty, _ = _safe_float(ing["quantity"])  # already validated
++        agent_map[nm] = (qty, canonical_unit(str(ing["unit"])), str(ing["name"]))
++
++    # Compare
++    omitted = 0
++    extra = 0
++    unit_mismatch = 0
++    errors: list[float] = []
++    max_err = 0.0
++    matched = 0
++
++    for norm_name, (base_qty, base_unit) in base_map.items():
++        expected = base_qty * factor
++        if norm_name not in agent_map:
++            omitted += 1
++            trajectory.metadata[f"err_{norm_name}_pct"] = 100.0  # missing
++            continue
++        qty, unit, _raw = agent_map[norm_name]
++        if unit != base_unit:
++            unit_mismatch += 1
++        e = _percent_error(expected, qty)
++        errors.append(e)
++        matched += 1
++        max_err = max(max_err, e)
++        trajectory.metadata[f"err_{norm_name}_pct"] = float(e)
++
++    for norm_name in agent_map.keys():
++        if norm_name not in base_map:
++            extra += 1
++
++    # Metrics
++    mean_err = float(sum(errors) / len(errors)) if errors else (100.0 if omitted else 0.0)
++    trajectory.metrics["mean_abs_pct_error"] = mean_err
++    trajectory.metrics["max_abs_pct_error"] = float(max_err if errors else (100.0 if omitted else 0.0))
++    trajectory.metrics["matched_count"] = float(matched)
++    trajectory.metrics["omitted_count"] = float(omitted)
++    trajectory.metrics["extra_count"] = float(extra)
++    trajectory.metrics["unit_mismatch_count"] = float(unit_mismatch)
++
++    # Metadata flags (scalar-only)
++    trajectory.metadata["missing_any"] = 1.0 if omitted > 0 else 0.0
++    trajectory.metadata["extra_any"] = 1.0 if extra > 0 else 0.0
++    trajectory.metadata["unit_mismatch_any"] = 1.0 if unit_mismatch > 0 else 0.0
++
++    # Reward logic per spec with gentle shaping. Never exceed [−1, 1].
++    if omitted > 0:
++        trajectory.metadata["invalid_solution"] = 1.0
++        reward = -1.0  # Missing required ingredients is a hard failure
++    else:
++        reward = 0.0
++        if max_err < 0.5:
++            reward = 1.0
++        elif max_err < 5.0:
++            reward = 0.5
++
++        # Smooth shaping: small bonus for low mean error, small penalty for extras.
++        # This keeps gradients informative without violating the primary rules.
++        shaping = max(0.0, 0.3 * (1.0 - min(mean_err / 10.0, 1.0)))
++        reward = min(1.0, reward + shaping)
++        reward -= min(0.3, 0.05 * extra)
++
++        # If schema is off but parsed, penalize strongly (should be caught above).
++        # Kept for clarity and future extension.
++    trajectory.reward = float(max(-1.0, min(1.0, reward)))
++
++    # Record the reported servings if present
++    srv_val, srv_ok = _safe_float(data.get("servings"))
++    if srv_ok:
++        trajectory.metrics["agent_servings"] = srv_val
++        trajectory.metadata["agent_servings_int"] = int(round(srv_val))
++    else:
++        trajectory.metadata["agent_servings_parse_fail"] = 1.0
++
++    return trajectory
++
+
+[2025-09-21T08:40:33] codex
+
+Created two files for a minimal ART task:
+
+- env.py: Config, recipe dataset, normalization utilities, and prompt builders. Exposes RANDOM_SEED, TRAINING_CONFIG, and helpers.
+- rollout.py: Async rollout with JSON parsing, defensive validation, per-ingredient error computation, scalar-only metadata, numeric metrics, and shaped rewards.
+
+What’s inside
+
+- Training config constants in env.py top section, easy to tweak: project, model_name, base_model, steps, trajectories_per_group, groups_per_step, learning_rate, max_completion_tokens, temperature, top_p, max_exceptions, cleanup_keep_last.
+- Small recipe pool with canonical units, deterministic selection by step, and suggested target servings that vary by step.
+- Concise prompts:
+  - System: strict JSON schema with servings and ingredients, no prose or fences.
+  - User: compact base recipe table and target servings.
+- Rollout logic:
+  - Calls LocalBackend via AsyncOpenAI using model.inference_base_url and model.inference_api_key.
+  - Parses agent JSON (no lists/dicts in metadata; scalars only).
+  - Computes per-ingredient percent errors and records them as metadata fields like err_flour_pct.
+  - Flags for omissions/extras and unit mismatches as scalar metadata.
+  - Metrics: mean_abs_pct_error, max_abs_pct_error, matched_count, omitted_count, extra_count, unit_mismatch_count, agent_servings.
+  - Rewards:
+    - -1.0 for missing ingredients or invalid formatting/parse.
+    - +1.0 if max error < 0.5%.
+    - +0.5 if max error < 5%.
+    - Gentle shaping bonus for lower mean error and a small penalty for extra ingredients, bounded in [-1, 1].
+
+Usage notes
+
+- Training loop is intentionally omitted; host training.py will import env and rollout.
+- Inference/training assumes ART LocalBackend; no external GPU settings here.
+- If you need dependencies, install with uv:
+  - uv pip install art weave openai requests
+
+If you want, I can also add another recipe or adjust units/thresholds.
+[2025-09-21T08:40:40] tokens used: 17,503
+[2025-09-21T08:40:40] turn diff:
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6c63bebad0267b2ee7adee54b4491531440937
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/env.py
+@@ -0,0 +1,236 @@
++"""Shared environment and helpers for the Recipe Scaling ART task.
++
++This module centralizes tweakable constants, base recipes, and prompt helpers.
++Keep hyperparameters near the top for easy modification.
++
++Assumptions:
++- The host project wires up training; we only expose config and rollout helpers.
++- Inference/training uses a LocalBackend; no GPU selection logic here.
++
++Installation (if needed):
++- Use uv for dependencies: `uv pip install openai requests weave` and ART deps.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, TypedDict
++
++
++# -----------------------------
++# Tunables & training constants
++# -----------------------------
++RANDOM_SEED: int = 7
++
++# Minimal training config expected by host training harness.
++TRAINING_CONFIG: dict[str, Any] = {
++    "project": "recipe-scaling",
++    "model_name": "agent-recipe-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 30,
++    "trajectories_per_group": 12,
++    "groups_per_step": 1,
++    "learning_rate": 2e-5,
++    "max_completion_tokens": 256,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    "max_exceptions": 12,
++    # Keep last N checkpoints when cleaning up between steps
++    "cleanup_keep_last": 1,
++}
++
++
++# -----------------------------
++# Recipe data model & registry
++# -----------------------------
++class Ingredient(TypedDict):
++    name: str
++    quantity: float
++    unit: str
++
++
++class Recipe(TypedDict):
++    name: str
++    servings: int
++    ingredients: List[Ingredient]
++
++
++# A small pool of base recipes. Quantities are realistic but simple.
++# Units are canonicalized to a short form to ease validation.
++BASE_RECIPES: list[Recipe] = [
++    {
++        "name": "Fluffy Pancakes",
++        "servings": 4,
++        "ingredients": [
++            {"name": "all-purpose flour", "quantity": 200.0, "unit": "g"},
++            {"name": "milk", "quantity": 300.0, "unit": "ml"},
++            {"name": "egg", "quantity": 2.0, "unit": "pc"},
++            {"name": "sugar", "quantity": 25.0, "unit": "g"},
++            {"name": "butter (melted)", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 2.0, "unit": "g"},
++            {"name": "baking powder", "quantity": 10.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Tomato Soup",
++        "servings": 3,
++        "ingredients": [
++            {"name": "tomato", "quantity": 600.0, "unit": "g"},
++            {"name": "vegetable stock", "quantity": 500.0, "unit": "ml"},
++            {"name": "onion", "quantity": 100.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 15.0, "unit": "ml"},
++            {"name": "salt", "quantity": 4.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++    {
++        "name": "Simple Pasta",
++        "servings": 2,
++        "ingredients": [
++            {"name": "spaghetti", "quantity": 180.0, "unit": "g"},
++            {"name": "garlic", "quantity": 6.0, "unit": "g"},
++            {"name": "olive oil", "quantity": 20.0, "unit": "ml"},
++            {"name": "parmesan", "quantity": 30.0, "unit": "g"},
++            {"name": "salt", "quantity": 3.0, "unit": "g"},
++            {"name": "black pepper", "quantity": 1.0, "unit": "g"},
++        ],
++    },
++]
++
++
++# -----------------------------
++# Unit and name normalization
++# -----------------------------
++UNIT_SYNONYMS: dict[str, str] = {
++    # mass
++    "gram": "g",
++    "grams": "g",
++    "g": "g",
++    # volume
++    "milliliter": "ml",
++    "milliliters": "ml",
++    "ml": "ml",
++    "tablespoon": "tbsp",
++    "tablespoons": "tbsp",
++    "tbsp": "tbsp",
++    "teaspoon": "tsp",
++    "teaspoons": "tsp",
++    "tsp": "tsp",
++    # count
++    "pc": "pc",
++    "piece": "pc",
++    "pieces": "pc",
++    "egg": "pc",
++    "eggs": "pc",
++}
++
++
++def canonical_unit(unit: str) -> str:
++    """Return a canonical short unit string (lowercase)."""
++    u = unit.strip().lower()
++    return UNIT_SYNONYMS.get(u, u)
++
++
++def normalize_name(name: str) -> str:
++    """Lowercase, strip, and collapse spaces & punctuation for stable matching."""
++    s = name.lower().strip()
++    # Keep letters/numbers/spaces, replace others with space, then collapse
++    out = []
++    prev_space = False
++    for ch in s:
++        if ch.isalnum() or ch.isspace():
++            if ch.isspace():
++                if not prev_space:
++                    out.append(" ")
++                prev_space = True
++            else:
++                out.append(ch)
++                prev_space = False
++        else:
++            if not prev_space:
++                out.append(" ")
++                prev_space = True
++    return "".join(out).strip()
++
++
++# -----------------------------
++# Prompt helpers
++# -----------------------------
++SYSTEM_PROMPT: str = (
++    "You scale cooking recipes. Respond ONLY with JSON. "
++    "JSON schema: {\"servings\": int, \"ingredients\": ["
++    "{\"name\": str, \"quantity\": number, \"unit\": str}]}. "
++    "No explanations, no code fences, no prose."
++)
++
++
++def build_user_prompt(recipe: Recipe, target_servings: int) -> str:
++    """Create a compact user prompt describing the scaling task.
++
++    The agent must scale all ingredient quantities proportionally from the
++    provided base servings to the requested target servings and return strict
++    JSON per SYSTEM_PROMPT.
++    """
++    lines = [
++        f"Base recipe: {recipe['name']}",
++        f"Original servings: {recipe['servings']}",
++        "Ingredients (name, quantity, unit):",
++    ]
++    for ing in recipe["ingredients"]:
++        lines.append(f"- {ing['name']} | {ing['quantity']} | {ing['unit']}")
++    lines.append(f"Target servings: {target_servings}")
++    lines.append(
++        "Return JSON with keys 'servings' and 'ingredients' only; quantities as numbers."
++    )
++    return "\n".join(lines)
++
++
++def recipe_for_step(step: int) -> Recipe:
++    """Deterministically select a recipe from BASE_RECIPES for the given step."""
++    idx = step % len(BASE_RECIPES)
++    recipe = BASE_RECIPES[idx]
++    # Canonicalize units for safety
++    canonicalized: Recipe = {
++        "name": recipe["name"],
++        "servings": int(recipe["servings"]),
++        "ingredients": [
++            {
++                "name": i["name"],
++                "quantity": float(i["quantity"]),
++                "unit": canonical_unit(i["unit"]),
++            }
++            for i in recipe["ingredients"]
++        ],
++    }
++    return canonicalized
++
++
++def suggested_target_servings(original: int, step: int) -> int:
++    """Pick a simple but varying target servings value.
++
++    Uses the step to avoid randomness: cycles through a small, interesting set.
++    """
++    # Values chosen to hit <1x, ~1x, and >1x scaling ratios.
++    options = [1, 2, 3, 4, 6, 8, 10, 12]
++    # Avoid asking for the same value; pick the next option.
++    try:
++        j = (options.index(original) + (1 + (step % 3))) % len(options)
++    except ValueError:
++        j = (step + original) % len(options)
++    target = options[j]
++    return target
++
++
++__all__ = [
++    "RANDOM_SEED",
++    "TRAINING_CONFIG",
++    "Ingredient",
++    "Recipe",
++    "BASE_RECIPES",
++    "SYSTEM_PROMPT",
++    "build_user_prompt",
++    "recipe_for_step",
++    "normalize_name",
++    "canonical_unit",
++    "suggested_target_servings",
++]
++
+diff --git a/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d4c4f8fe69a0870a143d9fc1575370d11eb1334
+--- /dev/null
++++ b/codex_runs/recipe_scaling/gpt-5/20250921_083849/rollout.py
+@@ -0,0 +1,242 @@
++"""ART rollout for the Recipe Scaling task.
++
++This rollout asks the model to scale a base recipe to a target serving count,
++returning strict JSON. We compute per-ingredient percent errors, apply
++defensive validation, and shape rewards to be informative while honoring the
++requested rules:
++- Exact scaling => reward +1.0
++- If max abs % error < 5% and formatting valid => +0.5
++- Missing ingredients or invalid formatting => -1.0
++
++We also record scalar metadata for diagnostics and numeric metrics for ART.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import Any, Dict, Tuple
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    SYSTEM_PROMPT,
++    build_user_prompt,
++    recipe_for_step,
++    normalize_name,
++    canonical_unit,
++    suggested_target_servings,
++)
++
++
++def _safe_float(x: Any) -> Tuple[float, bool]:
++    """Try to interpret x as float. Return (value, ok)."""
++    try:
++        if isinstance(x, bool):  # exclude booleans
++            return 0.0, False
++        return float(x), True
++    except Exception:
++        return 0.0, False
++
++
++def _parse_agent_json(text: str) -> Tuple[dict[str, Any] | None, str | None]:
++    """Extract a JSON object from the assistant response.
++
++    Returns (data, error_message). If parsing fails or schema invalid, data is None.
++    """
++    s = text.strip()
++    # Heuristic: if model included code fences, strip them
++    if s.startswith("```") and s.endswith("```"):
++        s = s.strip("`")
++        # remove optional language tag
++        s = s.split('\n', 1)[-1]
++
++    try:
++        data = json.loads(s)
++    except Exception as exc:
++        return None, f"json_parse_error: {type(exc).__name__}"
++
++    if not isinstance(data, dict):
++        return None, "top_level_not_object"
++    if "ingredients" not in data or "servings" not in data:
++        return None, "missing_required_keys"
++    ings = data.get("ingredients")
++    if not isinstance(ings, list) or len(ings) == 0:
++        return None, "ingredients_not_list_or_empty"
++
++    # Basic ingredient validation; we allow extra fields but require core keys.
++    for idx, ing in enumerate(ings):
++        if not isinstance(ing, dict):
++            return None, f"ingredient_{idx}_not_object"
++        if not all(k in ing for k in ("name", "quantity", "unit")):
++            return None, f"ingredient_{idx}_missing_keys"
++        qv, ok = _safe_float(ing["quantity"])
++        if not ok:
++            return None, f"ingredient_{idx}_quantity_not_number"
++        if not isinstance(ing["name"], str) or not isinstance(ing["unit"], str):
++            return None, f"ingredient_{idx}_name_or_unit_not_string"
++
++    return data, None
++
++
++def _percent_error(expected: float, actual: float) -> float:
++    denom = max(abs(expected), 1e-9)
++    return abs(actual - expected) / denom * 100.0
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Collect a single scaling attempt trajectory for a selected recipe.
++
++    The config argument is merged with TRAINING_CONFIG for decoding options.
++    """
++    # Merge decode config with defaults
++    cfg = {**TRAINING_CONFIG, **(config or {})}
++
++    # Prepare scenario
++    recipe = recipe_for_step(step)
++    target_servings = suggested_target_servings(recipe["servings"], step)
++    factor = float(target_servings) / float(recipe["servings"])
++
++    # Build messages
++    trajectory = art.Trajectory(
++        messages_and_choices=[
++            {"role": "system", "content": SYSTEM_PROMPT},
++            {"role": "user", "content": build_user_prompt(recipe, target_servings)},
++        ],
++        metadata={
++            # Scalar-only metadata for ART aggregation
++            "task": "recipe-scaling",
++            "recipe_name": recipe["name"],
++            "step": step,
++            "orig_servings": recipe["servings"],
++            "target_servings": target_servings,
++            "scale_factor": factor,
++            "invalid_solution": 0.0,
++            "missing_any": 0.0,
++            "extra_any": 0.0,
++            "parse_error_flag": 0.0,
++        },
++        reward=0.0,
++    )
++
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    # Model inference
++    completion = await client.chat.completions.create(
++        model=model.name,
++        messages=trajectory.messages(),
++        max_completion_tokens=int(cfg.get("max_completion_tokens", 256)),
++        temperature=float(cfg.get("temperature", 0.7)),
++        top_p=float(cfg.get("top_p", 0.9)),
++        stream=False,
++    )
++
++    choice = completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # Parse & validate
++    data, parse_err = _parse_agent_json(content)
++    if parse_err:
++        trajectory.metadata["parse_error"] = parse_err
++        trajectory.metadata["parse_error_flag"] = 1.0
++        trajectory.metadata["invalid_solution"] = 1.0
++        trajectory.reward = -1.0
++        # Minimal metrics for failed parse
++        trajectory.metrics["mean_abs_pct_error"] = 100.0
++        trajectory.metrics["max_abs_pct_error"] = 100.0
++        trajectory.metrics["matched_count"] = 0.0
++        trajectory.metrics["omitted_count"] = float(len(recipe["ingredients"]))
++        trajectory.metrics["extra_count"] = 0.0
++        return trajectory
++
++    # Build indices for comparison
++    base_map: dict[str, tuple[float, str]] = {}
++    for ing in recipe["ingredients"]:
++        base_map[normalize_name(ing["name"])[:48]] = (float(ing["quantity"]), canonical_unit(ing["unit"]))
++
++    agent_ings = data.get("ingredients", [])
++    agent_map: dict[str, tuple[float, str, str]] = {}  # norm_name -> (qty, unit, raw_name)
++    for ing in agent_ings:
++        nm = normalize_name(str(ing["name"]))[:48]
++        qty, _ = _safe_float(ing["quantity"])  # already validated
++        agent_map[nm] = (qty, canonical_unit(str(ing["unit"])), str(ing["name"]))
++
++    # Compare
++    omitted = 0
++    extra = 0
++    unit_mismatch = 0
++    errors: list[float] = []
++    max_err = 0.0
++    matched = 0
++
++    for norm_name, (base_qty, base_unit) in base_map.items():
++        expected = base_qty * factor
++        if norm_name not in agent_map:
++            omitted += 1
++            trajectory.metadata[f"err_{norm_name}_pct"] = 100.0  # missing
++            continue
++        qty, unit, _raw = agent_map[norm_name]
++        if unit != base_unit:
++            unit_mismatch += 1
++        e = _percent_error(expected, qty)
++        errors.append(e)
++        matched += 1
++        max_err = max(max_err, e)
++        trajectory.metadata[f"err_{norm_name}_pct"] = float(e)
++
++    for norm_name in agent_map.keys():
++        if norm_name not in base_map:
++            extra += 1
++
++    # Metrics
++    mean_err = float(sum(errors) / len(errors)) if errors else (100.0 if omitted else 0.0)
++    trajectory.metrics["mean_abs_pct_error"] = mean_err
++    trajectory.metrics["max_abs_pct_error"] = float(max_err if errors else (100.0 if omitted else 0.0))
++    trajectory.metrics["matched_count"] = float(matched)
++    trajectory.metrics["omitted_count"] = float(omitted)
++    trajectory.metrics["extra_count"] = float(extra)
++    trajectory.metrics["unit_mismatch_count"] = float(unit_mismatch)
++
++    # Metadata flags (scalar-only)
++    trajectory.metadata["missing_any"] = 1.0 if omitted > 0 else 0.0
++    trajectory.metadata["extra_any"] = 1.0 if extra > 0 else 0.0
++    trajectory.metadata["unit_mismatch_any"] = 1.0 if unit_mismatch > 0 else 0.0
++
++    # Reward logic per spec with gentle shaping. Never exceed [−1, 1].
++    if omitted > 0:
++        trajectory.metadata["invalid_solution"] = 1.0
++        reward = -1.0  # Missing required ingredients is a hard failure
++    else:
++        reward = 0.0
++        if max_err < 0.5:
++            reward = 1.0
++        elif max_err < 5.0:
++            reward = 0.5
++
++        # Smooth shaping: small bonus for low mean error, small penalty for extras.
++        # This keeps gradients informative without violating the primary rules.
++        shaping = max(0.0, 0.3 * (1.0 - min(mean_err / 10.0, 1.0)))
++        reward = min(1.0, reward + shaping)
++        reward -= min(0.3, 0.05 * extra)
++
++        # If schema is off but parsed, penalize strongly (should be caught above).
++        # Kept for clarity and future extension.
++    trajectory.reward = float(max(-1.0, min(1.0, reward)))
++
++    # Record the reported servings if present
++    srv_val, srv_ok = _safe_float(data.get("servings"))
++    if srv_ok:
++        trajectory.metrics["agent_servings"] = srv_val
++        trajectory.metadata["agent_servings_int"] = int(round(srv_val))
++    else:
++        trajectory.metadata["agent_servings_parse_fail"] = 1.0
++
++    return trajectory
++
+

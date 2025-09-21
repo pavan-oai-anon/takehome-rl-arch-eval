@@ -1,0 +1,36 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {
+      "description": "Schema validator enforces required keys/types and rejects extras with clear error messages.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Types and required-field presence are checked inside compute_reward (coverage/type_score), but there is no dedicated schema validator to reject extra keys or emit clear per-field error messages; parse errors are surfaced only as a coarse 'parse_error'."
+    },
+    {
+      "description": "Reward function differentiates exact matches vs partial matches with documented weighting (e.g., per-field scores).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "compute_reward documents and implements weighted components (valid_json, coverage, type_score, value_score) and adds an 'exact_match' metric; numeric fields use smooth relative-error scoring."
+    },
+    {
+      "description": "Response normalization (case folding, trimming) occurs before scoring and is covered by unit tests or examples.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Normalization includes date canonicalization, currency upper-casing, numeric symbol stripping, and string trimming; diverse seeded examples exercise multiple date/currency formats, demonstrating coverage."
+    },
+    {
+      "description": "Environment records diagnostics (`missing_fields`, `type_error`, `summary_length`) as metrics/metadata for analysis.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Metrics include chars_out (length), invalid_solution, and shaped scores; 'parse_error' is stored in metadata. However, explicit missing_fields/type_error diagnostics are not emitted as metrics or metadata (valerr from compute_reward is computed but not recorded)."
+    },
+    {
+      "description": "Edge-case handling (empty tickets, ambiguous prompts) is implemented and noted in comments or tests.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No explicit logic for empty/ambiguous inputs or related tests/comments; the code focuses on normal cases with general defensive JSON parsing only."
+    }
+  ],
+  "notes": "Strong reward shaping and normalization with illustrative examples. Lacks a hard validator to reject extra keys and does not record detailed validation diagnostics (missing/type) despite computing them. No explicit edge-case handling for empty or ambiguous prompts."
+}

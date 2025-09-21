@@ -1,0 +1,37 @@
+{
+  "total_points": 2,
+  "criteria": [
+    {
+      "description": "Word counter handles hyphenated words, contractions, and emoji consistently; tests cover edge cases.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "rollout.py counts words using a whitespace regex (\\S+), which treats hyphenated words, contractions, and emoji as single tokens consistently; however, there are no explicit tests or documented edge-case handling."
+    },
+    {
+      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Reward uses a continuous function (1 - diff/target) without discrete tiers or documentation distinguishing exact, off-by-one, and larger errors."
+    },
+    {
+      "description": "Theme adherence check (keyword match or embedding similarity) influences reward or metadata.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No theme adherence evaluation is performed; theme is only included in prompt/metadata and does not affect reward or logged metrics."
+    },
+    {
+      "description": "Environment logs `word_count`, `count_difference`, and `theme_match` for every rollout.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Actual word count and difference are logged in trajectory.metrics, but there is no theme_match metric recorded."
+    },
+    {
+      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Only a type check for string is performed; there is no explicit plain-text enforcement or whitespace stripping prior to scoring."
+    }
+  ],
+  "notes": "Overall design is functional for basic word counting and smooth reward but lacks tiered rewards, theme adherence checks, explicit logging of theme_match, and output sanitization. No tests are present for edge cases."
+}
+

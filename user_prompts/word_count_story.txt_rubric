@@ -1,0 +1,8 @@
+Rubric – Word Count Story Environment (10 pts total)
+
+Award points for environment/reward design:
+- 2 pts: Word counter handles hyphenated words, contractions, and emoji consistently; tests cover edge cases.
+- 2 pts: Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.
+- 2 pts: Theme adherence check (keyword match or embedding similarity) influences reward or metadata.
+- 2 pts: Environment logs `word_count`, `count_difference`, and `theme_match` for every rollout.
+- 2 pts: Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.

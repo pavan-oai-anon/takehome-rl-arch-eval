@@ -1,0 +1,486 @@
+[2025-09-21T09:04:12] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T09:04:12] User instructions:
+You are an automated reviewer scoring an OpenPipe ART environment.
+Evaluate the provided files using the rubric and then WRITE the score JSON to
+/home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json. Use this structure exactly:
+{
+  "total_points": <number>,
+  "criteria": [{"description": "...", "max_points": <number>, "awarded_points": <number>, "justification": "..."}, ...],
+  "notes": "..."
+}
+After writing the file, output ONLY the text DONE so the caller knows you finished.
+
+Rubric (10 points total):
+Rubric – Typo Correction Environment (10 pts total)
+
+Award points for environment/reward quality:
+- 2 pts: Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.
+- 2 pts: Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.
+- 2 pts: Sentiment/intent checks (e.g., simple similarity or heuristic) flag meaning drift and feed into metadata/reward.
+- 2 pts: Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.
+- 2 pts: Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.
+
+Project run: /home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112
+
+env.py:
+```python
+"""Environment helpers for the "typo-fix" ART task.
+
+This file purposefully contains **no** ART specific code so that it can be
+imported both by the rollout script *and* any potential evaluation utilities
+without pulling heavyweight dependencies.
+
+Key design goals:
+1. Keep hyper-parameters clearly visible at the top for quick iteration.
+2. Provide a small pool of noisy product reviews with ground-truth fixes.
+3. Offer lightweight helpers for sampling an episode and computing rewards.
+4. Avoid non-stdlib dependencies – difflib gives us a decent similarity score.
+"""
+
+from __future__ import annotations
+
+import random
+import difflib
+from typing import Tuple, Dict, Any
+
+# ---------------------------------------------------------------------------
+# Tuning knobs & training configuration.
+# ---------------------------------------------------------------------------
+
+RANDOM_SEED: int = 42
+
+# Core ART training hyper-parameters – tweak freely.
+TRAINING_CONFIG: Dict[str, Any] = {
+    "project": "typo-fix",
+    "model_name": "agent-typo",
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "steps": 50,
+    "trajectories_per_group": 24,
+    "groups_per_step": 1,
+    "learning_rate": 5e-5,
+    "max_completion_tokens": 128,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_exceptions": 24,
+    # Keep the most recent checkpoint only – matches 2048 example.
+    "cleanup_keep_last": 1,
+}
+
+# ---------------------------------------------------------------------------
+# Episode data.
+# ---------------------------------------------------------------------------
+
+_SAMPLE_REVIEWS = [
+    {
+        "noisy": "Thiss product is amazng! I realy love the colour and the quility.",
+        "correct": "This product is amazing! I really love the colour and the quality.",
+        "difficulty": 0.4,
+    },
+    {
+        "noisy": "The battrey life isnt good, it dies after twoo hours of use.",
+        "correct": "The battery life isn't good; it dies after two hours of use.",
+        "difficulty": 0.5,
+    },
+    {
+        "noisy": "Package arived late and the box was dammaged.",
+        "correct": "Package arrived late and the box was damaged.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "I hav never been more dissapointed in a purchase.",
+        "correct": "I have never been more disappointed in a purchase.",
+        "difficulty": 0.6,
+    },
+    {
+        "noisy": "Excelent camera qualty but the screen scratches to easilly.",
+        "correct": "Excellent camera quality but the screen scratches too easily.",
+        "difficulty": 0.7,
+    },
+    {
+        "noisy": "Sound is clear, but the earbuds fall outa my ears.",
+        "correct": "Sound is clear, but the earbuds fall out of my ears.",
+        "difficulty": 0.4,
+    },
+    {
+        "noisy": "Greta price for what you get. Definately recomended!",
+        "correct": "Great price for what you get. Definitely recommended!",
+        "difficulty": 0.2,
+    },
+    {
+        "noisy": "Dont waist your money, it broke after one weak.",
+        "correct": "Don't waste your money; it broke after one week.",
+        "difficulty": 0.5,
+    },
+    {
+        "noisy": "Colour looks differant than in the advertisment.",
+        "correct": "Colour looks different than in the advertisement.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "Fast delivary and grate custumer servise.",
+        "correct": "Fast delivery and great customer service.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "The instrutions where confusing and mispelled.",
+        "correct": "The instructions were confusing and misspelled.",
+        "difficulty": 0.6,
+    },
+    {
+        "noisy": "I'm verry happy with this purchace so far.",
+        "correct": "I'm very happy with this purchase so far.",
+        "difficulty": 0.2,
+    },
+    {
+        "noisy": "It stoped working after the recent update, pleas fix!",
+        "correct": "It stopped working after the recent update; please fix!",
+        "difficulty": 0.7,
+    },
+]
+
+# Make behaviour deterministic when needed.
+random.seed(RANDOM_SEED)
+
+
+# ---------------------------------------------------------------------------
+# Public helpers.
+# ---------------------------------------------------------------------------
+
+
+def sample_episode() -> Tuple[str, str, float, int]:
+    """Return *(noisy, correct, difficulty, review_id)* for a single episode."""
+
+    review_id = random.randrange(len(_SAMPLE_REVIEWS))
+    review = _SAMPLE_REVIEWS[review_id]
+    return review["noisy"], review["correct"], review["difficulty"], review_id
+
+
+def compute_reward(predicted: str, target: str) -> float:
+    """Compute a smooth reward based on string similarity.
+
+    We use :pyclass:`difflib.SequenceMatcher` to obtain a ratio in ``[0,1]`` and
+    then linearly map it to ``[-1, 1]`` so that *perfect* corrections receive
+    ``+1`` while completely unrelated outputs approach ``-1``.
+    """
+
+    matcher = difflib.SequenceMatcher(None, predicted.strip(), target.strip())
+    similarity = matcher.ratio()  # 0 → 1
+    return (2.0 * similarity) - 1.0
+
+
+def is_valid_output(predicted: str) -> bool:
+    """Validation guard – ensure the model returns *something* printable.
+
+    - Output must be non-empty and not exceed 3× target length (defensive).
+    - We intentionally allow minor punctuation differences; reward handles that.
+    """
+
+    predicted = predicted.strip()
+    return bool(predicted) and len(predicted) < 1024
+
+
+# Export symbols that other modules are expected to import.
+__all__ = [
+    "RANDOM_SEED",
+    "TRAINING_CONFIG",
+    "sample_episode",
+    "compute_reward",
+    "is_valid_output",
+]
+```
+
+rollout.py:
+```python
+"""ART rollout logic for the *typo-fix* task.
+
+This file mirrors the style of the 2048 reference implementation while being
+considerably simpler – each episode only contains **one** user turn. The agent
+receives a typo-ridden product review and must respond **only** with the fully
+corrected version.
+
+Reward shaping uses Levenshtein-style similarity (via ``difflib``) to provide a
+smooth signal between ``-1`` and ``+1`` so that partially-correct fixes still
+contribute to learning.
+"""
+
+from __future__ import annotations
+
+import requests
+from openai import AsyncOpenAI
+import art
+import weave
+
+from typing import Any
+
+from env import (
+    sample_episode,
+    compute_reward,
+    is_valid_output,
+)
+
+
+class ScenarioTypos(art.TypedDict):  # type: ignore[misc]
+    """Minimal scenario container so that different training steps can be traced."""
+
+    step: int
+
+
+# ---------------------------------------------------------------------------
+# Rollout definition.
+# ---------------------------------------------------------------------------
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(
+    model: art.Model, step: int, config: dict[str, Any]  # noqa: D401 – ART signature
+) -> art.Trajectory:
+    """Generate a single trajectory for the *typo-fix* environment."""
+
+    # ---------------------------------------------------------------------
+    # Episode setup.
+    # ---------------------------------------------------------------------
+    noisy_review, correct_review, difficulty, review_id = sample_episode()
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert proof-reader. Given a customer review that "
+                    "may contain typos or grammar mistakes, respond with the fully "
+                    "corrected review. Respond with *plain text only* – no extra "
+                    "comments, no markdown, no explanations. The output must be "
+                    "identical to the corrected version, including punctuation."
+                ),
+            }
+        ],
+        metadata={
+            "review_id": float(review_id),  # scalar for aggregation
+            "difficulty": difficulty,
+            "step": float(step),
+        },
+        reward=0.0,
+    )
+
+    # Add user turn with the noisy text.
+    trajectory.messages_and_choices.append({"role": "user", "content": noisy_review})
+
+    # ------------------------------------------------------------------
+    # Model inference.
+    # ------------------------------------------------------------------
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    chat_completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        max_completion_tokens=config.get("max_completion_tokens", 128),
+        temperature=config.get("temperature", 0.7),
+        top_p=config.get("top_p", 0.9),
+        stream=False,
+    )
+
+    choice = chat_completion.choices[0]
+    content = choice.message.content or ""
+    trajectory.messages_and_choices.append(choice)
+
+    # ------------------------------------------------------------------
+    # Validation & reward.
+    # ------------------------------------------------------------------
+    is_valid = is_valid_output(content)
+    trajectory.metrics["invalid_output"] = 0.0 if is_valid else 1.0
+
+    if not is_valid:
+        trajectory.reward = -1.0
+        return trajectory
+
+    similarity_reward = compute_reward(content, correct_review)
+
+    # Emphasise perfect corrections while still learning from partial ones.
+    trajectory.reward = similarity_reward
+
+    # Additional metrics for analysis (all scalars).
+    trajectory.metrics["similarity"] = similarity_reward
+
+    return trajectory
+
+
+# Re-export for ART's dynamic import pattern.
+__all__ = ["rollout"]
+```
+
+[2025-09-21T09:04:16] codex
+
+I’m going to inspect the project directory and open the provided files to score them against the rubric.
+[2025-09-21T09:04:16] exec bash -lc 'ls -la' in /home/azureuser/probable-goggles-1
+[2025-09-21T09:04:16] bash -lc 'ls -la' succeeded in 7ms:
+total 1148
+drwxrwxr-x  7 azureuser azureuser    4096 Sep 21 08:35 .
+drwxr-x--- 16 azureuser azureuser    4096 Sep 20 18:27 ..
+-rw-rw-r--  1 azureuser azureuser     180 Sep 20 20:20 .env
+drwxrwxr-x  8 azureuser azureuser    4096 Sep 21 08:46 .git
+-rw-rw-r--  1 azureuser azureuser      47 Sep 20 21:02 .gitignore
+drwxrwxr-x  6 azureuser azureuser    4096 Sep 20 02:00 .venv
+-rw-rw-r--  1 azureuser azureuser   11966 Sep 20 18:19 2048.py
+drwxrwxr-x  2 azureuser azureuser    4096 Sep 21 08:45 __pycache__
+-rw-rw-r--  1 azureuser azureuser    6055 Sep 20 23:31 codex_runner.py
+drwxrwxr-x 10 azureuser azureuser    4096 Sep 21 08:38 codex_runs
+-rw-rw-r--  1 azureuser azureuser    4900 Sep 21 07:49 multi_train_launcher.py
+-rw-rw-r--  1 azureuser azureuser    3822 Sep 21 03:00 prompt_builder.py
+-rw-rw-r--  1 azureuser azureuser     375 Sep 20 00:01 pyproject.toml
+-rw-rw-r--  1 azureuser azureuser     120 Sep 20 00:34 requirements.txt
+-rw-rw-r--  1 azureuser azureuser    4672 Sep 21 08:45 score_codex_runs.py
+-rw-rw-r--  1 azureuser azureuser   17593 Sep 21 07:48 training.py
+drwxrwxr-x  2 azureuser azureuser    4096 Sep 21 08:24 user_prompts
+-rw-rw-r--  1 azureuser azureuser 1066727 Sep 20 00:04 uv.lock
+[2025-09-21T09:04:16] tokens used: 2,594
+[2025-09-21T09:04:18] exec bash -lc 'ls -la codex_runs/typo_correction/o3/20250921_024112' in /home/azureuser/probable-goggles-1
+[2025-09-21T09:04:18] bash -lc 'ls -la codex_runs/typo_correction/o3/20250921_024112' succeeded in 7ms:
+total 108
+drwxrwxr-x 2 azureuser azureuser  4096 Sep 21 02:42 .
+drwxrwxr-x 3 azureuser azureuser  4096 Sep 21 02:41 ..
+-rw-rw-r-- 1 azureuser azureuser  5636 Sep 21 02:42 env.py
+-rw-rw-r-- 1 azureuser azureuser 14939 Sep 21 02:41 prompt.txt
+-rw-rw-r-- 1 azureuser azureuser  3970 Sep 21 02:42 rollout.py
+-rw-rw-r-- 1 azureuser azureuser     0 Sep 21 02:42 stderr.txt
+-rw-rw-r-- 1 azureuser azureuser 70246 Sep 21 02:42 stdout.txt
+[2025-09-21T09:04:18] tokens used: 3,244
+[2025-09-21T09:04:18] exec bash -lc "sed -n '1,200p' codex_runs/typo_correction/o3/20250921_024112/env.py" in /home/azureuser/probable-goggles-1
+[2025-09-21T09:04:18] bash -lc "sed -n '1,200p' codex_runs/typo_correction/o3/20250921_024112/env.py" succeeded in 7ms:
+"""Environment helpers for the "typo-fix" ART task.
+
+This file purposefully contains **no** ART specific code so that it can be
+imported both by the rollout script *and* any potential evaluation utilities
+without pulling heavyweight dependencies.
+
+Key design goals:
+1. Keep hyper-parameters clearly visible at the top for quick iteration.
+2. Provide a small pool of noisy product reviews with ground-truth fixes.
+3. Offer lightweight helpers for sampling an episode and computing rewards.
+4. Avoid non-stdlib dependencies – difflib gives us a decent similarity score.
+"""
+
+from __future__ import annotations
+
+import random
+import difflib
+from typing import Tuple, Dict, Any
+
+# ---------------------------------------------------------------------------
+[2025-09-21T09:04:18] tokens used: 3,651
+[2025-09-21T09:04:20] exec bash -lc "sed -n '1,240p' codex_runs/typo_correction/o3/20250921_024112/rollout.py" in /home/azureuser/probable-goggles-1
+[2025-09-21T09:04:20] bash -lc "sed -n '1,240p' codex_runs/typo_correction/o3/20250921_024112/rollout.py" succeeded in 7ms:
+"""ART rollout logic for the *typo-fix* task.
+
+This file mirrors the style of the 2048 reference implementation while being
+considerably simpler – each episode only contains **one** user turn. The agent
+receives a typo-ridden product review and must respond **only** with the fully
+corrected version.
+
+Reward shaping uses Levenshtein-style similarity (via ``difflib``) to provide a
+smooth signal between ``-1`` and ``+1`` so that partially-correct fixes still
+contribute to learning.
+"""
+
+from __future__ import annotations
+
+import requests
+from openai import AsyncOpenAI
+import art
+import weave
+
+from typing import Any
+[2025-09-21T09:04:20] tokens used: 5,459
+[2025-09-21T09:04:39] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+{
+  "total_points": 2,
+  "criteria": [
+    {"description": "Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.", "max_points": 2, "awarded_points": 2, "justification": "Uses difflib.SequenceMatcher to compute similarity and maps to [-1,1], providing continuous scoring where exact matches yield 1.0 and partial fixes earn proportionally less."},
+    {"description": "Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.", "max_points": 2, "awarded_points": 0, "justification": "No explicit tiering or documentation of tiers; only a continuous similarity reward and an invalid_output penalty are present."},
+    {"description": "Sentiment/intent checks flag meaning drift and feed into metadata/reward.", "max_points": 2, "awarded_points": 0, "justification": "No semantic similarity, intent, or sentiment checks; rewards are purely string-similarity-based."},
+    {"description": "Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.", "max_points": 2, "awarded_points": 0, "justification": "Metrics include only similarity and invalid_output; there is no logged edit distance, unchanged/exact-match flag, or semantic change indicator."},
+    {"description": "Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.", "max_points": 2, "awarded_points": 0, "justification": "No tests or golden cases are present; dataset lacks explicit all-caps, punctuation-only, and already-correct cases. Validator docstring mentions a length-based constraint not reflected in code."}
+  ],
+  "notes": "Strength: clear, continuous similarity-based reward via difflib that differentiates perfect vs partial fixes. Gaps: no explicit reward tiers or documentation, no semantic/intent checks, sparse metrics (no edit distance or exact-match flag), and no regression tests for edge cases. Consider adding tiered reward thresholds, logging edit distance and exact-match/unchanged flags, incorporating a lightweight semantic similarity check, and adding tests for all-caps, punctuation-only, and already-correct inputs."
+}
+
+[2025-09-21T09:04:39] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+[2025-09-21T09:04:39] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..990c32869afd0aacfa1e844ba125cbcb8e408792
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,12 @@
++{
++  "total_points": 2,
++  "criteria": [
++    {"description": "Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.", "max_points": 2, "awarded_points": 2, "justification": "Uses difflib.SequenceMatcher to compute similarity and maps to [-1,1], providing continuous scoring where exact matches yield 1.0 and partial fixes earn proportionally less."},
++    {"description": "Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.", "max_points": 2, "awarded_points": 0, "justification": "No explicit tiering or documentation of tiers; only a continuous similarity reward and an invalid_output penalty are present."},
++    {"description": "Sentiment/intent checks flag meaning drift and feed into metadata/reward.", "max_points": 2, "awarded_points": 0, "justification": "No semantic similarity, intent, or sentiment checks; rewards are purely string-similarity-based."},
++    {"description": "Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.", "max_points": 2, "awarded_points": 0, "justification": "Metrics include only similarity and invalid_output; there is no logged edit distance, unchanged/exact-match flag, or semantic change indicator."},
++    {"description": "Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.", "max_points": 2, "awarded_points": 0, "justification": "No tests or golden cases are present; dataset lacks explicit all-caps, punctuation-only, and already-correct cases. Validator docstring mentions a length-based constraint not reflected in code."}
++  ],
++  "notes": "Strength: clear, continuous similarity-based reward via difflib that differentiates perfect vs partial fixes. Gaps: no explicit reward tiers or documentation, no semantic/intent checks, sparse metrics (no edit distance or exact-match flag), and no regression tests for edge cases. Consider adding tiered reward thresholds, logging edit distance and exact-match/unchanged flags, incorporating a lightweight semantic similarity check, and adding tests for all-caps, punctuation-only, and already-correct inputs."
++}
++
+
+[2025-09-21T09:04:39] tokens used: 8,277
+[2025-09-21T09:04:39] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..990c32869afd0aacfa1e844ba125cbcb8e408792
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,12 @@
++{
++  "total_points": 2,
++  "criteria": [
++    {"description": "Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.", "max_points": 2, "awarded_points": 2, "justification": "Uses difflib.SequenceMatcher to compute similarity and maps to [-1,1], providing continuous scoring where exact matches yield 1.0 and partial fixes earn proportionally less."},
++    {"description": "Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.", "max_points": 2, "awarded_points": 0, "justification": "No explicit tiering or documentation of tiers; only a continuous similarity reward and an invalid_output penalty are present."},
++    {"description": "Sentiment/intent checks flag meaning drift and feed into metadata/reward.", "max_points": 2, "awarded_points": 0, "justification": "No semantic similarity, intent, or sentiment checks; rewards are purely string-similarity-based."},
++    {"description": "Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.", "max_points": 2, "awarded_points": 0, "justification": "Metrics include only similarity and invalid_output; there is no logged edit distance, unchanged/exact-match flag, or semantic change indicator."},
++    {"description": "Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.", "max_points": 2, "awarded_points": 0, "justification": "No tests or golden cases are present; dataset lacks explicit all-caps, punctuation-only, and already-correct cases. Validator docstring mentions a length-based constraint not reflected in code."}
++  ],
++  "notes": "Strength: clear, continuous similarity-based reward via difflib that differentiates perfect vs partial fixes. Gaps: no explicit reward tiers or documentation, no semantic/intent checks, sparse metrics (no edit distance or exact-match flag), and no regression tests for edge cases. Consider adding tiered reward thresholds, logging edit distance and exact-match/unchanged flags, incorporating a lightweight semantic similarity check, and adding tests for all-caps, punctuation-only, and already-correct inputs."
++}
++
+
+[2025-09-21T09:04:39] codex
+
+DONE
+[2025-09-21T09:04:40] tokens used: 9,033
+[2025-09-21T09:04:40] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..990c32869afd0aacfa1e844ba125cbcb8e408792
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,12 @@
++{
++  "total_points": 2,
++  "criteria": [
++    {"description": "Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.", "max_points": 2, "awarded_points": 2, "justification": "Uses difflib.SequenceMatcher to compute similarity and maps to [-1,1], providing continuous scoring where exact matches yield 1.0 and partial fixes earn proportionally less."},
++    {"description": "Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.", "max_points": 2, "awarded_points": 0, "justification": "No explicit tiering or documentation of tiers; only a continuous similarity reward and an invalid_output penalty are present."},
++    {"description": "Sentiment/intent checks flag meaning drift and feed into metadata/reward.", "max_points": 2, "awarded_points": 0, "justification": "No semantic similarity, intent, or sentiment checks; rewards are purely string-similarity-based."},
++    {"description": "Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.", "max_points": 2, "awarded_points": 0, "justification": "Metrics include only similarity and invalid_output; there is no logged edit distance, unchanged/exact-match flag, or semantic change indicator."},
++    {"description": "Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.", "max_points": 2, "awarded_points": 0, "justification": "No tests or golden cases are present; dataset lacks explicit all-caps, punctuation-only, and already-correct cases. Validator docstring mentions a length-based constraint not reflected in code."}
++  ],
++  "notes": "Strength: clear, continuous similarity-based reward via difflib that differentiates perfect vs partial fixes. Gaps: no explicit reward tiers or documentation, no semantic/intent checks, sparse metrics (no edit distance or exact-match flag), and no regression tests for edge cases. Consider adding tiered reward thresholds, logging edit distance and exact-match/unchanged flags, incorporating a lightweight semantic similarity check, and adding tests for all-caps, punctuation-only, and already-correct inputs."
++}
++
