@@ -12,6 +12,7 @@ import torch
 from openai import OpenAI
 from unsloth import FastLanguageModel
 from dotenv import load_dotenv
+from tenacity import retry
 load_dotenv()
 
 @dataclass
@@ -164,7 +165,7 @@ def generate_with_model(
     generated = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
     return generated.strip()
 
-
+@retry
 def evaluate_with_code_interpreter(
     client: OpenAI,
     evaluator_model: str,
