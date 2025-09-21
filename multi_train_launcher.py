@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Sequence
 
 DEFAULT_TIMEOUT_SECONDS = 600  # 10 minutes
-MAX_CONCURRENT_JOBS = 2
+DEFAULT_MAX_CONCURRENT = 1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch training.py in separate subprocesses (up to two at a time) with a fixed timeout. "
+            "Launch training.py in separate subprocesses with a fixed timeout. "
             "Each positional JOB argument accepts a comma-separated list of Codex run "
             "directories that will be passed to training.py in a single invocation."
         )
@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         "--python",
         default=sys.executable,
         help="Python interpreter to use when launching training.py (default: current interpreter).",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT,
+        help="Maximum concurrent training jobs (default: 1; set 2 to run two at a time).",
     )
     parser.add_argument(
         "--training-args",
@@ -75,9 +81,10 @@ def main() -> None:
     overall_status = 0
     active: list[dict[str, object]] = []
     job_cursor = 0
+    max_concurrent = max(1, args.parallel)
 
     while job_cursor < len(jobs) or active:
-        while job_cursor < len(jobs) and len(active) < MAX_CONCURRENT_JOBS:
+        while job_cursor < len(jobs) and len(active) < max_concurrent:
             idx, job_paths = jobs[job_cursor]
             job_cursor += 1
 
