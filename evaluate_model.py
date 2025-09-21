@@ -231,10 +231,15 @@ def resolve_model_checkpoint(model_input: Path) -> tuple[Path, str]:
         raise FileNotFoundError(f"No model directories found under {models_root}")
 
     prioritized: list[Path] = []
+    if requested_model:
+        exact = [d for d in candidates if d.name == requested_model]
+        if exact:
+            prioritized.extend(exact)
+        partial = [d for d in candidates if d.name != requested_model and requested_model in d.name]
+        prioritized.extend(partial)
     if run_timestamp:
-        prioritized.extend([d for d in candidates if run_timestamp in d.name])
-    if not prioritized and requested_model:
-        prioritized.extend([d for d in candidates if requested_model in d.name])
+        time_matches = [d for d in candidates if run_timestamp in d.name]
+        prioritized.extend(time_matches)
     if not prioritized:
         prioritized = candidates
 
@@ -357,18 +362,19 @@ def main() -> None:
 
         shared_runs.append(run_entry)
 
-    aggregate_reports = []
-    for (model_path, _task, output_path) in resolved_models:
-        model_entries = []
+    for idx, (model_path, _task, output_path) in enumerate(resolved_models):
+        model_entries: list[dict[str, Any]] = []
         for run in shared_runs:
-            for model_entry in run["models"]:
-                if model_entry["model_path"] == str(model_path):
-                    entry = {
-                        "plan": run["plan"],
-                        "model_response": model_entry["model_response"],
-                        "evaluation": model_entry["evaluation"],
-                    }
-                    model_entries.append(entry)
+            if idx >= len(run["models"]):
+                continue
+            model_entry = run["models"][idx]
+            model_entries.append(
+                {
+                    "plan": run["plan"],
+                    "model_response": model_entry["model_response"],
+                    "evaluation": model_entry["evaluation"],
+                }
+            )
 
         scores = [float(entry["evaluation"].get("score", 0.0)) for entry in model_entries]
         passes = [bool(entry["evaluation"].get("passed", False)) for entry in model_entries]
