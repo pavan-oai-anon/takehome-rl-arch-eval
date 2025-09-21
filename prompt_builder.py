@@ -25,6 +25,7 @@ Follow these rules:
 13. Metadata must be a simple scalar value, not a list/dict.
 14. Metrics must be a number in trajectory.metrics.
 15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+Make sure to use the codex tools to create the files needed for this - I don't just want example output.
 """
 
 
