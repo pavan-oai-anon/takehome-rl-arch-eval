@@ -62,7 +62,7 @@ class TrainingConfig:
         config.extra = {key: value for key, value in mapping.items() if key not in known}
         # override the base model with ours and training steps, trajectories per group, groups per step
         config.base_model = "Qwen/Qwen2.5-1.5B-Instruct"
-        config.steps = 100
+        config.steps = 10
         config.trajectories_per_group = 16
         config.groups_per_step = 8
         return config
