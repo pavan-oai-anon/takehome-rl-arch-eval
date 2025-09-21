@@ -12,6 +12,8 @@ dependencies = [
     "openai>=1.0.0",
     "pydantic",
     "requests",
+    "pandas",
+    "matplotlib",
 ]
 
 [tool.uv]
