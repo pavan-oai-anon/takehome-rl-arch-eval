@@ -92,15 +92,16 @@ def import_module(path: Path, module_name: str, alias: str | None = None) -> Any
     return module
 
 
-def _resolve_backend_path(config: TrainingConfig, base_dir: Path) -> Path:
-    """Determine where LocalBackend artifacts should live."""
+def _resolve_backend_path(config: TrainingConfig) -> Path:
+    """Determine where LocalBackend artifacts should live at the project root."""
 
+    root = Path.cwd()
     if config.backend_path:
         path = Path(config.backend_path)
         if not path.is_absolute():
-            path = base_dir / path
+            path = root / path
     else:
-        path = base_dir / ".art"
+        path = root / ".art"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -127,7 +128,7 @@ async def initialize_backend(config: TrainingConfig, base_task_dir: Path) -> Any
 
         backend = await SkyPilotBackend.initialize_cluster(**cluster_kwargs)
     else:
-        backend_path = _resolve_backend_path(config, base_task_dir)
+        backend_path = _resolve_backend_path(config)
         backend = LocalBackend(in_process=True, path=str(backend_path))
 
     return backend
