@@ -1,0 +1,37 @@
+{
+  "total_points": 5,
+  "criteria": [
+    {
+      "description": "Environment uses different schemas for different examples, not just limited to one type of schema.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Single fixed schema (name, age, location) is used across all examples; inputs vary in surface form only."
+    },
+    {
+      "description": "Reward function differentiates exact matches vs partial matches with documented weighting (e.g., per-field scores).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward is the fraction of correct fields (equal per-field weighting), clearly indicated in code comments."
+    },
+    {
+      "description": "Reward function properly checks to see if json matches the expected schema, and penalizing when there are extra fields, or fields that are not in the expected schema requested in the prompt.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Checks expected keys and types, but does not detect or penalize extra/unexpected fields; 'validation_error' metric is binary and does not affect reward."
+    },
+    {
+      "description": "Edge-case handling (empty tickets, ambiguous prompts) is implemented and noted in comments or tests.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No explicit handling or tests for empty/ambiguous inputs; only basic invalid-JSON handling is present, and edge cases are not documented."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Partial credit via per-field correctness yields smooth rewards between 0 and 1 for valid JSON outputs."
+    }
+  ],
+  "notes": "Overall, the environment sets a single target schema and provides fractional per-field rewards, enabling partial credit and smooth optimization. It lacks schema diversity across examples and does not penalize extra fields. Edge-case handling (e.g., empty inputs, spelled-out numbers, ambiguous prompts) is not addressed or documented. Adding multiple target schemas, explicit schema-conformance checks that penalize unexpected keys, and tests/comments for edge cases would strengthen the environment."
+}
+

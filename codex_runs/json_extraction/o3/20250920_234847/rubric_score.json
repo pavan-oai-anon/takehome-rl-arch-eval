@@ -1,0 +1,36 @@
+{
+  "total_points": 5,
+  "criteria": [
+    {
+      "description": "Environment uses different schemas for different examples",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "A single fixed schema (name, date, amount) is used for all samples; no per-example schema variation."
+    },
+    {
+      "description": "Reward function differentiates exact matches vs partial matches with documented weighting",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Field-level scoring sums correct fields (equal weighting) with comments/docstrings explaining 1/len(SCHEMA) and a perfect-match bonus."
+    },
+    {
+      "description": "Reward function checks schema match and penalizes extra or non-schema fields",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Validation ensures JSON parses and is a dict, but there is no penalty for extra keys; grading ignores unknown fields and only counts known ones."
+    },
+    {
+      "description": "Edge-case handling (empty tickets, ambiguous prompts) implemented and noted",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Handles code-fence wrappers and invalid/non-dict JSON with a negative reward; however no explicit handling for empty inputs or ambiguity and no tests documenting such cases."
+    },
+    {
+      "description": "Reward function is smooth with partial credit",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Partial correctness yields proportional reward (0–1), plus a smooth bonus only on perfect extraction."
+    }
+  ],
+  "notes": "Overall design provides clear partial-credit shaping and a perfect-match bonus. It lacks schema-compatibility enforcement beyond basic type normalization for amount and does not penalize extra fields. Only one schema is used across all examples, and edge-case coverage is limited to JSON parsing nuances."
+}

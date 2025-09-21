@@ -1,0 +1,12 @@
+{
+  "total_points": 8,
+  "criteria": [
+    {"description": "Sample code snippets that are malicious are not ovbious in their comments / code. It's by the nature of their code they are malicious, not other things.", "max_points": 3, "awarded_points": 1, "justification": "Many malicious stubs explicitly label intent in comments (e.g., reverse shell, web shell, keylogger, dangerous rm). While patterns exist in code, comments make them obvious."},
+    {"description": "The samples seeded in the envionment are a variety of different languages, and not just one language.", "max_points": 2, "awarded_points": 2, "justification": "Includes Python, JavaScript, Bash, PowerShell, Go, Ruby, and PHP across 16 samples."},
+    {"description": "The samples seeded in the environment have a variety of difficulty - they are not all trivial examples, or exceptionally difficult to figure out if they are malicious or not.", "max_points": 2, "awarded_points": 2, "justification": "Difficulty varies: simple eval/download stubs to persistence/autorun and reverse shell patterns; benign tasks also vary (CLI, hashing, math)."},
+    {"description": "The rollouts are setup to extract out data in a structured format to make the judgement of correctness easier.", "max_points": 2, "awarded_points": 2, "justification": "Rollout enforces strict JSON, validates keys/types, coerces booleans, scores structure/style, and logs scalar metrics—facilitating clear evaluation."},
+    {"description": "The environment has a sufficient number of samples, more than 10.", "max_points": 1, "awarded_points": 1, "justification": "There are 16 curated examples total (7 malicious-leaning, 9 benign)."}
+  ],
+  "notes": "Well-structured rollout and diverse dataset. To improve, remove explicit labels in comments for malicious items so detection relies more on behavioral patterns than annotations."
+}
+

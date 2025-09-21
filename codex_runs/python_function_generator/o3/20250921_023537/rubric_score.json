@@ -1,0 +1,36 @@
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "AST-based validator checks syntax and exact signature (name, params, return type) before scoring.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "rollout.py parses with ast, compiles/executes in an isolated module, and verify_signature in env.py compares the exact def string including name, parameter annotations, and return type before testing."
+    },
+    {
+      "description": "Reward structure differentiates between syntax errors, signature mismatches, logic failures, and full success.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Separate flags/metrics for invalid code, signature mismatch, and test failures; reward combines syntax_ok, signature_ok, and test_pass_ratio with distinct weights."
+    },
+    {
+      "description": "Automatic unit tests or assertions run per prompt, feeding pass/fail results into rewards. The environment actually runs the function and checks correctness against the golden outputs.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "run_tests executes the submitted function against predefined test cases derived from golden behavior and feeds the pass ratio directly into the reward."
+    },
+    {
+      "description": "Environment enforces docstring/type hint requirements when specified, with clear penalties when missing.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Type hints are mandated via exact signature matching; missing or incorrect annotations cause signature_ok=0 and a signature error flag. Docstrings are not required by the tasks, so no enforcement is needed."
+    },
+    {
+      "description": "Reward function is smooth, granting partial credit for partial correctness.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Weighted linear combination allows graded rewards; test_pass_ratio provides continuous partial credit between 0 and 1."
+    }
+  ],
+  "notes": "The environment cleanly separates syntax parsing, signature validation, and execution-based testing. Metrics and flags clearly diagnose failure modes, and the reward shaping provides smooth learning signal. Type annotations are enforced strictly via string-level signature comparison; docstrings are not specified by the tasks and thus not enforced."
+}

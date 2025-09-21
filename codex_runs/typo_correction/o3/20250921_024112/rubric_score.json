@@ -1,0 +1,37 @@
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Reward signal does not just compare for exact match, but uses similarity (difflib/Levenshtein-style).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "compute_reward uses difflib.SequenceMatcher.ratio mapped to [-1,1]; rollout explicitly frames it as Levenshtein-style similarity."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "_SAMPLE_REVIEWS contains 13 review pairs, exceeding the threshold."
+    },
+    {
+      "description": "Examples are varied, not just one overwhelming error repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Dataset includes diverse misspellings, punctuation fixes, grammar (apostrophes, homophones, plurals), and spacing variations across many words and structures."
+    },
+    {
+      "description": "Reward function is smooth with partial credit for near-correct outputs.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Similarity ratio provides continuous scoring; mapping to [-1,1] ensures incremental reward even when not exact."
+    },
+    {
+      "description": "Environment stays on product reviews topic and includes difficulty labels.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "All items are customer reviews; each example has a 'difficulty' float and rollout propagates it in trajectory metadata."
+    }
+  ],
+  "notes": "Solid, lightweight setup: deterministic sampling, smooth reward via difflib, varied review typos, and difficulty metadata. Minor nit: is_valid_output docstring mentions 3× target length but implementation uses a fixed 1024-char cap; otherwise aligns with rubric well."
+}
+

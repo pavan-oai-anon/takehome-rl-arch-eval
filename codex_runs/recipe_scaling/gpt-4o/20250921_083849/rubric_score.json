@@ -1,0 +1,36 @@
+{
+  "total_points": 2,
+  "criteria": [
+    {
+      "description": "Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.",
+      "max_points": 2,
+      "awarded_points": 0.5,
+      "justification": "Validator checks proportional quantities and flags unknown ingredients, but does not verify missing ingredients, duplicates, or unit consistency."
+    },
+    {
+      "description": "Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Near-match within 5% grants +0.5 and JSON parse errors get -1; extra ingredients penalized. Exact matches are not rewarded differently (+1 not implemented), and missing ingredients are not penalized explicitly."
+    },
+    {
+      "description": "Examples seeded in the environment are a variety of different scaling tasks (upscale, downscale, fractional-serving, etc)",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Only one recipe provided with a single upscale scenario; no downscale or fractional-serving examples."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Environment seeds only one example recipe."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 0.5,
+      "justification": "Provides partial credit within a 5% threshold, but uses step changes (+0.5 or -1) rather than a continuous/graded reward across error magnitudes."
+    }
+  ],
+  "notes": "To improve: (1) Extend validator to ensure all original ingredients appear exactly once, enforce unit consistency, and detect duplicates and omissions. (2) Differentiate exact matches (+1) from near matches (+0.5). (3) Penalize both extra and missing ingredients. (4) Seed >10 diverse examples covering upscale, downscale, and fractional servings. (5) Consider a continuous reward based on percentage error to make the reward smoother across deviations."
+}

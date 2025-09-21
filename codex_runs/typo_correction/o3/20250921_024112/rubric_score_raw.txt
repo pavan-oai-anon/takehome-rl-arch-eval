@@ -1,0 +1,507 @@
+[2025-09-21T20:22:44] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T20:22:44] User instructions:
+You are an automated reviewer scoring an OpenPipe ART environment.
+Evaluate the provided files using the rubric and then WRITE the score JSON to
+/home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json. Use this structure exactly:
+{
+  "total_points": <number>,
+  "criteria": [{"description": "...", "max_points": <number>, "awarded_points": <number>, "justification": "..."}, ...],
+  "notes": "..."
+}
+After writing the file, output ONLY the text DONE so the caller knows you finished.
+
+Rubric (10 points total):
+Rubric – Typo Correction Environment (10 pts total)
+
+Award points for environment/reward quality:
+- 2 pts: Reward signal does not just compare for exact match, but also uses something better like a levenshtein distance or similar.
+- 2 pts: More than 10 examples are seeded in the environment.
+- 2 pts: Examples are varied, and not just one overwelming error repeated.
+- 2 pts: Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.
+- 2 pts: Environment stayed on topic to reviews and has difficulty labels.
+
+Project run: /home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112
+
+env.py:
+```python
+"""Environment helpers for the "typo-fix" ART task.
+
+This file purposefully contains **no** ART specific code so that it can be
+imported both by the rollout script *and* any potential evaluation utilities
+without pulling heavyweight dependencies.
+
+Key design goals:
+1. Keep hyper-parameters clearly visible at the top for quick iteration.
+2. Provide a small pool of noisy product reviews with ground-truth fixes.
+3. Offer lightweight helpers for sampling an episode and computing rewards.
+4. Avoid non-stdlib dependencies – difflib gives us a decent similarity score.
+"""
+
+from __future__ import annotations
+
+import random
+import difflib
+from typing import Tuple, Dict, Any
+
+# ---------------------------------------------------------------------------
+# Tuning knobs & training configuration.
+# ---------------------------------------------------------------------------
+
+RANDOM_SEED: int = 42
+
+# Core ART training hyper-parameters – tweak freely.
+TRAINING_CONFIG: Dict[str, Any] = {
+    "project": "typo-fix",
+    "model_name": "agent-typo",
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "steps": 50,
+    "trajectories_per_group": 24,
+    "groups_per_step": 1,
+    "learning_rate": 5e-5,
+    "max_completion_tokens": 128,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_exceptions": 24,
+    # Keep the most recent checkpoint only – matches 2048 example.
+    "cleanup_keep_last": 1,
+}
+
+# ---------------------------------------------------------------------------
+# Episode data.
+# ---------------------------------------------------------------------------
+
+_SAMPLE_REVIEWS = [
+    {
+        "noisy": "Thiss product is amazng! I realy love the colour and the quility.",
+        "correct": "This product is amazing! I really love the colour and the quality.",
+        "difficulty": 0.4,
+    },
+    {
+        "noisy": "The battrey life isnt good, it dies after twoo hours of use.",
+        "correct": "The battery life isn't good; it dies after two hours of use.",
+        "difficulty": 0.5,
+    },
+    {
+        "noisy": "Package arived late and the box was dammaged.",
+        "correct": "Package arrived late and the box was damaged.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "I hav never been more dissapointed in a purchase.",
+        "correct": "I have never been more disappointed in a purchase.",
+        "difficulty": 0.6,
+    },
+    {
+        "noisy": "Excelent camera qualty but the screen scratches to easilly.",
+        "correct": "Excellent camera quality but the screen scratches too easily.",
+        "difficulty": 0.7,
+    },
+    {
+        "noisy": "Sound is clear, but the earbuds fall outa my ears.",
+        "correct": "Sound is clear, but the earbuds fall out of my ears.",
+        "difficulty": 0.4,
+    },
+    {
+        "noisy": "Greta price for what you get. Definately recomended!",
+        "correct": "Great price for what you get. Definitely recommended!",
+        "difficulty": 0.2,
+    },
+    {
+        "noisy": "Dont waist your money, it broke after one weak.",
+        "correct": "Don't waste your money; it broke after one week.",
+        "difficulty": 0.5,
+    },
+    {
+        "noisy": "Colour looks differant than in the advertisment.",
+        "correct": "Colour looks different than in the advertisement.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "Fast delivary and grate custumer servise.",
+        "correct": "Fast delivery and great customer service.",
+        "difficulty": 0.3,
+    },
+    {
+        "noisy": "The instrutions where confusing and mispelled.",
+        "correct": "The instructions were confusing and misspelled.",
+        "difficulty": 0.6,
+    },
+    {
+        "noisy": "I'm verry happy with this purchace so far.",
+        "correct": "I'm very happy with this purchase so far.",
+        "difficulty": 0.2,
+    },
+    {
+        "noisy": "It stoped working after the recent update, pleas fix!",
+        "correct": "It stopped working after the recent update; please fix!",
+        "difficulty": 0.7,
+    },
+]
+
+# Make behaviour deterministic when needed.
+random.seed(RANDOM_SEED)
+
+
+# ---------------------------------------------------------------------------
+# Public helpers.
+# ---------------------------------------------------------------------------
+
+
+def sample_episode() -> Tuple[str, str, float, int]:
+    """Return *(noisy, correct, difficulty, review_id)* for a single episode."""
+
+    review_id = random.randrange(len(_SAMPLE_REVIEWS))
+    review = _SAMPLE_REVIEWS[review_id]
+    return review["noisy"], review["correct"], review["difficulty"], review_id
+
+
+def compute_reward(predicted: str, target: str) -> float:
+    """Compute a smooth reward based on string similarity.
+
+    We use :pyclass:`difflib.SequenceMatcher` to obtain a ratio in ``[0,1]`` and
+    then linearly map it to ``[-1, 1]`` so that *perfect* corrections receive
+    ``+1`` while completely unrelated outputs approach ``-1``.
+    """
+
+    matcher = difflib.SequenceMatcher(None, predicted.strip(), target.strip())
+    similarity = matcher.ratio()  # 0 → 1
+    return (2.0 * similarity) - 1.0
+
+
+def is_valid_output(predicted: str) -> bool:
+    """Validation guard – ensure the model returns *something* printable.
+
+    - Output must be non-empty and not exceed 3× target length (defensive).
+    - We intentionally allow minor punctuation differences; reward handles that.
+    """
+
+    predicted = predicted.strip()
+    return bool(predicted) and len(predicted) < 1024
+
+
+# Export symbols that other modules are expected to import.
+__all__ = [
+    "RANDOM_SEED",
+    "TRAINING_CONFIG",
+    "sample_episode",
+    "compute_reward",
+    "is_valid_output",
+]
+```
+
+rollout.py:
+```python
+"""ART rollout logic for the *typo-fix* task.
+
+This file mirrors the style of the 2048 reference implementation while being
+considerably simpler – each episode only contains **one** user turn. The agent
+receives a typo-ridden product review and must respond **only** with the fully
+corrected version.
+
+Reward shaping uses Levenshtein-style similarity (via ``difflib``) to provide a
+smooth signal between ``-1`` and ``+1`` so that partially-correct fixes still
+contribute to learning.
+"""
+
+from __future__ import annotations
+
+import requests
+from openai import AsyncOpenAI
+import art
+import weave
+
+from typing import Any
+
+from env import (
+    sample_episode,
+    compute_reward,
+    is_valid_output,
+)
+
+
+class ScenarioTypos(art.TypedDict):  # type: ignore[misc]
+    """Minimal scenario container so that different training steps can be traced."""
+
+    step: int
+
+
+# ---------------------------------------------------------------------------
+# Rollout definition.
+# ---------------------------------------------------------------------------
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(
+    model: art.Model, step: int, config: dict[str, Any]  # noqa: D401 – ART signature
+) -> art.Trajectory:
+    """Generate a single trajectory for the *typo-fix* environment."""
+
+    # ---------------------------------------------------------------------
+    # Episode setup.
+    # ---------------------------------------------------------------------
+    noisy_review, correct_review, difficulty, review_id = sample_episode()
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert proof-reader. Given a customer review that "
+                    "may contain typos or grammar mistakes, respond with the fully "
+                    "corrected review. Respond with *plain text only* – no extra "
+                    "comments, no markdown, no explanations. The output must be "
+                    "identical to the corrected version, including punctuation."
+                ),
+            }
+        ],
+        metadata={
+            "review_id": float(review_id),  # scalar for aggregation
+            "difficulty": difficulty,
+            "step": float(step),
+        },
+        reward=0.0,
+    )
+
+    # Add user turn with the noisy text.
+    trajectory.messages_and_choices.append({"role": "user", "content": noisy_review})
+
+    # ------------------------------------------------------------------
+    # Model inference.
+    # ------------------------------------------------------------------
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    chat_completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        max_completion_tokens=config.get("max_completion_tokens", 128),
+        temperature=config.get("temperature", 0.7),
+        top_p=config.get("top_p", 0.9),
+        stream=False,
+    )
+
+    choice = chat_completion.choices[0]
+    content = choice.message.content or ""
+    trajectory.messages_and_choices.append(choice)
+
+    # ------------------------------------------------------------------
+    # Validation & reward.
+    # ------------------------------------------------------------------
+    is_valid = is_valid_output(content)
+    trajectory.metrics["invalid_output"] = 0.0 if is_valid else 1.0
+
+    if not is_valid:
+        trajectory.reward = -1.0
+        return trajectory
+
+    similarity_reward = compute_reward(content, correct_review)
+
+    # Emphasise perfect corrections while still learning from partial ones.
+    trajectory.reward = similarity_reward
+
+    # Additional metrics for analysis (all scalars).
+    trajectory.metrics["similarity"] = similarity_reward
+
+    return trajectory
+
+
+# Re-export for ART's dynamic import pattern.
+__all__ = ["rollout"]
+```
+
+[2025-09-21T20:23:11] codex
+
+Writing the rubric score JSON to the requested path.
+[2025-09-21T20:23:20] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Reward signal does not just compare for exact match, but uses similarity (difflib/Levenshtein-style).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "compute_reward uses difflib.SequenceMatcher.ratio mapped to [-1,1]; rollout explicitly frames it as Levenshtein-style similarity."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "_SAMPLE_REVIEWS contains 13 review pairs, exceeding the threshold."
+    },
+    {
+      "description": "Examples are varied, not just one overwhelming error repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Dataset includes diverse misspellings, punctuation fixes, grammar (apostrophes, homophones, plurals), and spacing variations across many words and structures."
+    },
+    {
+      "description": "Reward function is smooth with partial credit for near-correct outputs.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Similarity ratio provides continuous scoring; mapping to [-1,1] ensures incremental reward even when not exact."
+    },
+    {
+      "description": "Environment stays on product reviews topic and includes difficulty labels.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "All items are customer reviews; each example has a 'difficulty' float and rollout propagates it in trajectory metadata."
+    }
+  ],
+  "notes": "Solid, lightweight setup: deterministic sampling, smooth reward via difflib, varied review typos, and difficulty metadata. Minor nit: is_valid_output docstring mentions 3× target length but implementation uses a fixed 1024-char cap; otherwise aligns with rubric well."
+}
+
+[2025-09-21T20:23:20] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+[2025-09-21T20:23:20] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c02a992ab95ddd10c005dd4b24e26ff6104f700f
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,37 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward signal does not just compare for exact match, but uses similarity (difflib/Levenshtein-style).",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "compute_reward uses difflib.SequenceMatcher.ratio mapped to [-1,1]; rollout explicitly frames it as Levenshtein-style similarity."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "_SAMPLE_REVIEWS contains 13 review pairs, exceeding the threshold."
++    },
++    {
++      "description": "Examples are varied, not just one overwhelming error repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Dataset includes diverse misspellings, punctuation fixes, grammar (apostrophes, homophones, plurals), and spacing variations across many words and structures."
++    },
++    {
++      "description": "Reward function is smooth with partial credit for near-correct outputs.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Similarity ratio provides continuous scoring; mapping to [-1,1] ensures incremental reward even when not exact."
++    },
++    {
++      "description": "Environment stays on product reviews topic and includes difficulty labels.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "All items are customer reviews; each example has a 'difficulty' float and rollout propagates it in trajectory metadata."
++    }
++  ],
++  "notes": "Solid, lightweight setup: deterministic sampling, smooth reward via difflib, varied review typos, and difficulty metadata. Minor nit: is_valid_output docstring mentions 3× target length but implementation uses a fixed 1024-char cap; otherwise aligns with rubric well."
++}
++
+
+[2025-09-21T20:23:20] tokens used: 4,641
+[2025-09-21T20:23:20] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c02a992ab95ddd10c005dd4b24e26ff6104f700f
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,37 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward signal does not just compare for exact match, but uses similarity (difflib/Levenshtein-style).",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "compute_reward uses difflib.SequenceMatcher.ratio mapped to [-1,1]; rollout explicitly frames it as Levenshtein-style similarity."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "_SAMPLE_REVIEWS contains 13 review pairs, exceeding the threshold."
++    },
++    {
++      "description": "Examples are varied, not just one overwhelming error repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Dataset includes diverse misspellings, punctuation fixes, grammar (apostrophes, homophones, plurals), and spacing variations across many words and structures."
++    },
++    {
++      "description": "Reward function is smooth with partial credit for near-correct outputs.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Similarity ratio provides continuous scoring; mapping to [-1,1] ensures incremental reward even when not exact."
++    },
++    {
++      "description": "Environment stays on product reviews topic and includes difficulty labels.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "All items are customer reviews; each example has a 'difficulty' float and rollout propagates it in trajectory metadata."
++    }
++  ],
++  "notes": "Solid, lightweight setup: deterministic sampling, smooth reward via difflib, varied review typos, and difficulty metadata. Minor nit: is_valid_output docstring mentions 3× target length but implementation uses a fixed 1024-char cap; otherwise aligns with rubric well."
++}
++
+
+[2025-09-21T20:23:21] codex
+
+DONE
+[2025-09-21T20:23:21] tokens used: 5,379
+[2025-09-21T20:23:21] turn diff:
+diff --git a/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c02a992ab95ddd10c005dd4b24e26ff6104f700f
+--- /dev/null
++++ b/codex_runs/typo_correction/o3/20250921_024112/rubric_score.json
+@@ -0,0 +1,37 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward signal does not just compare for exact match, but uses similarity (difflib/Levenshtein-style).",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "compute_reward uses difflib.SequenceMatcher.ratio mapped to [-1,1]; rollout explicitly frames it as Levenshtein-style similarity."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "_SAMPLE_REVIEWS contains 13 review pairs, exceeding the threshold."
++    },
++    {
++      "description": "Examples are varied, not just one overwhelming error repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Dataset includes diverse misspellings, punctuation fixes, grammar (apostrophes, homophones, plurals), and spacing variations across many words and structures."
++    },
++    {
++      "description": "Reward function is smooth with partial credit for near-correct outputs.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Similarity ratio provides continuous scoring; mapping to [-1,1] ensures incremental reward even when not exact."
++    },
++    {
++      "description": "Environment stays on product reviews topic and includes difficulty labels.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "All items are customer reviews; each example has a 'difficulty' float and rollout propagates it in trajectory metadata."
++    }
++  ],
++  "notes": "Solid, lightweight setup: deterministic sampling, smooth reward via difflib, varied review typos, and difficulty metadata. Minor nit: is_valid_output docstring mentions 3× target length but implementation uses a fixed 1024-char cap; otherwise aligns with rubric well."
++}
++

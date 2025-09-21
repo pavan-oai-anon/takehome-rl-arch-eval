@@ -1,0 +1,36 @@
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward combines smooth closeness with an explicit +0.3 exact-match bonus and a formatting penalty, clearly separating exact, near-miss, and larger deviations (see rollout: closeness, exact bonus, penalty)."
+    },
+    {
+      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Keyword coverage via extract_keywords and coverage_score contributes 0.3 weight to reward and is recorded as a metric."
+    },
+    {
+      "description": "Prompt themes are varied, and not just one theme repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reference tasks include 14 distinct, diverse themes (e.g., haunted lighthouse, cyberpunk heist, underwater library)."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "There are 14 ReferenceTask entries in the seed set."
+    },
+    {
+      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "validate_story() strips whitespace and rejects code fences/JSON/XML-like markup, influencing reward via a -0.5 penalty; prompts also instruct plain text only."
+    }
+  ],
+  "notes": "Design is robust: deterministic task selection, few-shot examples, clear reward shaping with exact-count bonus and theme coverage, and basic formatting validation. Minor note: newlines are allowed (flagged as 'newline') and whitespace stripping happens in validation rather than the counter, but token-based counting makes this inconsequential."
+}

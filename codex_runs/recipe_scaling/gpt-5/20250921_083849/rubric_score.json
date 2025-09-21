@@ -1,0 +1,37 @@
+{
+  "total_points": 6.0,
+  "criteria": [
+    {
+      "description": "Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.",
+      "max_points": 2,
+      "awarded_points": 1.5,
+      "justification": "Validation computes expected scaled quantities and percent errors, flags omissions, and canonicalizes units while counting mismatches. However, duplicates of the same ingredient name are not detected (mapping coalesces keys), and unit mismatches are tracked but not enforced in reward."
+    },
+    {
+      "description": "Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).",
+      "max_points": 2,
+      "awarded_points": 1.5,
+      "justification": "Exact match yields +1 (with <0.5% tolerance) and near match <5% yields +0.5 before shaping; parse errors and missing ingredients are -1. Extra ingredients incur only small deductions (not -1), and shaping can raise near-match above 0.5, so it partially but not fully matches the spec."
+    },
+    {
+      "description": "Examples seeded in the environment are a variety of different scaling tasks (upscale, downscale, fractional-serving, etc)",
+      "max_points": 2,
+      "awarded_points": 1.0,
+      "justification": "Targets cover upscaling and downscaling via a fixed integer set; fractional servings are not used."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0.0,
+      "justification": "Only three base recipes are provided; there is no seeded set exceeding ten distinct examples."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 2.0,
+      "justification": "Shaping adds a graded bonus based on mean percentage error and small penalties for extras, producing smooth rewards within [-1, 1]."
+    }
+  ],
+  "notes": "Overall, the environment is well-structured with clear prompts and defensive parsing. Validation captures omissions and percent errors and tracks unit mismatches, but does not detect duplicate ingredients and does not enforce unit consistency in reward. The reward logic cleanly distinguishes exact/near matches and handles parse/missing errors at -1, with additional smooth shaping; however, extra ingredients are not a hard failure. Example coverage is limited to three base recipes and integer target servings."
+}
+

@@ -1,0 +1,37 @@
+{
+  "total_points": 4,
+  "criteria": [
+    {
+      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Continuous reward via 1 - diff/target yields 1.0 for exact matches and smaller penalties for off-by-one and larger misses, but it is not tiered and does not document specific off-by-one values. See env.py: word_count_reward."
+    },
+    {
+      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No theme adherence verification; only the theme string is stored in metadata. Reward and metrics ignore whether the story matches the theme."
+    },
+    {
+      "description": "Prompt themes are varied, and not just one theme repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Seed scenarios cover diverse themes (e.g., haunted library, cyberpunk market, interstellar coffee shop, dragon diplomacy). See env.py: _SEED_SCENARIOS."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Exactly 10 seed scenarios are provided, not more than 10."
+    },
+    {
+      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "count_words strips whitespace before splitting, but no sanitizer enforces plain-text or removes markup; only a system prompt asks for plain text. See env.py: count_words and rollout.py: system_prompt."
+    }
+  ],
+  "notes": "Environment is deterministic and includes shaped rewards and useful metrics (word_diff, invalid_solution). However, it lacks theme adherence checks, plain-text enforcement, and >10 seed scenarios. Reward is continuous rather than tiered."
+}
+
