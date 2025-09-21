@@ -169,6 +169,11 @@ async def setup_model(
 
     random.seed(random_seed)
 
+    sanitized_name = re.sub(r"[^A-Za-z0-9_-]+", "_", config.model_name)
+    if not sanitized_name:
+        sanitized_name = f"model-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    config.model_name = sanitized_name
+
     model = art.TrainableModel(
         name=config.model_name,
         project=config.project,
@@ -418,6 +423,17 @@ async def main() -> None:
         training_config, rollout_config = resolve_training_config(env_module)
         apply_overrides(training_config, args)
 
+        try:
+            relative_path = task_dir.relative_to(Path.cwd())
+        except ValueError:
+            relative_path = task_dir
+        relevant_parts = relative_path.parts[-3:] if len(relative_path.parts) >= 3 else relative_path.parts
+        project_component = relevant_parts[0] if relevant_parts else task_dir.name
+        project_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", project_component)
+        if not project_slug:
+            project_slug = "project"
+        training_config.project = project_slug
+
         rollout_config = {**training_config.as_dict(), **training_config.extra}
 
         rollout_fn = getattr(rollout_module, "rollout", None)
@@ -471,7 +487,6 @@ async def main() -> None:
                 sanitized_name = datetime.now().strftime("run-%Y%m%d-%H%M%S")
 
             task.config.model_name = sanitized_name
-            task.rollout_config["model_name"] = sanitized_name
 
             model, weave_enabled = await setup_model(
                 task.config,
@@ -479,6 +494,8 @@ async def main() -> None:
                 task_dir=task.task_dir,
                 random_seed=task.random_seed,
             )
+
+            task.rollout_config["model_name"] = task.config.model_name
 
             await run_training(
                 model,
