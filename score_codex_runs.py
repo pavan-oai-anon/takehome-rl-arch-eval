@@ -4,37 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-PROMPT_TEMPLATE = """You are an automated reviewer scoring an OpenPipe ART environment.
-Evaluate the provided files using the rubric and return JSON only.
-
-Rubric (10 points total):
-{rubric}
-
-Project run: {run_path}
-
-Respond with a JSON object containing:
-- "total_points": number (0-10).
-- "criteria": list of objects with keys "description", "max_points", "awarded_points", "justification".
-- "notes": short string.
-
-Do not include any markdown fences, prose, or explanations outside the JSON.
-
-env.py:
-```python
-{env_code}
-```
-
-rollout.py:
-```python
-{rollout_code}
-```
-"""
+PROMPT_TEMPLATE = """You are an automated reviewer scoring an OpenPipe ART environment.\nEvaluate the provided files using the rubric and then WRITE the score JSON to\n{score_path}.json. Use this structure exactly:\n{{\n  \"total_points\": <number>,\n  \"criteria\": [{{\"description\": \"...\", \"max_points\": <number>, \"awarded_points\": <number>, \"justification\": \"...\"}}, ...],\n  \"notes\": \"...\"\n}}\nAfter writing the file, output ONLY the text DONE so the caller knows you finished.\n\nRubric (10 points total):\n{rubric}\n\nProject run: {run_path}\n\nenv.py:\n```python\n{env_code}\n```\n\nrollout.py:\n```python\n{rollout_code}\n```\n"""
 
 
 def find_run_directories(root: Path) -> list[Path]:
@@ -49,8 +24,9 @@ def load_text(path: Path) -> str:
     return path.read_text().strip()
 
 
-def build_prompt(run_path: Path, rubric_text: str, env_code: str, rollout_code: str) -> str:
+def build_prompt(run_path: Path, score_stub: Path, rubric_text: str, env_code: str, rollout_code: str) -> str:
     return PROMPT_TEMPLATE.format(
+        score_path=score_stub,
         rubric=rubric_text.strip(),
         run_path=str(run_path),
         env_code=env_code.strip(),
@@ -75,11 +51,10 @@ def call_codex(prompt: str, model: str) -> str:
     return result.stdout.strip()
 
 
-def extract_json(text: str) -> Any:
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in Codex output")
-    return json.loads(match.group(0))
+def verify_score_file(score_file: Path) -> Any:
+    if not score_file.exists():
+        raise FileNotFoundError(f"Codex did not create {score_file}")
+    return json.loads(score_file.read_text())
 
 
 def score_run(root: Path, run_path: Path, rubric_root: Path, model: str, overwrite: bool) -> None:
@@ -89,32 +64,36 @@ def score_run(root: Path, run_path: Path, rubric_root: Path, model: str, overwri
         task_name = parts[0] if parts else run_path.name
     except ValueError:
         task_name = run_path.name
+
     rubric_path = rubric_root / f"{task_name}.txt_rubric"
     if not rubric_path.exists():
         print(f"[skip] No rubric for task '{task_name}' (expected {rubric_path})")
         return
 
-    score_path = run_path / "rubric_score.json"
+    score_file = run_path / "rubric_score.json"
     raw_path = run_path / "rubric_score_raw.txt"
-    if score_path.exists() and not overwrite:
+    score_stub = score_file.with_suffix("")
+    if score_file.exists() and not overwrite:
         print(f"[skip] Score already exists for {run_path}")
         return
+    if score_file.exists():
+        score_file.unlink()
 
     env_code = load_text(run_path / "env.py")
     rollout_code = load_text(run_path / "rollout.py")
     rubric_text = load_text(rubric_path)
 
-    prompt = build_prompt(run_path, rubric_text, env_code, rollout_code)
+    prompt = build_prompt(run_path, score_stub, rubric_text, env_code, rollout_code)
+    raw_output = ""
     try:
         raw_output = call_codex(prompt, model)
-        data = extract_json(raw_output)
+        raw_path.write_text(raw_output)
+        data = verify_score_file(score_file)
     except Exception as exc:
         print(f"[error] {run_path}: {exc}")
-        raw_path.write_text(str(exc))
+        raw_path.write_text(f"ERROR: {exc}\n\nOUTPUT:\n{raw_output}")
         return
 
-    raw_path.write_text(raw_output)
-    score_path.write_text(json.dumps(data, indent=2))
     print(f"[ok] Scored {run_path}: {data.get('total_points')}")
 
 
