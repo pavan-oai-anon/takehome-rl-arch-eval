@@ -25,9 +25,10 @@ class EvaluationPlan:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a PEFT model using GPT-5 generated tests")
     parser.add_argument(
-        "model_path",
+        "model_paths",
+        nargs="+",
         help=(
-            "Path to the PEFT model checkpoint directory or a Codex run folder (e.g. codex_runs/task/model/timestamp)"
+            "One or more PEFT checkpoint directories or Codex run folders (e.g. codex_runs/task/model/timestamp)."
         ),
     )
     parser.add_argument(
@@ -280,80 +281,119 @@ def determine_output_path(run_input: Path, explicit_output: str | None) -> Path:
 
 def main() -> None:
     args = parse_args()
-    input_path = Path(args.model_path).resolve()
+    input_paths = [Path(p).resolve() for p in args.model_paths]
+    for input_path in input_paths:
+        if not input_path.exists():
+            raise FileNotFoundError(f"Model path {input_path} does not exist")
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Model path {input_path} does not exist")
+    resolved_models: list[tuple[Path, str, Path]] = []
 
-    model_path, task_name = resolve_model_checkpoint(input_path)
+    first_task = None
+    for input_path in input_paths:
+        model_path, task_name = resolve_model_checkpoint(input_path)
+        if first_task is None:
+            first_task = task_name
+        elif task_name != first_task:
+            raise ValueError(
+                f"All models must target the same task. Expected '{first_task}', found '{task_name}' for {input_path}."
+            )
+        user_prompt_path = Path("user_prompts") / f"{task_name}.txt"
+        if not user_prompt_path.exists():
+            raise FileNotFoundError(f"User prompt {user_prompt_path} not found for inferred task '{task_name}'")
+        output_path = determine_output_path(input_path, args.output)
+        resolved_models.append((model_path, task_name, output_path))
+
+    if not resolved_models:
+        raise RuntimeError("No models resolved for evaluation")
+
+    task_name = resolved_models[0][1]
+    user_prompt_path = Path("user_prompts") / f"{task_name}.txt"
+    user_prompt = load_user_prompt(user_prompt_path)
     user_prompt_path = Path("user_prompts") / f"{task_name}.txt"
     if not user_prompt_path.exists():
         raise FileNotFoundError(f"User prompt {user_prompt_path} not found for inferred task '{task_name}'")
 
-    output_path = determine_output_path(input_path, args.output)
-
-    user_prompt = load_user_prompt(user_prompt_path)
     client = OpenAI()
 
-    peft_model, tokenizer, device = load_peft_model(model_path)
+    peft_models = [load_peft_model(model_path) for model_path, _, _ in resolved_models]
 
-    runs: list[dict[str, Any]] = []
-
+    shared_runs: list[dict[str, Any]] = []
     for run_idx in range(1, args.runs + 1):
         plan = request_evaluation_plan(client, args.gpt5_model, user_prompt)
-        model_response = generate_with_model(
-            peft_model,
-            tokenizer,
-            device,
-            plan.system_message,
-            plan.user_message,
-            args.max_new_tokens,
-            args.temperature,
-            args.top_p,
-        )
-        evaluation = evaluate_with_code_interpreter(
-            client,
-            args.evaluator_model,
-            plan,
-            model_response,
-        )
-        runs.append(
-            {
-                "plan": plan.__dict__,
-                "model_response": model_response,
-                "evaluation": evaluation,
-            }
-        )
+        run_entry = {"plan": plan.__dict__, "models": []}
+
+        for (model_path, _task, output_path), (peft_model, tokenizer, device) in zip(
+            resolved_models, peft_models
+        ):
+            model_response = generate_with_model(
+                peft_model,
+                tokenizer,
+                device,
+                plan.system_message,
+                plan.user_message,
+                args.max_new_tokens,
+                args.temperature,
+                args.top_p,
+            )
+            evaluation = evaluate_with_code_interpreter(
+                client,
+                args.evaluator_model,
+                plan,
+                model_response,
+            )
+
+            run_entry["models"].append(
+                {
+                    "model_path": str(model_path),
+                    "output_path": str(output_path),
+                    "model_response": model_response,
+                    "evaluation": evaluation,
+                }
+            )
+            print(
+                f"Run {run_idx}/{args.runs} | {model_path.name}: score={evaluation.get('score')} passed={evaluation.get('passed')}"
+            )
+
+        shared_runs.append(run_entry)
+
+    aggregate_reports = []
+    for (model_path, _task, output_path) in resolved_models:
+        model_entries = []
+        for run in shared_runs:
+            for model_entry in run["models"]:
+                if model_entry["model_path"] == str(model_path):
+                    entry = {
+                        "plan": run["plan"],
+                        "model_response": model_entry["model_response"],
+                        "evaluation": model_entry["evaluation"],
+                    }
+                    model_entries.append(entry)
+
+        scores = [float(entry["evaluation"].get("score", 0.0)) for entry in model_entries]
+        passes = [bool(entry["evaluation"].get("passed", False)) for entry in model_entries]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        pass_rate = sum(passes) / len(passes) if passes else 0.0
+        max_score = max(scores) if scores else 0.0
+        min_score = min(scores) if scores else 0.0
+
+        summary = {
+            "task": task_name,
+            "model_path": str(model_path),
+            "user_prompt_path": str(user_prompt_path),
+            "runs": model_entries,
+            "aggregate": {
+                "runs": len(model_entries),
+                "average_score": avg_score,
+                "pass_rate": pass_rate,
+                "max_score": max_score,
+                "min_score": min_score,
+            },
+        }
+
+        Path(output_path).write_text(json.dumps(summary, indent=2))
         print(
-            f"Run {run_idx}/{args.runs}: score={evaluation.get('score')} passed={evaluation.get('passed')}"
+            f"Evaluation written to {output_path} | avg_score={avg_score:.3f} | pass_rate={pass_rate:.2%}"
         )
-
-    scores = [float(run["evaluation"].get("score", 0.0)) for run in runs]
-    passes = [bool(run["evaluation"].get("passed", False)) for run in runs]
-
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    pass_rate = sum(passes) / len(passes) if passes else 0.0
-    max_score = max(scores) if scores else 0.0
-    min_score = min(scores) if scores else 0.0
-
-    summary = {
-        "task": task_name,
-        "model_path": str(model_path),
-        "user_prompt_path": str(user_prompt_path),
-        "runs": runs,
-        "aggregate": {
-            "runs": len(runs),
-            "average_score": avg_score,
-            "pass_rate": pass_rate,
-            "max_score": max_score,
-            "min_score": min_score,
-        },
-    }
-
-    output_path.write_text(json.dumps(summary, indent=2))
-    print(
-        f"Evaluation written to {output_path} | avg_score={avg_score:.3f} | pass_rate={pass_rate:.2%}"
-    )
 
 
 if __name__ == "__main__":
