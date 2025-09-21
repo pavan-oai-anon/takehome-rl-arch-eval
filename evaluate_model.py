@@ -198,36 +198,66 @@ def evaluate_with_code_interpreter(
 
 
 def resolve_model_checkpoint(model_input: Path) -> Path:
-    if (model_input / "config.json").exists():  # assume direct checkpoint directory
+    if (model_input / "config.json").exists():  # direct checkpoint directory
         return model_input
 
-    # Assume codex run folder codex_runs/task/model/timestamp
-    if len(model_input.parts) >= 4 and model_input.parents[0].name == "codex_runs":
-        task = model_input.parts[-3]
-        model_name = model_input.parts[-2]
-        timestamp = model_input.parts[-1]
-    elif len(model_input.parts) >= 3:
-        task, model_name, timestamp = model_input.parts[-3:]
+    run_parts = model_input.parts
+    # Expect codex_runs/<task>/<model>/<run_timestamp>
+    if len(run_parts) >= 4 and run_parts[0] == "codex_runs":
+        task = run_parts[1]
+        requested_model = run_parts[2]
+        run_timestamp = run_parts[3]
+    elif len(run_parts) >= 3:
+        task, requested_model, run_timestamp = run_parts[-3:]
     else:
         raise ValueError(
             f"Cannot infer task/model/timestamp from path {model_input}. Provide a checkpoint directory or codex run path."
         )
 
     art_root = Path(".art")
-    checkpoint_dir = art_root / task / "models" / model_name / "checkpoints"
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} not found")
+    models_root = art_root / task / "models"
+    if not models_root.exists():
+        raise FileNotFoundError(f"Models directory {models_root} not found")
 
-    target = checkpoint_dir / timestamp
-    if target.exists():
-        return target
+    # Select best matching model directory
+    candidates = [d for d in models_root.iterdir() if d.is_dir()]
+    if not candidates:
+        raise FileNotFoundError(f"No model directories found under {models_root}")
 
-    # if timestamp not found, pick the latest numeric subdirectory
-    checkpoints = sorted([p for p in checkpoint_dir.iterdir() if p.is_dir()], reverse=True)
+    prioritized: list[Path] = []
+    if run_timestamp:
+        prioritized.extend([d for d in candidates if run_timestamp in d.name])
+    if not prioritized and requested_model:
+        prioritized.extend([d for d in candidates if requested_model in d.name])
+    if not prioritized:
+        prioritized = candidates
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered = []
+    for d in prioritized:
+        if d not in seen:
+            ordered.append(d)
+            seen.add(d)
+
+    chosen_model_dir = ordered[0]
+
+    checkpoint_root = chosen_model_dir / "checkpoints"
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Checkpoint directory {checkpoint_root} not found")
+
+    # Determine specific checkpoint folder
+    checkpoints = sorted(
+        [p for p in checkpoint_root.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
     if not checkpoints:
-        raise FileNotFoundError(f"No checkpoints found under {checkpoint_dir}")
+        raise FileNotFoundError(f"No checkpoints found under {checkpoint_root}")
 
-    return checkpoints[0]
+    checkpoint_dir = checkpoints[0]
+
+    return checkpoint_dir
 
 
 def determine_output_path(run_input: Path, explicit_output: str | None) -> Path:
