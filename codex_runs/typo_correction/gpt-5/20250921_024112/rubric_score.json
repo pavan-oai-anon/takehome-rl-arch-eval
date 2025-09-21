@@ -1,0 +1,36 @@
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Reward uses more than exact match (e.g., Levenshtein).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "compute_metrics_and_reward blends character- and word-level normalized edit distances computed via a custom Levenshtein implementation, not just exact string equality."
+    },
+    {
+      "description": "More than 10 seeded examples.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "DATASET contains 20 ReviewExample entries (r01–r20)."
+    },
+    {
+      "description": "Examples are varied, not one repeated error.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Covers diverse spelling and grammar issues (misspellings, contractions, agreement, punctuation/sentence split, hyphenation) across many distinct phrases; not a single template."
+    },
+    {
+      "description": "Smooth reward with partial credit.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward is a weighted mix of accuracies (0.7*char + 0.3*word), with exact-match bonus and format penalties, yielding graded partial credit rather than binary outcomes."
+    },
+    {
+      "description": "On-topic reviews with difficulty labels.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "All samples are short product reviews with typo/grammar fixes; each has a difficulty label (easy/medium/hard) surfaced in prompts and metadata via difficulty_code."
+    }
+  ],
+  "notes": "Well-scoped environment for review typo correction: deterministic example selection, canonicalization for robust comparison, strict formatting validation, and a shaped reward using normalized Levenshtein distances. Dataset spans 20 varied examples with difficulty labels."
+}

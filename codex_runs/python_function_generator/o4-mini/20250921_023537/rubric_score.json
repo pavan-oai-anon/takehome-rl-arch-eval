@@ -1,0 +1,11 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {"description": "AST-based validator checks syntax and exact signature (name, params, return type) before scoring.", "max_points": 2, "awarded_points": 1, "justification": "Uses ast.parse and validates function name and parameter names, but does not check return type annotations."},
+    {"description": "Reward structure differentiates between syntax errors, signature mismatches, logic failures, and full success.", "max_points": 2, "awarded_points": 2, "justification": "Sets distinct metadata/metrics for syntax and signature issues and assigns zero reward; logic failures reduce reward via test-based pass rate; full success yields 1.0."},
+    {"description": "Automatic unit tests or assertions run per prompt, feeding pass/fail results into rewards. The environment should actually run the function and check to see if it is correct and compare it to the golden implementation.", "max_points": 2, "awarded_points": 1, "justification": "Executes the generated function and checks against expected outputs from test cases, but does not compare behavior directly to the golden implementation despite loading it."},
+    {"description": "Environment enforces docstring/type hint requirements when specified, with clear penalties when missing.", "max_points": 2, "awarded_points": 0, "justification": "Does not enforce presence of the specified docstring or any type hints; no penalties are applied for missing them."},
+    {"description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.", "max_points": 2, "awarded_points": 2, "justification": "Reward equals test pass rate in [0,1], providing graded partial credit."}
+  ],
+  "notes": "Overall, the environment cleanly validates syntax and signature (excluding return type) and uses per-scenario tests to compute a smooth reward. It distinguishes failure modes via metadata/metrics. It does not enforce docstring/type hints and does not compare generated behavior directly to the golden function."
+}

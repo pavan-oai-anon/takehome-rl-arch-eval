@@ -1,0 +1,37 @@
+{
+  "total_points": 4,
+  "criteria": [
+    {
+      "description": "Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Checks missing/extra ingredients and proportional quantities via avg relative error, but does not validate units or detect duplicate ingredients."
+    },
+    {
+      "description": "Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Implements exact (1.0), near (<5% -> 0.5), and penalties (-1) for invalid JSON or missing/extra ingredients."
+    },
+    {
+      "description": "Examples seeded in the environment are a variety of different scaling tasks (upscale, downscale, fractional-serving, etc)",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Only one base recipe present and no seeded example set demonstrating varied target servings."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No seeded examples list; environment has a single recipe."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Provides partial credit at <5% error (0.5), but jumps to -1 beyond that; not fully smooth."
+    }
+  ],
+  "notes": "Validator lacks unit checks and duplicate detection. Reward tiers match rubric thresholds but are coarse. Environment does not include a diverse or large set of seeded examples; only a single 'pancakes' recipe is defined and scenarios rely on external config."
+}
+

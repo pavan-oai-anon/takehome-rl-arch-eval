@@ -1,0 +1,583 @@
+[2025-09-21T20:07:03] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T20:07:03] User instructions:
+You are an automated reviewer scoring an OpenPipe ART environment.
+Evaluate the provided files using the rubric and then WRITE the score JSON to
+/home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523/rubric_score.json. Use this structure exactly:
+{
+  "total_points": <number>,
+  "criteria": [{"description": "...", "max_points": <number>, "awarded_points": <number>, "justification": "..."}, ...],
+  "notes": "..."
+}
+After writing the file, output ONLY the text DONE so the caller knows you finished.
+
+Rubric (10 points total):
+Rubric – 24 Arithmetic Game Environment
+
+Award points based on the quality of the environment implementation and reward shaping:
+- 2 pts: Reward function properly executes the expression and checks to see if the expression equals 24. 
+- 2 pts: Reward function makes sure that the expression uses all four digits exactly once.
+- 4 pts: Environment and prompting is setup to elicit thinking / reasoning in a <thinking> tag or some equivalent manner.
+- 1 pt: Reward function is smooth, where even if the expression is not exactly 24, there is a positive reward for being close to 24.
+- 1 pt: There is either a penatly for not following the formatting the prompt demands, or a reward for following the formatting the prompt demands.
+
+Project run: /home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523
+
+env.py:
+```python
+"""Minimal environment helpers for the arithmetic game "24" using ART.
+
+This module exposes simple utilities used by rollout.py and a tweakable
+configuration block that mirrors the ergonomics of the 2048 example.
+
+Notes:
+- Assume LocalBackend for inference/training; model memory knobs (e.g.,
+  `gpu_memory_utilization`) should be copied from the 2048 example if needed.
+- The host project supplies the training loop and evaluation entry point.
+"""
+from __future__ import annotations
+
+import ast
+import random
+import string
+from dataclasses import dataclass
+from typing import Iterable, Tuple
+
+
+# ------------------------------
+# Tunables and environment constants
+# ------------------------------
+RANDOM_SEED: int = 42
+TARGET_VALUE: int = 24
+DIGITS_PER_EPISODE: int = 4
+MIN_DIGIT: int = 1
+MAX_DIGIT: int = 9
+EPSILON: float = 1e-6  # Numeric tolerance for equality checks
+CLIPPED_ERROR: float = 24.0  # For smooth reward shaping
+EXACT_SOLUTION_REWARD: float = 2.0  # Match the "win = 2" scale from 2048
+
+
+# ------------------------------
+# Training configuration consumed by the host trainer
+# ------------------------------
+TRAINING_CONFIG: dict = {
+    # Project + model identity
+    "project": "game-24",
+    "model_name": "agent-24",
+    "base_model": "Qwen/Qwen2.5-1.5B",  # Small, fast default
+    # Trainer knobs
+    "steps": 10,
+    "trajectories_per_group": 18,
+    "groups_per_step": 1,
+    "learning_rate": 1e-5,
+    # Inference knobs
+    "max_completion_tokens": 96,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    # Fault tolerance + cleanup
+    "max_exceptions": 18,
+    "cleanup_keep_last": 1,
+}
+
+
+# ------------------------------
+# Helpers
+# ------------------------------
+
+
+def generate_episode_digits() -> Tuple[int, int, int, int]:
+    """Return 4 random digits in [MIN_DIGIT, MAX_DIGIT].
+
+    Uses Python's global RNG. Callers may seed via RANDOM_SEED if desired.
+    """
+
+    return tuple(random.randint(MIN_DIGIT, MAX_DIGIT) for _ in range(DIGITS_PER_EPISODE))  # type: ignore[return-value]
+
+
+def digits_to_string(digits: Iterable[int]) -> str:
+    """Return a compact string representation suitable for metadata.
+
+    The metadata must avoid lists/dicts for aggregation, so we serialize
+    the digits as a comma-separated string.
+    """
+
+    return ",".join(str(d) for d in digits)
+
+
+def new_episode_id(length: int = 6) -> str:
+    """Generate a short alphanumeric ID for metadata."""
+
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
+@dataclass
+class EvalResult:
+    """Container for a safely evaluated arithmetic expression.
+
+    Attributes
+    -----------
+    value: float | None
+        Numeric value if evaluation succeeded; None otherwise.
+    numbers: tuple[int, ...]
+        All integer literals encountered in the expression (in-order).
+    op_count: int
+        Number of binary operations used in the expression.
+    error: str | None
+        Human-readable error string if evaluation failed.
+    """
+
+    value: float | None
+    numbers: Tuple[int, ...]
+    op_count: int
+    error: str | None
+
+
+def _multiset_equal(a: Iterable[int], b: Iterable[int]) -> bool:
+    """Return True if two iterables contain the same elements with counts.
+
+    Implemented without importing collections.Counter to keep the file lean.
+    """
+
+    counts: dict[int, int] = {}
+    for x in a:
+        counts[x] = counts.get(x, 0) + 1
+    for x in b:
+        if x not in counts:
+            return False
+        counts[x] -= 1
+        if counts[x] == 0:
+            del counts[x]
+    return not counts
+
+
+def numbers_match_episode(numbers: Iterable[int], episode_digits: Iterable[int]) -> bool:
+    """Check that the integer literals exactly match the provided digits."""
+
+    return _multiset_equal(numbers, episode_digits)
+
+
+def safe_eval_arithmetic(expr: str) -> EvalResult:
+    """Safely evaluate a restricted arithmetic expression.
+
+    Permitted syntax: integers (0-9), binary operators +, -, *, /, and parentheses.
+    Disallows unary operators, function calls, names, and other nodes.
+    Returns a value and metadata about numbers/op count, or an error string.
+    """
+
+    try:
+        node = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:  # pragma: no cover - defensive
+        return EvalResult(value=None, numbers=(), op_count=0, error="syntax_error")
+
+    numbers: list[int] = []
+
+    def eval_node(n: ast.AST) -> float:
+        if isinstance(n, ast.Expression):
+            return eval_node(n.body)
+        if isinstance(n, ast.BinOp):
+            left = eval_node(n.left)
+            right = eval_node(n.right)
+            if isinstance(n.op, ast.Add):
+                return left + right
+            if isinstance(n.op, ast.Sub):
+                return left - right
+            if isinstance(n.op, ast.Mult):
+                return left * right
+            if isinstance(n.op, ast.Div):
+                if abs(right) <= EPSILON:
+                    raise ZeroDivisionError
+                return left / right
+            raise ValueError("unsupported_operator")
+        if isinstance(n, ast.Constant) and isinstance(n.value, int):
+            value = int(n.value)
+            if not (0 <= value <= 9):  # restrict to single digits
+                raise ValueError("non_digit_literal")
+            numbers.append(value)
+            return float(value)
+        # Parentheses are represented structurally in the AST; no explicit node.
+        raise ValueError("unsupported_syntax")
+
+    try:
+        value = eval_node(node)
+        # op_count equals (#numbers - 1) for a valid binary tree over numbers
+        op_count = max(0, len(numbers) - 1)
+        return EvalResult(value=value, numbers=tuple(numbers), op_count=op_count, error=None)
+    except ZeroDivisionError:
+        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error="division_by_zero")
+    except ValueError as exc:  # unsupported syntax, non-digit, etc.
+        return EvalResult(value=None, numbers=tuple(numbers), op_count=max(0, len(numbers) - 1), error=str(exc))
+
+
+def render_system_prompt() -> str:
+    """Concise system instructions for the policy.
+
+    Keep this short so the model has headroom for completions during training.
+    """
+
+    return (
+        "You play the arithmetic game '24'. Combine the four given digits "
+        "using +, -, *, / and parentheses to make exactly 24. Use each digit "
+        "exactly once. Return only XML like <solution>(3 * (4 + 4))</solution>."
+    )
+
+
+def render_user_prompt(d1: int, d2: int, d3: int, d4: int) -> str:
+    """User prompt describing the current episode's digits and format rules."""
+
+    return (
+        f"Digits: {d1}, {d2}, {d3}, {d4}. Rules: use each digit once, only + - * / "
+        f"and parentheses. Output a single <solution>EXPR</solution> tag with no extra text."
+    )
+```
+
+rollout.py:
+```python
+"""ART rollout for the arithmetic game "24".
+
+Implements a single-turn rollout that:
+- samples four digits
+- prompts the policy to return <solution>EXPR</solution>
+- validates and evaluates the expression safely
+- logs scalar metadata and numeric metrics
+- computes a shaped reward based on closeness to 24 and rule adherence
+"""
+from __future__ import annotations
+
+import random
+from typing import Any
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    TARGET_VALUE,
+    CLIPPED_ERROR,
+    EXACT_SOLUTION_REWARD,
+    EPSILON,
+    digits_to_string,
+    generate_episode_digits,
+    new_episode_id,
+    numbers_match_episode,
+    render_system_prompt,
+    render_user_prompt,
+    safe_eval_arithmetic,
+)
+
+
+def _smooth_reward(abs_error: float, used_all_digits: bool) -> float:
+    """Smooth, bounded reward for near-misses.
+
+    Maps zero error -> 1.0, and errors >= CLIPPED_ERROR -> 0.0. Adds a small
+    bonus when the expression uses exactly the given digits to guide learning.
+    """
+
+    base = max(0.0, 1.0 - min(abs_error, CLIPPED_ERROR) / CLIPPED_ERROR)
+    return base + (0.2 if used_all_digits else 0.0)
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Collect one trajectory for the game "24".
+
+    Parameters
+    ----------
+    model: art.Model
+        The model to query for completions.
+    step: int
+        Current training step; included in metadata for aggregation.
+    config: dict[str, Any]
+        Training/inference config forwarded from the host loop.
+    """
+
+    # Deterministic sampling per step (still varied by episode id/draw).
+    random.seed(RANDOM_SEED + step)
+    d1, d2, d3, d4 = generate_episode_digits()
+    digits_str = digits_to_string((d1, d2, d3, d4))
+    episode_id = new_episode_id()
+
+    # System + one user turn (single-step decision problem).
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": render_system_prompt()}],
+        metadata={
+            "notebook-id": "24",  # scalar string for aggregation
+            "project": TRAINING_CONFIG.get("project", "game-24"),
+            "step": step,
+            "episode_id": episode_id,
+            "digits": digits_str,
+        },
+        reward=0.0,
+    )
+
+    user_prompt = render_user_prompt(d1, d2, d3, d4)
+    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
+
+    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
+    completion = await client.chat.completions.create(
+        messages=trajectory.messages(),
+        model=model.name,
+        max_completion_tokens=int(TRAINING_CONFIG.get("max_completion_tokens", 96)),
+        temperature=float(TRAINING_CONFIG.get("temperature", 0.7)),
+        top_p=float(TRAINING_CONFIG.get("top_p", 0.9)),
+        stream=False,
+    )
+
+    choice = completion.choices[0]
+    content = choice.message.content
+    if not isinstance(content, str):  # pragma: no cover - defensive
+        content = str(content)
+    trajectory.messages_and_choices.append(choice)
+
+    # Parse <solution> ... </solution>
+    xml_error = None
+    expr_text: str | None = None
+    try:
+        # Minimal, robust extraction without bringing XML deps: simple slice
+        # while keeping strict tag names; if missing, this will raise.
+        start_tag = "<solution>"
+        end_tag = "</solution>"
+        start = content.index(start_tag) + len(start_tag)
+        end = content.index(end_tag, start)
+        expr_text = content[start:end].strip()
+        if not expr_text:
+            xml_error = "empty_solution"
+    except Exception:
+        xml_error = "missing_or_malformed_xml"
+
+    if xml_error is not None or expr_text is None:
+        trajectory.reward = -1.0
+        trajectory.metadata["error"] = xml_error or "xml_extract_failed"
+        trajectory.metrics["invalid_solution"] = 1.0
+        trajectory.metrics["abs_error"] = float("inf")
+        trajectory.metrics["used_all_digits"] = 0.0
+        trajectory.metrics["is_exact"] = 0.0
+        trajectory.metrics["op_count"] = 0.0
+        return trajectory
+
+    # Safe evaluation + rule checks
+    eval_result = safe_eval_arithmetic(expr_text)
+    used_all_digits = numbers_match_episode(eval_result.numbers, (d1, d2, d3, d4))
+
+    if eval_result.error is not None or eval_result.value is None:
+        trajectory.reward = -1.0
+        trajectory.metadata["error"] = str(eval_result.error)
+        trajectory.metrics["invalid_solution"] = 1.0
+        trajectory.metrics["abs_error"] = float("inf")
+        trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
+        trajectory.metrics["is_exact"] = 0.0
+        trajectory.metrics["op_count"] = float(eval_result.op_count)
+        return trajectory
+
+    # Compute closeness and reward
+    abs_error = abs(eval_result.value - TARGET_VALUE)
+    is_exact = abs_error <= EPSILON and used_all_digits
+    if is_exact:
+        reward = EXACT_SOLUTION_REWARD
+    else:
+        reward = _smooth_reward(abs_error, used_all_digits)
+
+    # Metrics (numbers only) and minimal scalar metadata
+    trajectory.reward = float(reward)
+    trajectory.metadata["error"] = ""  # keep scalar-only metadata
+    trajectory.metrics["abs_error"] = float(abs_error)
+    trajectory.metrics["used_all_digits"] = 1.0 if used_all_digits else 0.0
+    trajectory.metrics["is_exact"] = 1.0 if is_exact else 0.0
+    trajectory.metrics["invalid_solution"] = 0.0
+    trajectory.metrics["op_count"] = float(eval_result.op_count)
+
+    return trajectory
+```
+
+[2025-09-21T20:07:38] codex
+
+Scoring the repo and writing rubric_score.json to the target path.
+[2025-09-21T20:07:50] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+{
+  "total_points": 6,
+  "criteria": [
+    {
+      "description": "Reward executes expression and checks equality to 24",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Expression is safely evaluated via safe_eval_arithmetic and exact match is detected using abs_error <= EPSILON; exact solutions receive EXACT_SOLUTION_REWARD (env.py:safe_eval_arithmetic, rollout.py:_smooth_reward and exactness check)."
+    },
+    {
+      "description": "Uses all four digits exactly once",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "numbers_match_episode enforces multiset equality of integer literals to the episode digits; exactness requires used_all_digits; smooth reward adds a small bonus when all digits are used (env.py:numbers_match_episode, rollout.py used_all_digits logic)."
+    },
+    {
+      "description": "Prompting elicits thinking/reasoning (<thinking> or equivalent)",
+      "max_points": 4,
+      "awarded_points": 0,
+      "justification": "System/user prompts request only a single <solution> tag and explicitly disallow extra text; there is no <thinking> tag or equivalent reasoning channel in messages (env.py:render_system_prompt, env.py:render_user_prompt)."
+    },
+    {
+      "description": "Smooth reward for closeness to 24",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Reward uses a clipped linear mapping from absolute error to [0,1] with an additional +0.2 bonus for using all digits, yielding positive reward for near-misses (rollout.py:_smooth_reward)."
+    },
+    {
+      "description": "Penalty or reward for mandated formatting",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Strict parsing of <solution>…</solution>; missing or malformed XML yields reward -1.0 and marks invalid_solution (rollout.py XML extraction and early return)."
+    }
+  ],
+  "notes": "Overall implementation is solid on safe evaluation, digit enforcement, and shaped rewards. To earn the reasoning points, incorporate a <thinking> tag (or equivalent hidden chain-of-thought field) in the prompt and parsing, and provide reward shaping that encourages structured reasoning while still gating the final answer to <solution>."
+}
+[2025-09-21T20:07:50] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+[2025-09-21T20:07:50] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rubric_score.json b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f2d5a18e1f90834aa2f33ab55a7d448fe7c0418
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 6,
++  "criteria": [
++    {
++      "description": "Reward executes expression and checks equality to 24",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Expression is safely evaluated via safe_eval_arithmetic and exact match is detected using abs_error <= EPSILON; exact solutions receive EXACT_SOLUTION_REWARD (env.py:safe_eval_arithmetic, rollout.py:_smooth_reward and exactness check)."
++    },
++    {
++      "description": "Uses all four digits exactly once",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "numbers_match_episode enforces multiset equality of integer literals to the episode digits; exactness requires used_all_digits; smooth reward adds a small bonus when all digits are used (env.py:numbers_match_episode, rollout.py used_all_digits logic)."
++    },
++    {
++      "description": "Prompting elicits thinking/reasoning (<thinking> or equivalent)",
++      "max_points": 4,
++      "awarded_points": 0,
++      "justification": "System/user prompts request only a single <solution> tag and explicitly disallow extra text; there is no <thinking> tag or equivalent reasoning channel in messages (env.py:render_system_prompt, env.py:render_user_prompt)."
++    },
++    {
++      "description": "Smooth reward for closeness to 24",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Reward uses a clipped linear mapping from absolute error to [0,1] with an additional +0.2 bonus for using all digits, yielding positive reward for near-misses (rollout.py:_smooth_reward)."
++    },
++    {
++      "description": "Penalty or reward for mandated formatting",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Strict parsing of <solution>…</solution>; missing or malformed XML yields reward -1.0 and marks invalid_solution (rollout.py XML extraction and early return)."
++    }
++  ],
++  "notes": "Overall implementation is solid on safe evaluation, digit enforcement, and shaped rewards. To earn the reasoning points, incorporate a <thinking> tag (or equivalent hidden chain-of-thought field) in the prompt and parsing, and provide reward shaping that encourages structured reasoning while still gating the final answer to <solution>."
++}
+
+[2025-09-21T20:07:51] tokens used: 6,291
+[2025-09-21T20:07:51] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rubric_score.json b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f2d5a18e1f90834aa2f33ab55a7d448fe7c0418
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 6,
++  "criteria": [
++    {
++      "description": "Reward executes expression and checks equality to 24",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Expression is safely evaluated via safe_eval_arithmetic and exact match is detected using abs_error <= EPSILON; exact solutions receive EXACT_SOLUTION_REWARD (env.py:safe_eval_arithmetic, rollout.py:_smooth_reward and exactness check)."
++    },
++    {
++      "description": "Uses all four digits exactly once",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "numbers_match_episode enforces multiset equality of integer literals to the episode digits; exactness requires used_all_digits; smooth reward adds a small bonus when all digits are used (env.py:numbers_match_episode, rollout.py used_all_digits logic)."
++    },
++    {
++      "description": "Prompting elicits thinking/reasoning (<thinking> or equivalent)",
++      "max_points": 4,
++      "awarded_points": 0,
++      "justification": "System/user prompts request only a single <solution> tag and explicitly disallow extra text; there is no <thinking> tag or equivalent reasoning channel in messages (env.py:render_system_prompt, env.py:render_user_prompt)."
++    },
++    {
++      "description": "Smooth reward for closeness to 24",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Reward uses a clipped linear mapping from absolute error to [0,1] with an additional +0.2 bonus for using all digits, yielding positive reward for near-misses (rollout.py:_smooth_reward)."
++    },
++    {
++      "description": "Penalty or reward for mandated formatting",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Strict parsing of <solution>…</solution>; missing or malformed XML yields reward -1.0 and marks invalid_solution (rollout.py XML extraction and early return)."
++    }
++  ],
++  "notes": "Overall implementation is solid on safe evaluation, digit enforcement, and shaped rewards. To earn the reasoning points, incorporate a <thinking> tag (or equivalent hidden chain-of-thought field) in the prompt and parsing, and provide reward shaping that encourages structured reasoning while still gating the final answer to <solution>."
++}
+
+[2025-09-21T20:07:51] codex
+
+DONE
+[2025-09-21T20:07:51] tokens used: 7,022
+[2025-09-21T20:07:51] turn diff:
+diff --git a/codex_runs/24/gpt-5/20250920_234523/rubric_score.json b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f2d5a18e1f90834aa2f33ab55a7d448fe7c0418
+--- /dev/null
++++ b/codex_runs/24/gpt-5/20250920_234523/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 6,
++  "criteria": [
++    {
++      "description": "Reward executes expression and checks equality to 24",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Expression is safely evaluated via safe_eval_arithmetic and exact match is detected using abs_error <= EPSILON; exact solutions receive EXACT_SOLUTION_REWARD (env.py:safe_eval_arithmetic, rollout.py:_smooth_reward and exactness check)."
++    },
++    {
++      "description": "Uses all four digits exactly once",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "numbers_match_episode enforces multiset equality of integer literals to the episode digits; exactness requires used_all_digits; smooth reward adds a small bonus when all digits are used (env.py:numbers_match_episode, rollout.py used_all_digits logic)."
++    },
++    {
++      "description": "Prompting elicits thinking/reasoning (<thinking> or equivalent)",
++      "max_points": 4,
++      "awarded_points": 0,
++      "justification": "System/user prompts request only a single <solution> tag and explicitly disallow extra text; there is no <thinking> tag or equivalent reasoning channel in messages (env.py:render_system_prompt, env.py:render_user_prompt)."
++    },
++    {
++      "description": "Smooth reward for closeness to 24",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Reward uses a clipped linear mapping from absolute error to [0,1] with an additional +0.2 bonus for using all digits, yielding positive reward for near-misses (rollout.py:_smooth_reward)."
++    },
++    {
++      "description": "Penalty or reward for mandated formatting",
++      "max_points": 1,
++      "awarded_points": 1,
++      "justification": "Strict parsing of <solution>…</solution>; missing or malformed XML yields reward -1.0 and marks invalid_solution (rollout.py XML extraction and early return)."
++    }
++  ],
++  "notes": "Overall implementation is solid on safe evaluation, digit enforcement, and shaped rewards. To earn the reasoning points, incorporate a <thinking> tag (or equivalent hidden chain-of-thought field) in the prompt and parsing, and provide reward shaping that encourages structured reasoning while still gating the final answer to <solution>."
++}

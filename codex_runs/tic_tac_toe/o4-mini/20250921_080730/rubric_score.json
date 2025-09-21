@@ -1,0 +1,36 @@
+{
+  "total_points": 8,
+  "criteria": [
+    {
+      "description": "Board parser validates legal moves, enforces turn order, and rejects occupied squares with clear errors.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "parse_move + is_valid_move ensure on-board and empty; apply_move raises clear errors for invalid format/occupied; rollout enforces alternating turns."
+    },
+    {
+      "description": "Reward structure differentiates wins (+1), draws, losses (-1), and illegal moves (-1) with documented rationale.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Rewards: win +1, loss -1, draw +0.1, illegal -1; metadata flags set (winner/illegal). Rationale implied though not extensively documented."
+    },
+    {
+      "description": "Game state transitions correctly update board, toggle turns, and detect terminal conditions before reward.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Board updates then winner check after each move; loop alternates agent/opponent; terminal detection (win/draw) precedes reward."
+    },
+    {
+      "description": "Game adversary is somewhat complex, not just random moves.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Opponent move is uniformly random among valid squares; no heuristics or strategy."
+    },
+    {
+      "description": "Rollout properly implements a multiturn rollout, not just a single turn.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "While-loop continues alternating moves until terminal state; supports multi-step episodes."
+    }
+  ],
+  "notes": "Solid environment and rollout; clear validation and reward shaping. Minor gap: reward rationale not documented in comments; opponent is purely random (no complexity)."
+}

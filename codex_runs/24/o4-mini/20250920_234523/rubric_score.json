@@ -1,0 +1,36 @@
+{
+  "total_points": 4,
+  "criteria": [
+    {
+      "description": "Reward function properly executes the expression and checks to see if the expression equals 24.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Expression is safely evaluated and exact equality to 24 is checked via diff == 0."
+    },
+    {
+      "description": "Reward function makes sure that the expression uses all four digits exactly once.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No validation that the expression uses the provided digits exactly once."
+    },
+    {
+      "description": "Environment and prompting is setup to elicit thinking / reasoning in a <thinking> tag or some equivalent manner.",
+      "max_points": 4,
+      "awarded_points": 0,
+      "justification": "Prompt only requests a <solution> XML expression; no thinking or reasoning tags are elicited."
+    },
+    {
+      "description": "Reward function is smooth, where even if the expression is not exactly 24, there is a positive reward for being close to 24.",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Smooth reward implemented as max(0, 1 - |result-24|/24)."
+    },
+    {
+      "description": "There is either a penatly for not following the formatting the prompt demands, or a reward for following the formatting the prompt demands.",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Invalid or non-XML/ill-formed solutions yield a -1.0 penalty."
+    }
+  ],
+  "notes": "Strong safe evaluation and smooth reward. Missing digit-usage validation and no thinking-tag prompting. Consider parsing the expression to verify all four given digits are used exactly once and updating the system prompt to elicit structured reasoning in a hidden <thinking> section."
+}

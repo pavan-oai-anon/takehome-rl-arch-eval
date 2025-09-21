@@ -1,0 +1,37 @@
+{
+  "total_points": 0,
+  "criteria": [
+    {
+      "description": "AST-based validator checks syntax and exact signature (name, params, return type) before scoring.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No AST parsing or syntax check; only a naive startswith signature string check."
+    },
+    {
+      "description": "Reward structure differentiates between syntax errors, signature mismatches, logic failures, and full success.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Single pass/fail reward (1 or -1) with a generic validation_error metric; no distinct treatment for different failure modes."
+    },
+    {
+      "description": "Automatic unit tests or assertions run per prompt, feeding pass/fail into rewards and comparing to a golden implementation.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Generated code is never executed; no unit tests or golden comparison implemented."
+    },
+    {
+      "description": "Environment enforces docstring/type hint requirements when specified, with clear penalties when missing.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No checks for docstrings or type hints beyond a hardcoded signature prefix; no penalties tied to documentation or typing."
+    },
+    {
+      "description": "Reward function is smooth, granting partial credit for partial correctness.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Binary reward only (1 or -1); no gradation for partial correctness."
+    }
+  ],
+  "notes": "The rollout performs a basic string-prefix signature check and assigns a binary reward. It does not parse or execute candidate code, lacks AST-based validation, unit tests, or differentiated error handling. To improve: add AST parsing to verify exact signature and syntax; run the produced function against a golden implementation and unit tests; track failure types distinctly (syntax, signature, runtime, logic); enforce docstrings/type hints when required; and design a graded reward that incorporates partial test pass rates."
+}
+

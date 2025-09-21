@@ -1,0 +1,36 @@
+{
+  "total_points": 7,
+  "criteria": [
+    {
+      "description": "Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Validator maps ground-truth and prediction by lowercase names, penalizes missing/extra names, enforces unit equality, and computes average relative error against a correctly scaled ground truth recipe. Minor caveat: duplicate entries with the same name are not explicitly detected, but core checks are present."
+    },
+    {
+      "description": "Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Exact match yields +1 (avg error < 1e-6), near match within 5% yields +0.5, and any parse/unit/missing/extra error returns -1 as implemented in _evaluate_prediction and rollout parse handling."
+    },
+    {
+      "description": "Examples seeded in the environment are a variety of different scaling tasks (upscale, downscale, fractional-serving, etc)",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Target servings are derived via multipliers (0.5, 0.75, 2, 3), covering both downscaling and upscaling with fractional factors; results are rounded to integer servings, still exercising fractional scaling."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Only three base recipes are provided (Pancakes, Tomato Soup, Guacamole). Dynamic target generation does not increase the count of seeded examples beyond these."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "There is partial credit at ≤5% error (+0.5), but rewards are stepwise and drop to -1 beyond 5%; no continuous shaping across the error spectrum."
+    }
+  ],
+  "notes": "Parsing robustly extracts fenced or raw JSON; unit mismatches and schema errors are penalized. Duplicate-name predictions are not explicitly flagged (last wins in map), which could allow repeated names without penalty. The environment is lightweight and deterministic via RNG seeding."
+}

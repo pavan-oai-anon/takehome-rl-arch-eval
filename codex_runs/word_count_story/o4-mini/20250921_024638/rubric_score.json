@@ -1,0 +1,11 @@
+{
+  "total_points": 3,
+  "criteria": [
+    {"description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.", "max_points": 2, "awarded_points": 1, "justification": "Uses a continuous reward (1 - diff/target) that yields 1.0 for exact, slightly lower for off-by-one, and lower for larger misses; however, values are not explicitly documented as tiers."},
+    {"description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.", "max_points": 2, "awarded_points": 0, "justification": "No theme-adherence verification; reward and metadata do not evaluate whether the story matches the requested theme."},
+    {"description": "Prompt themes are varied, and not just one theme repeated.", "max_points": 2, "awarded_points": 2, "justification": "Ten distinct themes are provided (friendship, mystery, adventure, hope, loss, joy, courage, betrayal, wonder, homecoming)."},
+    {"description": "More than 10 examples are seeded in the environment.", "max_points": 2, "awarded_points": 0, "justification": "Exactly 10 examples are seeded; the rubric requires more than 10."},
+    {"description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.", "max_points": 2, "awarded_points": 0, "justification": "Output is only type-checked as string; there is no explicit plain-text sanitization or trimming before scoring."}
+  ],
+  "notes": "Consider adding explicit, documented reward tiers (e.g., exact=1.0, off-by-one=0.9, larger miss scaled), a theme-adherence check that influences reward/metadata (keyword overlap or embedding similarity), seeding more than 10 examples, and sanitizing/normalizing outputs (strip whitespace, remove markdown) prior to word-count scoring."
+}

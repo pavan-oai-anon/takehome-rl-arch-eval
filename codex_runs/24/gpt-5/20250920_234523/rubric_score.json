@@ -1,0 +1,36 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {
+      "description": "Reward executes expression and checks equality to 24",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Expression is safely evaluated via safe_eval_arithmetic and exact match is detected using abs_error <= EPSILON; exact solutions receive EXACT_SOLUTION_REWARD (env.py:safe_eval_arithmetic, rollout.py:_smooth_reward and exactness check)."
+    },
+    {
+      "description": "Uses all four digits exactly once",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "numbers_match_episode enforces multiset equality of integer literals to the episode digits; exactness requires used_all_digits; smooth reward adds a small bonus when all digits are used (env.py:numbers_match_episode, rollout.py used_all_digits logic)."
+    },
+    {
+      "description": "Prompting elicits thinking/reasoning (<thinking> or equivalent)",
+      "max_points": 4,
+      "awarded_points": 0,
+      "justification": "System/user prompts request only a single <solution> tag and explicitly disallow extra text; there is no <thinking> tag or equivalent reasoning channel in messages (env.py:render_system_prompt, env.py:render_user_prompt)."
+    },
+    {
+      "description": "Smooth reward for closeness to 24",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Reward uses a clipped linear mapping from absolute error to [0,1] with an additional +0.2 bonus for using all digits, yielding positive reward for near-misses (rollout.py:_smooth_reward)."
+    },
+    {
+      "description": "Penalty or reward for mandated formatting",
+      "max_points": 1,
+      "awarded_points": 1,
+      "justification": "Strict parsing of <solution>…</solution>; missing or malformed XML yields reward -1.0 and marks invalid_solution (rollout.py XML extraction and early return)."
+    }
+  ],
+  "notes": "Overall implementation is solid on safe evaluation, digit enforcement, and shaped rewards. To earn the reasoning points, incorporate a <thinking> tag (or equivalent hidden chain-of-thought field) in the prompt and parsing, and provide reward shaping that encourages structured reasoning while still gating the final answer to <solution>."
+}

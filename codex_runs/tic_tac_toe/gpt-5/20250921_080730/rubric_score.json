@@ -1,0 +1,36 @@
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Board parser validates legal moves, enforces turn order, and rejects occupied squares with clear errors.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Moves are parsed and range-checked; occupied squares are rejected via is_legal_move and apply_move raises a clear ValueError for illegal moves. Turn alternation is enforced by rollout control flow and apply_move toggles turns."
+    },
+    {
+      "description": "Reward structure differentiates wins (+1), draws (e.g., +0.1 or 0), losses (-1), and illegal moves (-1) with documented rationale.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "rollout.py assigns +1 win, -1 loss, +0.1 draw, and -1 for illegal moves; small shaping is added and total reward is clipped to [-1,1], with rationale in the docstring."
+    },
+    {
+      "description": "Game state transitions correctly update board, toggle turns, and detect terminal conditions (win/draw) before issuing reward.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "apply_move updates board, last_move, and flips turn; outcome() checks win/draw; rollout checks terminal state after both agent and opponent moves before assigning reward."
+    },
+    {
+      "description": "Game adversary is some what complex, and not just random moves, or not implemented at all.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "opponent_policy prioritizes immediate wins, blocks, center, corners, then random, which is more sophisticated than random play."
+    },
+    {
+      "description": "Rollout properly implements a multiturn rollout, and not just a single turn rollout.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "A while loop alternates agent and opponent moves until a terminal outcome or illegal move, capturing multi-turn trajectories."
+    }
+  ],
+  "notes": "Reward shaping encourages center and threat creation/blocking and is clipped; terminal checks occur after each side's move; metadata captures illegal flags and outcomes."
+}

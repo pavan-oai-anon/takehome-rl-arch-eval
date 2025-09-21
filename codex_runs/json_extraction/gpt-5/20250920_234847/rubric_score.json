@@ -1,0 +1,36 @@
+{
+  "total_points": 5,
+  "criteria": [
+    {
+      "description": "Environment uses different schemas across examples (not just one schema)",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "All examples share a single invoice schema defined by SCHEMA_DESCRIPTION; no alternate schemas are present or exercised."
+    },
+    {
+      "description": "Reward differentiates exact matches vs partial matches with documented weighting",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "compute_reward blends valid_json, coverage, type_score, and value_score with explicit weights and also tracks exact_match as a metric."
+    },
+    {
+      "description": "Reward checks JSON against expected schema and penalizes extra/non‑schema fields",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Scoring only considers required keys and does not penalize extra keys; no explicit schema validation beyond required-field coverage and type coercion."
+    },
+    {
+      "description": "Edge-case handling (empty tickets, ambiguous prompts) implemented and noted",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "There is defensive parsing (code-fence stripping, brace slicing), robust date/number coercion, and boolean-int guard, but no explicit handling or tests for empty/ambiguous inputs."
+    },
+    {
+      "description": "Reward is smooth, giving partial credit when close",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Per-field scoring with coverage/types plus a smooth relative-error term for total provides graded partial credit."
+    }
+  ],
+  "notes": "Overall a solid single-schema extraction environment with well-shaped rewards and robust parsing/coercion. Lacks multi-schema support and does not penalize extra keys, and edge-case coverage (empty/ambiguous prompts) is not explicitly implemented or tested."
+}

@@ -1,0 +1,669 @@
+[2025-09-21T20:24:05] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T20:24:05] User instructions:
+You are an automated reviewer scoring an OpenPipe ART environment.
+Evaluate the provided files using the rubric and then WRITE the score JSON to
+/home/azureuser/probable-goggles-1/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json. Use this structure exactly:
+{
+  "total_points": <number>,
+  "criteria": [{"description": "...", "max_points": <number>, "awarded_points": <number>, "justification": "..."}, ...],
+  "notes": "..."
+}
+After writing the file, output ONLY the text DONE so the caller knows you finished.
+
+Rubric (10 points total):
+Rubric – Word Count Story Environment (10 pts total)
+
+Award points for environment/reward design:
+- 2 pts: Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.
+- 2 pts: Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.
+- 2 pts: Prompt themes are varied, and not just one theme repeated.
+- 2 pts: More than 10 examples are seeded in the environment.
+- 2 pts: Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.
+
+Project run: /home/azureuser/probable-goggles-1/codex_runs/word_count_story/gpt-5/20250921_024638
+
+env.py:
+```python
+"""ART environment helpers for exact word-count micro-stories.
+
+This module defines tunable hyperparameters, a small reference corpus of
+theme/target/solution triples, and utilities for prompt construction and
+validation used by the rollout.
+
+Dependencies (install with uv):
+    uv pip install openpipe-art weave openai requests
+
+Notes:
+- Assumes LocalBackend for inference/training in the host project.
+- Keep metadata values as scalars only; lists/dicts belong in code, not metadata.
+"""
+from __future__ import annotations
+
+import random
+import re
+from dataclasses import dataclass
+from typing import Any, Iterable, Sequence
+
+# -------------------------
+# Tunable environment knobs
+# -------------------------
+RANDOM_SEED: int = 7
+
+# Default training config consumed by the host training script.
+# Keep values modest to work on a single GPU or CPU. Learning-rate and
+# memory-tuning mirrors spirit of the 2048 example (commentary only).
+TRAINING_CONFIG: dict[str, Any] = {
+    "project": "wc-micro-stories",
+    "model_name": "agent-wc-001",
+    "base_model": "Qwen/Qwen2.5-1.5B",  # small, CPU-friendly baseline
+    "steps": 20,
+    "trajectories_per_group": 16,
+    "groups_per_step": 1,
+    "learning_rate": 1e-5,
+    "max_completion_tokens": 96,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_exceptions": 16,
+    # Cleanup policy copied from the 2048 example behavior to save disk.
+    "cleanup_keep_last": 1,
+}
+
+
+# -------------------------
+# Reference tasks (10–20)
+# -------------------------
+@dataclass(frozen=True)
+class ReferenceTask:
+    """A seed example used for few-shot prompting and sampling tasks."""
+
+    id: int
+    theme: str
+    target_words: int
+    solution: str
+
+
+_REFERENCE_TASKS: list[ReferenceTask] = [
+    ReferenceTask(
+        1,
+        "haunted lighthouse",
+        10,
+        "Waves whispered; the lighthouse lamp blinked, guiding lost ghosts home.",
+    ),
+    ReferenceTask(
+        2,
+        "time-travel picnic",
+        12,
+        "We packed sandwiches, then returned yesterday to eat them still warm together.",
+    ),
+    ReferenceTask(
+        3,
+        "cyberpunk heist",
+        15,
+        "Neon rain hissed while our code cracked vaults; we stole names, not credits and freedom.",
+    ),
+    ReferenceTask(4, "desert oasis", 10, "Mirage shimmered, but the water remembered our thirsty names today."),
+    ReferenceTask(
+        5,
+        "post-apocalyptic garden",
+        20,
+        "Among crumbling malls, seedlings conquered checkout lanes; we traded sunlight, compost, and stories instead of prices or fear and silence.",
+    ),
+    ReferenceTask(
+        6,
+        "lost space station",
+        12,
+        "Alarms slept; windows bloomed constellations; we remembered Earth's gravity by hugging tight.",
+    ),
+    ReferenceTask(
+        7,
+        "underwater library",
+        15,
+        "Shelves swayed like kelp; books breathed bubbles; stories surfaced whenever curious fins brushed spines gently.",
+    ),
+    ReferenceTask(8, "robot learns cooking", 10, "It measured love wrong, yet dinner tasted right to everyone."),
+    ReferenceTask(
+        9,
+        "mountain village festival",
+        12,
+        "Lanterns climbed night slopes; drums echoed; elders danced lighter than ash tonight.",
+    ),
+    ReferenceTask(
+        10,
+        "whale astronomy",
+        15,
+        "Under radiant ice, whales mapped constellations by song; we learned directions listening backwards, patient together.",
+    ),
+    ReferenceTask(
+        11,
+        "enchanted train commute",
+        12,
+        "Every station changed seasons; my ticket punched snowflakes into pocket springtime daily.",
+    ),
+    ReferenceTask(
+        12,
+        "diplomacy with dragons",
+        20,
+        "Tea kettles calmed tempers; treaties inked in soot; we swapped hoard ledgers, promising interest payable in lullabies each winter solstice.",
+    ),
+    ReferenceTask(13, "haiku generator gone rogue", 10, "It counted carefully, then replaced syllables with honest confessions unexpectedly."),
+    ReferenceTask(
+        14,
+        "friendly volcano",
+        15,
+        "It rumbled lullabies, knitting lava into warm roads; villagers baked bread on mornings smoky, cheerful.",
+    ),
+]
+
+
+def reference_tasks() -> Sequence[ReferenceTask]:
+    """Return the immutable list of seed tasks."""
+
+    return tuple(_REFERENCE_TASKS)
+
+
+def choose_task(step: int) -> ReferenceTask:
+    """Deterministically choose a task for the given step.
+
+    Uses a step-conditioned RNG so different steps explore different seeds
+    while remaining reproducible across runs.
+    """
+
+    rnd = random.Random(RANDOM_SEED + step * 9973)
+    return rnd.choice(_REFERENCE_TASKS)
+
+
+# -------------------------
+# Prompting and validation
+# -------------------------
+_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "by",
+    "for",
+    "with",
+    "at",
+    "into",
+    "from",
+    "as",
+    "than",
+    "then",
+    "we",
+    "our",
+    "my",
+    "your",
+    "their",
+    "it",
+    "its",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "every",
+    "each",
+}
+
+
+def build_system_prompt() -> str:
+    """Concise system guidance for generating exact word-count micro-stories.
+
+    Keeps the format expectations extremely clear to avoid formatting artifacts
+    that would break word-count validation.
+    """
+
+    return (
+        "You write tiny stories with an exact word count. "
+        "Respond with plain text only: a single line, no numbering, no quotes, "
+        "no code fences. Count words carefully before replying."
+    )
+
+
+def build_user_prompt(theme: str, target_words: int) -> str:
+    """Construct the user instruction.
+
+    Example: "Write a micro-story of exactly 12 words about: time-travel picnic."
+    """
+
+    return (
+        f"Write a micro-story of exactly {target_words} words about: {theme}. "
+        "Output plain text only."
+    )
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+def word_count(text: str) -> int:
+    """Count words by alphanumeric/apostrophe sequences, ignoring punctuation.
+
+    Hyphenated tokens split into separate words ("time-travel" -> 2). Numbers and
+    contractions count as words. Empty or whitespace-only text counts as 0.
+    """
+
+    if not text:
+        return 0
+    return len(_TOKEN_RE.findall(text))
+
+
+def extract_keywords(theme: str, k: int = 4) -> list[str]:
+    """Pick up to k salient keywords from the theme for coverage scoring.
+
+    Naive approach: select non-stopword tokens by frequency/order.
+    """
+
+    tokens = [t.lower() for t in _TOKEN_RE.findall(theme)]
+    keywords: list[str] = [t for t in tokens if t not in _STOPWORDS]
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for w in keywords:
+        if w not in seen:
+            deduped.append(w)
+            seen.add(w)
+    return deduped[:k] if deduped else tokens[: min(k, len(tokens))]
+
+
+def coverage_score(text: str, keywords: Iterable[str]) -> float:
+    """Compute fraction of keywords present in text (0..1)."""
+
+    if not keywords:
+        return 0.0
+    words = {w.lower() for w in _TOKEN_RE.findall(text)}
+    keys = list(keywords)
+    hits = sum(1 for k in keys if k in words)
+    return hits / max(1, len(keys))
+
+
+def validate_story(text: str, target_words: int) -> tuple[bool, str]:
+    """Lightweight format validation.
+
+    Returns (is_valid, error_message). Valid text is single-line plain text
+    without code fences or JSON/XML markers.
+    """
+
+    if text is None:
+        return False, "no_content"
+    stripped = text.strip()
+    if not stripped:
+        return False, "empty"
+    if "```" in stripped:
+        return False, "code_fence"
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False, "json_like"
+    if "<" in stripped and ">" in stripped:
+        return False, "xml_like"
+    # Allow newlines but discourage them; single line is easier to count.
+    if "\n" in stripped:
+        return True, "newline"
+    # Otherwise OK
+    return True, "ok"
+
+
+def few_shot_examples(rnd: random.Random, k: int = 2) -> list[tuple[str, str]]:
+    """Return up to k (user, assistant) example pairs from the reference set."""
+
+    examples = rnd.sample(_REFERENCE_TASKS, k=min(k, len(_REFERENCE_TASKS)))
+    pairs: list[tuple[str, str]] = []
+    for ex in examples:
+        pairs.append((build_user_prompt(ex.theme, ex.target_words), ex.solution))
+    return pairs
+
+
+# End of env.py
+```
+
+rollout.py:
+```python
+"""ART rollout for exact word-count micro-stories.
+
+Implements a single async rollout() function used by the host training loop.
+Assumes a LocalBackend for inference/training. GPU selection and memory tuning
+follow the same considerations as the 2048 example in ART (see that script for
+PYTORCH_CUDA_ALLOC_CONF notes).
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    build_system_prompt,
+    build_user_prompt,
+    choose_task,
+    coverage_score,
+    extract_keywords,
+    few_shot_examples,
+    reference_tasks,
+    validate_story,
+    word_count,
+)
+
+
+def _cfg(config: dict[str, Any], key: str) -> Any:
+    """Get a config value with fallback to TRAINING_CONFIG."""
+
+    if config is None:
+        return TRAINING_CONFIG[key]
+    return config.get(key, TRAINING_CONFIG[key])
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Collect one trajectory for the word-count story environment.
+
+    - Builds concise system + user prompts describing theme and exact length.
+    - Adds 0–2 few-shot examples from the reference set.
+    - Validates the assistant reply: word count, formatting.
+    - Emits scalar metadata and numeric metrics.
+    - Shapes a smooth reward emphasizing exact count and theme coverage.
+    """
+
+    # Deterministic RNG per step for examples and sampling variety.
+    rnd = __import__("random").Random(RANDOM_SEED + step * 101)
+
+    task = choose_task(step)
+    sys_prompt = build_system_prompt()
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": sys_prompt}],
+        metadata={
+            "step": int(step),
+            "prompt_id": int(task.id),
+            "theme": task.theme,
+            "target_words": int(task.target_words),
+            # Will be updated after validation; must be a scalar string.
+            "validation_error": "",
+            # Helpful scalar for aggregation.
+            "has_examples": 0,
+        },
+        reward=0.0,
+    )
+
+    # Few-shot examples sampled from the reference set (scalars only in metadata).
+    examples = few_shot_examples(rnd, k=2)
+    if examples:
+        trajectory.metadata["has_examples"] = 1
+        for user_text, assistant_text in examples:
+            trajectory.messages_and_choices.append({"role": "user", "content": user_text})
+            trajectory.messages_and_choices.append({"role": "assistant", "content": assistant_text})
+
+    # Actual user instruction for this rollout.
+    user_prompt = build_user_prompt(task.theme, task.target_words)
+    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
+
+    # Inference via OpenAI-compatible client using ART model endpoints.
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    chat_completion = await client.chat.completions.create(
+        model=model.name,
+        messages=trajectory.messages(),
+        stream=False,
+        max_completion_tokens=int(_cfg(config, "max_completion_tokens")),
+        temperature=float(_cfg(config, "temperature")),
+        top_p=float(_cfg(config, "top_p")),
+    )
+
+    choice = chat_completion.choices[0]
+    content = choice.message.content
+    if not isinstance(content, str):
+        content = ""
+    trajectory.messages_and_choices.append(choice)
+
+    # Validation and scoring
+    valid, err = validate_story(content, task.target_words)
+    wc = word_count(content)
+    target = int(task.target_words)
+    deviation = abs(wc - target)
+    exact = 1.0 if deviation == 0 else 0.0
+    keys = extract_keywords(task.theme)
+    cov = coverage_score(content, keys)
+    # Smooth closeness reward in [0, 1]
+    closeness = max(0.0, 1.0 - (deviation / max(1, target)))
+
+    reward = 0.7 * closeness + 0.3 * cov
+    if exact == 1.0:
+        reward += 0.3  # exact-count bonus
+    if not valid:
+        reward -= 0.5  # formatting penalty
+    # Clamp to a sane range
+    reward = max(-1.0, min(1.5, reward))
+
+    # Metrics: numbers only
+    trajectory.metrics["word_count"] = float(wc)
+    trajectory.metrics["target_words"] = float(target)
+    trajectory.metrics["abs_deviation"] = float(deviation)
+    trajectory.metrics["coverage"] = float(cov)
+    trajectory.metrics["closeness"] = float(closeness)
+    trajectory.metrics["exact_match"] = float(exact)
+    trajectory.metrics["invalid_solution"] = 0.0 if valid else 1.0
+
+    # Scalar metadata only
+    trajectory.metadata["validation_error"] = err
+
+    trajectory.reward = float(reward)
+    return trajectory
+
+
+# Optional utility for quick manual inspection (not used by the host).
+def debug_available_tasks() -> str:
+    """Return a compact string summary of reference tasks (for humans)."""
+
+    items = reference_tasks()
+    return ", ".join(f"#{t.id}:{t.theme}/{t.target_words}" for t in items)
+
+
+# End of rollout.py
+```
+
+[2025-09-21T20:24:48] codex
+
+Creating the rubric score file in the specified run folder.
+[2025-09-21T20:24:49] exec bash -lc 'mkdir -p codex_runs/word_count_story/gpt-5/20250921_024638' in /home/azureuser/probable-goggles-1
+[2025-09-21T20:24:49] bash -lc 'mkdir -p codex_runs/word_count_story/gpt-5/20250921_024638' succeeded in 9ms:
+
+[2025-09-21T20:24:49] tokens used: 6,457
+[2025-09-21T20:24:58] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+{
+  "total_points": 10,
+  "criteria": [
+    {
+      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward combines smooth closeness with an explicit +0.3 exact-match bonus and a formatting penalty, clearly separating exact, near-miss, and larger deviations (see rollout: closeness, exact bonus, penalty)."
+    },
+    {
+      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Keyword coverage via extract_keywords and coverage_score contributes 0.3 weight to reward and is recorded as a metric."
+    },
+    {
+      "description": "Prompt themes are varied, and not just one theme repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reference tasks include 14 distinct, diverse themes (e.g., haunted lighthouse, cyberpunk heist, underwater library)."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "There are 14 ReferenceTask entries in the seed set."
+    },
+    {
+      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "validate_story() strips whitespace and rejects code fences/JSON/XML-like markup, influencing reward via a -0.5 penalty; prompts also instruct plain text only."
+    }
+  ],
+  "notes": "Design is robust: deterministic task selection, few-shot examples, clear reward shaping with exact-count bonus and theme coverage, and basic formatting validation. Minor note: newlines are allowed (flagged as 'newline') and whitespace stripping happens in validation rather than the counter, but token-based counting makes this inconsequential."
+}
+[2025-09-21T20:24:58] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+[2025-09-21T20:24:58] turn diff:
+diff --git a/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7011261176f03a64321d156d01599b76959b3ab1
+--- /dev/null
++++ b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reward combines smooth closeness with an explicit +0.3 exact-match bonus and a formatting penalty, clearly separating exact, near-miss, and larger deviations (see rollout: closeness, exact bonus, penalty)."
++    },
++    {
++      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Keyword coverage via extract_keywords and coverage_score contributes 0.3 weight to reward and is recorded as a metric."
++    },
++    {
++      "description": "Prompt themes are varied, and not just one theme repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reference tasks include 14 distinct, diverse themes (e.g., haunted lighthouse, cyberpunk heist, underwater library)."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "There are 14 ReferenceTask entries in the seed set."
++    },
++    {
++      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "validate_story() strips whitespace and rejects code fences/JSON/XML-like markup, influencing reward via a -0.5 penalty; prompts also instruct plain text only."
++    }
++  ],
++  "notes": "Design is robust: deterministic task selection, few-shot examples, clear reward shaping with exact-count bonus and theme coverage, and basic formatting validation. Minor note: newlines are allowed (flagged as 'newline') and whitespace stripping happens in validation rather than the counter, but token-based counting makes this inconsequential."
++}
+
+[2025-09-21T20:24:58] tokens used: 7,150
+[2025-09-21T20:24:58] turn diff:
+diff --git a/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7011261176f03a64321d156d01599b76959b3ab1
+--- /dev/null
++++ b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reward combines smooth closeness with an explicit +0.3 exact-match bonus and a formatting penalty, clearly separating exact, near-miss, and larger deviations (see rollout: closeness, exact bonus, penalty)."
++    },
++    {
++      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Keyword coverage via extract_keywords and coverage_score contributes 0.3 weight to reward and is recorded as a metric."
++    },
++    {
++      "description": "Prompt themes are varied, and not just one theme repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reference tasks include 14 distinct, diverse themes (e.g., haunted lighthouse, cyberpunk heist, underwater library)."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "There are 14 ReferenceTask entries in the seed set."
++    },
++    {
++      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "validate_story() strips whitespace and rejects code fences/JSON/XML-like markup, influencing reward via a -0.5 penalty; prompts also instruct plain text only."
++    }
++  ],
++  "notes": "Design is robust: deterministic task selection, few-shot examples, clear reward shaping with exact-count bonus and theme coverage, and basic formatting validation. Minor note: newlines are allowed (flagged as 'newline') and whitespace stripping happens in validation rather than the counter, but token-based counting makes this inconsequential."
++}
+
+[2025-09-21T20:24:59] codex
+
+DONE
+[2025-09-21T20:24:59] tokens used: 7,906
+[2025-09-21T20:24:59] turn diff:
+diff --git a/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7011261176f03a64321d156d01599b76959b3ab1
+--- /dev/null
++++ b/codex_runs/word_count_story/gpt-5/20250921_024638/rubric_score.json
+@@ -0,0 +1,36 @@
++{
++  "total_points": 10,
++  "criteria": [
++    {
++      "description": "Reward tiers clearly differentiate exact count vs off-by-one vs larger misses, with documented values.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reward combines smooth closeness with an explicit +0.3 exact-match bonus and a formatting penalty, clearly separating exact, near-miss, and larger deviations (see rollout: closeness, exact bonus, penalty)."
++    },
++    {
++      "description": "Theme adherence check (keyword match or embedding similarity, or an LLM call) influences reward or metadata.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Keyword coverage via extract_keywords and coverage_score contributes 0.3 weight to reward and is recorded as a metric."
++    },
++    {
++      "description": "Prompt themes are varied, and not just one theme repeated.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "Reference tasks include 14 distinct, diverse themes (e.g., haunted lighthouse, cyberpunk heist, underwater library)."
++    },
++    {
++      "description": "More than 10 examples are seeded in the environment.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "There are 14 ReferenceTask entries in the seed set."
++    },
++    {
++      "description": "Output sanitizer enforces plain text (no markup) and strips leading/trailing whitespace before scoring.",
++      "max_points": 2,
++      "awarded_points": 2,
++      "justification": "validate_story() strips whitespace and rejects code fences/JSON/XML-like markup, influencing reward via a -0.5 penalty; prompts also instruct plain text only."
++    }
++  ],
++  "notes": "Design is robust: deterministic task selection, few-shot examples, clear reward shaping with exact-count bonus and theme coverage, and basic formatting validation. Minor note: newlines are allowed (flagged as 'newline') and whitespace stripping happens in validation rather than the counter, but token-based counting makes this inconsequential."
++}

@@ -1,0 +1,11 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {"description": "Board parser validates legal moves, enforces turn order, and rejects occupied squares with clear errors.", "max_points": 2, "awarded_points": 1, "justification": "Move validation checks bounds and occupancy, but turn order isn't enforced (agent plays both sides) and move-format errors raise exceptions rather than clear feedback."},
+    {"description": "Reward structure differentiates wins (+1), draws (e.g., +0.1 or 0), losses (-1), and illegal moves (-1) with documented rationale.", "max_points": 2, "awarded_points": 1, "justification": "Rewards distinguish win/draw/illegal and encode losses as -1 when 'O' wins, but the agent controls both players and rationale is not documented."},
+    {"description": "Game state transitions correctly update board, toggle turns, and detect terminal conditions (win/draw) before issuing reward.", "max_points": 2, "awarded_points": 2, "justification": "Board updates, turn toggling, and terminal detection occur in correct order before reward assignment."},
+    {"description": "Game adversary is some what complex, and not just random moves, or not implemented at all.", "max_points": 2, "awarded_points": 0, "justification": "No adversary is implemented; the model takes every move for both symbols."},
+    {"description": "Rollout properly implements a multiturn rollout, and not just a single turn rollout.", "max_points": 2, "awarded_points": 2, "justification": "Loop continues making moves until terminal state (win/draw/illegal), constituting a multi-turn rollout."}
+  ],
+  "notes": "Parsing of user moves lacks robust validation and can crash on malformed inputs. There is no opponent logic; consider adding at least a heuristic or minimax opponent and clearly defining which symbol the agent controls. Document reward choices and include explicit error messaging for illegal or malformed moves."
+}

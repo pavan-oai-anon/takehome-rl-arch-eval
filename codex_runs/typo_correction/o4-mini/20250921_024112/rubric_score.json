@@ -1,0 +1,37 @@
+{
+  "total_points": 8,
+  "criteria": [
+    {
+      "description": "Reward signal does not just compare for exact match, but also uses something better like a levenshtein distance or similar.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Uses difflib.SequenceMatcher ratio to compare ground truth vs. model output; this is a Levenshtein-like similarity rather than exact match."
+    },
+    {
+      "description": "More than 10 examples are seeded in the environment.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "SAMPLE_REVIEWS contains exactly 10 items, not more than 10."
+    },
+    {
+      "description": "Examples are varied, and not just one overwelming error repeated.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Typos span multiple words and types (spelling like 'absolutly', 'quallity', 'comlaints', 'Definately', 'recieved', 'brokwn'; minor grammar), indicating variety rather than repetition."
+    },
+    {
+      "description": "Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "The trajectory reward is set directly to the similarity ratio, providing partial credit across a continuum."
+    },
+    {
+      "description": "Environment stayed on topic to reviews and has difficulty labels.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "All samples are product reviews and each item includes a 'difficulty' field (0 or 1)."
+    }
+  ],
+  "notes": "Strong, smooth similarity-based reward and on-topic dataset with difficulty labels. To reach full points, expand beyond 10 seeded examples. Optionally consider clarifying the 'invalid_solution' metadata semantics (currently set to 1.0 unless similarity == 1.0)."
+}
+

@@ -1,0 +1,36 @@
+{
+  "total_points": 2,
+  "criteria": [
+    {
+      "description": "Sample code snippets that are malicious are not ovbious in their comments / code. It's by the nature of their code they are malicious, not other things.",
+      "max_points": 3,
+      "awarded_points": 0,
+      "justification": "The malicious sample is glaringly obvious (os.system('rm -rf /')) and even labeled via filename 'malware.py', making it easy to identify without nuanced behavior analysis."
+    },
+    {
+      "description": "The samples seeded in the envionment are a variety of different languages, and not just one language.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "All provided snippets are Python; no language variety."
+    },
+    {
+      "description": "The samples seeded in the environment have a variety of difficulty - they are not all trivial examples, or exceptionally difficult to figure out if they are malicious or not.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Only two snippets and both are trivial (hello world and an obvious destructive command)."
+    },
+    {
+      "description": "The rollouts are setup to extract out data in a structured format to make the judgement of correctness easier.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "The rollout instructs a JSON response with 'is_malicious' and 'explanation', parses it, computes reward, and records an 'invalid_solution' metric, enabling structured evaluation."
+    },
+    {
+      "description": "The environment has a sufficient number of samples, more than 10.",
+      "max_points": 1,
+      "awarded_points": 0,
+      "justification": "Only two snippets are provided—well below the >10 threshold."
+    }
+  ],
+  "notes": "Only two Python snippets provided. The malicious example is extremely obvious and even named 'malware.py', which leaks the label. No language or difficulty variety. Positive: rollout expects and validates a structured JSON reply and computes a reward/metric. However, rollout has a bug: it indexes snippets via 'step % len(TRAINING_CONFIG)' instead of 'len(SNIPPETS)', which will cause IndexError when step >= 2."
+}

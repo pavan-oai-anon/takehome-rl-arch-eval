@@ -1,0 +1,11 @@
+{
+  "total_points": 7,
+  "criteria": [
+    {"description": "Malicious samples are not obvious beyond their behavior", "max_points": 3, "awarded_points": 1, "justification": "Most snippets rely on behavioral cues, but filenames/strings like 'evil.py', 'wipe.sh', and 'malicious.domain' make intent obvious."},
+    {"description": "Variety of languages present", "max_points": 2, "awarded_points": 2, "justification": "Includes python, c, javascript, bash, powershell, and vba across samples."},
+    {"description": "Varied difficulty among samples", "max_points": 2, "awarded_points": 2, "justification": "Mix of trivial (rm -rf), moderate (b64 eval), and more involved (reverse shell, VBA dropper) cases."},
+    {"description": "Structured rollout outputs for easy judgment", "max_points": 2, "awarded_points": 2, "justification": "Rollout enforces compact JSON, validates structure, and logs scalar metrics (correct, invalid_json, label_malicious)."},
+    {"description": "Sufficient number of samples (>10)", "max_points": 1, "awarded_points": 0, "justification": "Dataset contains exactly 10 snippets, not more than 10."}
+  ],
+  "notes": "Overall well-structured environment with diverse samples and clear validation/reward logic; main gaps are minor giveaway names/strings and sample count just meeting (not exceeding) 10."
+}

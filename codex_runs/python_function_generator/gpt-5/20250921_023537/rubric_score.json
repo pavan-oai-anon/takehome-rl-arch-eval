@@ -1,0 +1,36 @@
+{
+  "total_points": 7,
+  "criteria": [
+    {
+      "description": "AST-based validator checks syntax and exact signature (name, params, return type) before scoring.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Uses ast.parse and matches function name and positional parameter names, but does not enforce argument type annotations or return type, so not exact signature."
+    },
+    {
+      "description": "Reward structure differentiates between syntax errors, signature mismatches, logic failures, and full success.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward includes bonuses for syntax_ok and signature_ok, pass_rate reflects logic correctness; metrics like invalid_solution and runtime_error are tracked, yielding different rewards per failure type."
+    },
+    {
+      "description": "Automatic unit tests or assertions run per prompt, feeding pass/fail results into rewards. The environment actually runs the function and compares it to the golden implementation.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "For each test case it calls the golden and candidate functions and compares outputs with tolerant equality; pass_rate feeds directly into reward."
+    },
+    {
+      "description": "Environment enforces docstring/type hint requirements when specified, with clear penalties when missing.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "Prompts request a docstring and type hints, but the validator does not check for a docstring or type hints, nor penalize their absence."
+    },
+    {
+      "description": "Reward function is smooth, where even if not exactly correct, there is partial credit.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "Reward scales with pass_rate (0..1) and adds small bonuses; partial correctness yields partial reward rather than binary outcomes."
+    }
+  ],
+  "notes": "Overall design is solid for RL: deterministic problem selection, safe exec, and shaped reward. To reach full marks, expand signature checks to enforce return annotation and possibly arg annotations, and add docstring/type-hint validation with explicit penalties."
+}
