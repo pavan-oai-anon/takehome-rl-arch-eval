@@ -25,7 +25,12 @@ class EvaluationPlan:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a PEFT model using GPT-5 generated tests")
-    parser.add_argument("model_path", help="Path to the PEFT model checkpoint directory")
+    parser.add_argument(
+        "model_path",
+        help=(
+            "Path to the PEFT model checkpoint directory or a Codex run folder (e.g. codex_runs/task/model/timestamp)"
+        ),
+    )
     parser.add_argument("user_prompt_path", help="Path to the user prompt text file that describes the task")
     parser.add_argument(
         "--output",
@@ -192,15 +197,65 @@ def evaluate_with_code_interpreter(
     return data
 
 
+def resolve_model_checkpoint(model_input: Path) -> Path:
+    if (model_input / "config.json").exists():  # assume direct checkpoint directory
+        return model_input
+
+    # Assume codex run folder codex_runs/task/model/timestamp
+    if len(model_input.parts) >= 4 and model_input.parents[0].name == "codex_runs":
+        task = model_input.parts[-3]
+        model_name = model_input.parts[-2]
+        timestamp = model_input.parts[-1]
+    elif len(model_input.parts) >= 3:
+        task, model_name, timestamp = model_input.parts[-3:]
+    else:
+        raise ValueError(
+            f"Cannot infer task/model/timestamp from path {model_input}. Provide a checkpoint directory or codex run path."
+        )
+
+    art_root = Path(".art")
+    checkpoint_dir = art_root / task / "models" / model_name / "checkpoints"
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} not found")
+
+    target = checkpoint_dir / timestamp
+    if target.exists():
+        return target
+
+    # if timestamp not found, pick the latest numeric subdirectory
+    checkpoints = sorted([p for p in checkpoint_dir.iterdir() if p.is_dir()], reverse=True)
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoints found under {checkpoint_dir}")
+
+    return checkpoints[0]
+
+
+def determine_output_path(run_input: Path, explicit_output: str | None) -> Path:
+    if explicit_output:
+        return Path(explicit_output).resolve()
+
+    try:
+        relative = run_input.relative_to(Path("codex_runs"))
+        report_dir = Path("codex_runs") / relative
+    except ValueError:
+        report_dir = run_input
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    return (report_dir / "evaluation_report.json").resolve()
+
+
 def main() -> None:
     args = parse_args()
-    model_path = Path(args.model_path).resolve()
+    input_path = Path(args.model_path).resolve()
     user_prompt_path = Path(args.user_prompt_path).resolve()
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model path {model_path} does not exist")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Model path {input_path} does not exist")
     if not user_prompt_path.exists():
         raise FileNotFoundError(f"User prompt path {user_prompt_path} does not exist")
+
+    model_path = resolve_model_checkpoint(input_path)
+    output_path = determine_output_path(input_path, args.output)
 
     user_prompt = load_user_prompt(user_prompt_path)
     client = OpenAI()
@@ -259,7 +314,6 @@ def main() -> None:
         },
     }
 
-    output_path = Path(args.output).resolve()
     output_path.write_text(json.dumps(summary, indent=2))
     print(
         f"Evaluation written to {output_path} | avg_score={avg_score:.3f} | pass_rate={pass_rate:.2%}"
