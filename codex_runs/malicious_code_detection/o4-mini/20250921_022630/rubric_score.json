@@ -1,0 +1,43 @@
+{
+  "total_points": 3,
+  "criteria": [
+    {
+      "description": "Static analysis heuristics (network calls, file wipes, credential access) populate signals used in rewards.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No heuristics implemented; reward solely based on model output and JSON validity."
+    },
+    {
+      "description": "Reward logic grants distinct scores for correct classification, partial credit for right reasoning with wrong label, and penalties for contradictions.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Has penalty for invalid JSON and 1/0 for correctness; no partial credit or contradiction penalties."
+    },
+    {
+      "description": "JSON schema check enforces exact response format and surfaces descriptive errors.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Checks keys and types and penalizes invalid; does not surface descriptive error details in metrics."
+    },
+    {
+      "description": "Metadata logs heuristic flags and raw snippet context to aid debugging.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Stores snippet metadata (id, language, filename, step); no heuristic flags and raw code not in metadata."
+    },
+    {
+      "description": "Unit tests or fixtures cover benign vs malicious examples across languages/file types.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No tests or fixtures found in the provided environment."
+    },
+    {
+      "description": "Sample code snippets that are malicious are not obvious in their comments/code; maliciousness derives from behavior, not labels.",
+      "max_points": 3,
+      "awarded_points": 0,
+      "justification": "Malicious examples are telegraphed by filenames (e.g., exploit.py, attack.js, hack.c) and strings like 'http://malicious'."
+    }
+  ],
+  "notes": "Environment samples multiple languages and validates JSON, but lacks static heuristics, nuanced reward shaping, and test coverage. Consider adding heuristic detectors (e.g., regex/AST for dangerous APIs), richer reward signals (partial credit for correct rationale, contradiction penalties), structured error reporting, and realistic, non-signaling filenames/comments for malicious snippets."
+}
+

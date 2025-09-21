@@ -1,0 +1,43 @@
+{
+  "total_points": 3,
+  "criteria": [
+    {
+      "description": "Static analysis heuristics (network calls, file wipes, credential access) populate signals used in rewards.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No static code analysis implemented; rewards do not incorporate heuristic signals."
+    },
+    {
+      "description": "Reward logic grants distinct scores for correct classification, partial credit for right reasoning with wrong label, and penalties for contradictions.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Provides 1.0 for correct, 0.0 for wrong, and -1.0 for invalid format; however, no partial credit based on reasoning and no checks/penalties for contradictions between label and explanation."
+    },
+    {
+      "description": "JSON schema check enforces exact response format and surfaces descriptive errors.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Basic key/type checks for 'is_malicious' and 'explanation' are present; errors are treated uniformly as invalid without descriptive diagnostics or strict schema enforcement."
+    },
+    {
+      "description": "Metadata logs heuristic flags and raw snippet context to aid debugging.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Metadata captures language, filename, and step, but no heuristic flags are recorded and raw snippet context is not logged in metadata."
+    },
+    {
+      "description": "Unit tests or fixtures cover benign vs malicious examples across languages/file types.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No tests or fixtures found; only two Python snippets included with no cross-language coverage."
+    },
+    {
+      "description": "Sample code snippets that are malicious are not obvious in their comments/code; maliciousness is by the code's nature, not annotations.",
+      "max_points": 3,
+      "awarded_points": 0,
+      "justification": "Malicious example (rm -rf /) is overtly obvious; no subtle or realistic malicious patterns provided."
+    }
+  ],
+  "notes": "Environment is minimal and functional for a simple label-only reward, but lacks heuristic-based signals, nuanced reward shaping, strict schema validation with helpful error surfacing, and any testing or diverse, subtle malicious examples."
+}
+

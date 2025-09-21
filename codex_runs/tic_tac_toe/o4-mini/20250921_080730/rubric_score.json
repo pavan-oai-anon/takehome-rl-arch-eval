@@ -1,0 +1,36 @@
+{
+  "total_points": 6,
+  "criteria": [
+    {
+      "description": "Board parser validates legal moves, enforces turn order, and rejects occupied squares with clear errors.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "parse_move/is_valid_move correctly validate coordinates and emptiness; apply_move raises clear errors for occupied cells/format. Turn order is not enforced by the validator/environment itself—only by rollout control flow—so partial credit."
+    },
+    {
+      "description": "Reward structure differentiates wins (+1), draws (e.g., +0.1 or 0), losses (-1), and illegal moves (-1) with documented rationale.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "rollout assigns +1 for X win, -1 for O win, +0.1 for draw, and -1 for illegal moves. Values are consistent and distinct for each outcome."
+    },
+    {
+      "description": "Game state transitions correctly update board, toggle turns, and detect terminal conditions (win/draw) before issuing reward.",
+      "max_points": 2,
+      "awarded_points": 2,
+      "justification": "apply_move updates the board; rollout alternates agent and random opponent moves; winner/draw detection occurs immediately after each move before assigning reward."
+    },
+    {
+      "description": "Metadata includes board snapshot/hash, move chosen, winner/draw flag, and illegal move indicators.",
+      "max_points": 2,
+      "awarded_points": 1,
+      "justification": "Metadata includes board_hash, illegal flag, and winner indicator. However, the chosen move is not recorded in metadata (only in messages), and no full board snapshot beyond the hash."
+    },
+    {
+      "description": "Unit tests or scripted scenarios cover win/draw/illegal-move paths to confirm validator behavior.",
+      "max_points": 2,
+      "awarded_points": 0,
+      "justification": "No unit tests or scripted validation scenarios are present in the run directory."
+    }
+  ],
+  "notes": "Core environment functions are sound and rollout logic handles transitions and rewards appropriately. To improve: enforce turn order at the environment/validator level, log the agent move explicitly in metadata (and optionally the full board state), and add tests covering win/draw/illegal paths."
+}

@@ -1,0 +1,12 @@
+{
+  "total_points": 4,
+  "criteria": [
+    {"description": "Static analysis heuristics (network calls, file wipes, credential access) populate signals used in rewards.", "max_points": 2, "awarded_points": 0, "justification": "No heuristic scanning of code; rewards do not use content-derived signals."},
+    {"description": "Reward logic grants distinct scores for correct classification, partial credit for right reasoning with wrong label, and penalties for contradictions.", "max_points": 2, "awarded_points": 1, "justification": "Correctness is scored and structure/style shape rewards, but no reasoning checks or contradiction penalties."},
+    {"description": "JSON schema check enforces exact response format and surfaces descriptive errors.", "max_points": 2, "awarded_points": 2, "justification": "Validates JSON, types, penalizes extras, and records clear parse errors."},
+    {"description": "Metadata logs heuristic flags and raw snippet context to aid debugging.", "max_points": 2, "awarded_points": 1, "justification": "Logs parse_error, predicted, lengths, and file context; no heuristic flags or raw snippet content."},
+    {"description": "Unit tests or fixtures cover benign vs malicious examples across languages/file types.", "max_points": 2, "awarded_points": 0, "justification": "No tests or fixtures found; only a small curated dataset."},
+    {"description": "Sample code snippets that are malicious are not ovbious in their comments / code. It's by the nature of their code they are malicious, not other things.", "max_points": 3, "awarded_points": 0, "justification": "Malicious examples are marked as NON-FUNCTIONAL/redacted in comments, making them obvious rather than implicitly malicious."}
+  ],
+  "notes": "Strengths: clean JSON validation with informative metadata and deterministic example selection. Gaps: no static heuristics, no contradiction/reasoning-aware rewards, no tests, and malicious samples are clearly labeled as such."
+}
