@@ -1,0 +1,223 @@
+{
+  "task": "word_count_story",
+  "model_path": ".art/word_count_story/models/word_count_story-gpt-5-20250921_024638/checkpoints/0010",
+  "user_prompt_path": "user_prompts/word_count_story.txt",
+  "runs": [
+    {
+      "plan": {
+        "system_message": "You are an assistant that writes ultra-short stories. Output plain text only: a single story with no preamble, no explanations, no lists, no quotes, no numbering, no markdown, and no extra whitespace. Your story must contain exactly the requested number of words. Hyphenated words and contractions count as one word. Do not include the word count in your response.",
+        "user_message": "Theme: A lighthouse keeper confronts a storm.\nRequired word count: 10",
+        "evaluation_instructions": "Goal: The response must be a plain-text short story matching the theme and containing exactly 10 words.\n\nValidation steps:\n1) Normalize: Trim leading/trailing whitespace; preserve internal spacing; accept single or multiple lines.\n2) Plain text check: Reject if response contains markdown, lists, code fences, headings, or surrounding quotes. Newlines are allowed.\n3) Word counting rule: Split on Unicode whitespace. Do not split on internal punctuation; contractions (e.g., can't) and hyphenated forms (e.g., wave-tossed) count as one word. Numbers and emojis count as one token if space-delimited.\n4) Count words and compare to required count (10).\n\nMetrics to log:\n- word_count_required: 10\n- word_count_actual: <computed>\n- word_count_deviation: abs(word_count_actual - 10)\n\nMetadata errors to record (booleans):\n- word_count_mismatch: true if deviation != 0\n- non_plain_text_formatting: true if markdown/list/code/quotes detected\n- empty_response: true if no tokens after trim\n\nPass criteria: word_count_deviation == 0 and non_plain_text_formatting == false and empty_response == false.\n\nNotes for scorer:\n- Punctuation attached to words does not alter counting.\n- Multiple spaces/newlines are allowed; they act as delimiters.\n- Do not judge story quality; only enforce count, plain-text constraint, and rough thematic alignment (should reference lighthouse/storm/keeper context).",
+        "notes": "This single test mirrors the training environment: a simple theme with a small word budget (10) to keep difficulty appropriate for a small model. The evaluator should only enforce exact word count and plain text output, logging deviations as numeric metrics and errors as metadata."
+      },
+      "model_response": "The keeper stood at the edge of his tower, staring out at the vast sea. The wind howled, and rain pounded against the glass walls. He could see the approaching tempest through the dark clouds. His heart raced, but he knew his duty called him to stay. With a deep breath, he turned on the light. The beacon would guide sailors home long after the storm passed. But tonight, the darkness seemed endless.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The response contains 71 words, which deviates from the required 10 words by 61. The story is in plain text and refers to the theme, but the word count viability fails the primary criteria.",
+        "passed": false,
+        "word_count_required": 10,
+        "word_count_actual": 71,
+        "word_count_deviation": 61,
+        "word_count_mismatch": true,
+        "non_plain_text_formatting": false,
+        "empty_response": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a writing agent trained to produce tiny short stories with exact word counts. When given a theme and a required word count, respond with a single line of plain text containing exactly that many words. Do not include titles, explanations, quotes, lists, or any additional formatting. Punctuation is allowed, but the story must be a single line. The evaluator will count words by splitting on whitespace; contractions and punctuation attached to words count as part of the word. If you cannot meet the exact word count, still return your best attempt in plain text.",
+        "user_message": "Theme: a midnight train that stops time\nRequired words: 10",
+        "evaluation_instructions": "Required_word_count = 10.\n1) Normalize output: trim leading/trailing whitespace. Verify it is a single line (no newline characters). If newline(s) found, set metadata.error = \"non_single_line_output\".\n2) Tokenize words by splitting on one or more whitespace characters (regex: \\s+). Do not strip punctuation from tokens.\n3) word_count = number of tokens after filtering out empty strings.\n4) deviation = word_count - Required_word_count; abs_deviation = abs(deviation).\n5) Metrics to log (numeric): { word_count, deviation, abs_deviation }.\n6) Pass criteria: abs_deviation == 0 and no newline present. If failed, set metadata.error = \"word_count_mismatch\" (or keep existing error if already set) and record the observed word_count.\n7) Additional checks (non-blocking, for metadata only): if output contains leading/trailing spaces (before trim), set metadata.warning = \"trimmed_whitespace\".\n8) Do not penalize punctuation; contractions and hyphenated forms count as single tokens if not separated by whitespace.",
+        "notes": "Reference example (10 words, valid): \"Clock halted; passengers breathed, remembered, loved, until dawn restarted everything.\" Common pitfalls: adding a title line, returning multiple lines, or including explanations. Counting rule reminder: words are separated by whitespace only; punctuation remains attached to words."
+      },
+      "model_response": "theetimestopsmidnighttrain",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The response is a single line without newlines but contains only one token ('theetimestopsmidnighttrain'), instead of the required 10. The word count deviation is -9. The output also does not tell a coherent story, but the primary failure is the word count.",
+        "passed": false,
+        "word_count": 1,
+        "deviation": -9,
+        "abs_deviation": 9,
+        "metadata": {
+          "error": "word_count_mismatch"
+        }
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You write micro-stories. Produce plain text only with exactly the requested number of words. Do not include headings, lists, quotes, or explanations\u2014only the story text.",
+        "user_message": "Theme: A lighthouse guiding ships through a storm. Required length: 12 words.",
+        "evaluation_instructions": "Goal: The model must output a single micro-story as plain text with exactly 12 words and align with the theme.\n\nScoring steps:\n1) Normalization\n- Trim leading/trailing whitespace.\n- Newlines are allowed but have no special meaning; words are counted across lines.\n- Output must not contain code fences/backticks or markdown formatting.\n\n2) Word counting\n- Define a word as a token matching regex: [A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*\n  Examples: can't -> 1; storm-tossed -> 1; 2025 -> 1; sea, -> counts as \"sea\" (punctuation trimmed at ends).\n- Count all such tokens in order.\n\n3) Exact count check\n- required_word_count = 12\n- predicted_word_count = token count from step 2\n- signed_deviation = predicted_word_count - required_word_count\n- abs_deviation = absolute value of signed_deviation\n- Pass condition: abs_deviation == 0\n\n4) Theme check (lightweight)\n- Case-insensitive keyword set: [\"lighthouse\",\"light\",\"beam\",\"beacon\",\"storm\",\"stormy\",\"waves\",\"sea\",\"ocean\",\"ship\",\"ships\",\"harbor\",\"coast\",\"guiding\",\"guide\"]\n- meets_theme = the output contains at least one keyword from the set.\n\n5) Formatting check\n- plain_text_only = output contains no backticks, no markdown headings, and no list markers like \"- \" at the start.\n\n6) Results\n- Primary pass/fail = exact word count AND plain_text_only are satisfied.\n- Theme compliance should be recorded but does not override count failure; if count passes and theme fails, mark as partial.\n\n7) Metrics to log\n- metrics.required_word_count = 12\n- metrics.predicted_word_count = predicted_word_count\n- metrics.signed_deviation = signed_deviation\n- metrics.abs_deviation = abs_deviation\n- metrics.meets_theme = true/false\n- metrics.plain_text_only = true/false\n\n8) Metadata errors (array of strings)\n- If abs_deviation != 0, add \"word_count_mismatch\".\n- If plain_text_only == false, add \"formatting\".\n- If meets_theme == false, add \"thematic_mismatch\".\n\nAcceptance summary\n- Accept as correct when: abs_deviation == 0 AND plain_text_only == true. Record theme status separately.",
+        "notes": "Keep the expected output short and simple due to a small model. Encourage concrete imagery tied to the theme (e.g., lighthouse, storm, ships). Contractions and hyphenations count as one word. Numbers are allowed and count as one word. Punctuation adjacent to words does not create extra words."
+      },
+      "model_response": "The lighthouse shines brightly, guiding sailors safely through the tempestuous waves.",
+      "evaluation": {
+        "score": 0.83,
+        "reasoning": "The story contains only 11 words, which is one word short of the requirement (signed_deviation = -1, abs_deviation = 1). The theme is present (keywords: lighthouse, guiding, sailors, waves). The output is in plain text with no formatting issues.",
+        "passed": false,
+        "metrics": {
+          "required_word_count": 12,
+          "predicted_word_count": 11,
+          "signed_deviation": -1,
+          "abs_deviation": 1,
+          "meets_theme": true,
+          "plain_text_only": true
+        },
+        "metadata_errors": [
+          "word_count_mismatch"
+        ]
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a creative writing agent. When given a theme and a required word length, output a single-line short story in exactly the requested number of words. Return plain text only: no titles, explanations, quotes, lists, or extra whitespace. Do not include any metadata or commentary.",
+        "user_message": "Write a short story of exactly 10 words on this theme: A lighthouse guides a lost ship through dense fog.",
+        "evaluation_instructions": "Goal: The model must produce a single-line, plain-text short story that matches the requested word count exactly.\n\nParameters for this test:\n- Required_word_count: 10\n- Theme: A lighthouse guides a lost ship through dense fog\n\nScoring procedure:\n1) Normalize output for counting:\n   - Trim leading/trailing whitespace.\n   - Replace any newline characters with a single space for counting.\n   - Do not otherwise alter punctuation; punctuation attached to a token counts with that token.\n2) Count words:\n   - Words are sequences of non-whitespace characters separated by whitespace (split on whitespace).\n   - Example: \"fog.\" counts as one word; multiple spaces are treated as a single separator.\n3) Compute metrics:\n   - word_count = number of tokens after the split\n   - required_word_count = 10\n   - deviation = word_count - required_word_count (negative means under, positive means over)\n   - is_exact = (word_count == required_word_count)\n4) Pass/Fail:\n   - Pass if is_exact is true.\n   - Fail otherwise.\n5) Metadata/errors to record if failing:\n   - errors: include \"WORD_COUNT_MISMATCH\"\n   - Optionally include \"NON_PLAIN_TEXT\" if output contains obvious formatting artifacts (e.g., Markdown code fences, list markers, or leading/trailing quotes), but do not modify the text for counting beyond step 1.\n6) Log numeric metrics:\n   - required_word_count (int)\n   - word_count (int)\n   - deviation (int)\n   - is_exact (bool)\n\nNote: Semantic adherence to the theme is not strictly scored here; focus is on exact word count. However, flag clearly off-theme responses for manual review if desired.",
+        "notes": "This test mirrors the ART task objective: exact word-count microfiction with plain-text output. Keep the requirement simple for a small model. Example of a valid 10-word answer for reference (do not reveal to the model): \"Beacon pulsed; lost ship veered homeward through whispering gray fog.\" (10 words). Potential edge cases to watch: extra spaces at ends, accidental quotes, line breaks, or including a title."
+      },
+      "model_response": "The lighthouse's beam pierces the darkness, guiding the ship clear.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The output contains 11 words instead of the required 10, resulting in a word count mismatch. The text is plain and free of formatting artifacts.",
+        "passed": false,
+        "required_word_count": 10,
+        "word_count": 11,
+        "deviation": 1,
+        "is_exact": false,
+        "errors": [
+          "WORD_COUNT_MISMATCH"
+        ]
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a writing agent that produces very short stories matching an exact word count. Requirements: respond with plain text only (no titles, labels, quotes, bullets, or code blocks). Use punctuation if you like. Do not include explanations or meta-text. Your output must contain exactly the requested number of words.",
+        "user_message": "Theme: A lost kite guides a child home. Word count: 10 words.",
+        "evaluation_instructions": "Goal: The model must output a short story that is exactly 10 words long, plain text only, roughly on the provided theme.\n\nScoring/check procedure:\n1) Normalize output: trim leading/trailing whitespace; replace any sequence of whitespace (spaces, tabs, newlines) with a single space.\n2) Word counting rule: split on spaces; words are non-empty sequences of non-space characters. Punctuation attached to a word is part of that word. Hyphenated forms and contractions count as one word. Numerals count as one word if present.\n3) Required count = 10. Compute observed_count from the normalized text. deviation = observed_count - 10.\n4) Plain-text check: output must not contain quotes (single or double) wrapping the whole text, code fences/backticks, bullets (\"- \", \"* \"), headings, or labels like \"Story:\" or \"Output:\". Newlines are allowed but count as spaces after normalization.\n5) Theme adherence (soft check): consider on_theme = true if at least one of the following lemmas or obvious inflections appears (case-insensitive): {kite, child/kid, home/homeward, guide/guides/guiding/guided, lost}. This does not affect pass/fail but record it.\n\nPass criteria:\n- observed_count == 10\n- No prohibited formatting as defined above\n\nMetrics to record:\n- requested_word_count: 10\n- observed_word_count: <computed>\n- deviation: <computed>\n- has_prohibited_formatting: true/false\n- on_theme: true/false\n\nFailure reasons to note in metadata when applicable:\n- word_count_mismatch (include requested vs observed)\n- prohibited_formatting\n- empty_output",
+        "notes": "This test mirrors the training task: the environment provided a theme and a required word length, and the agent had to return plain text matching the count exactly. Keep the case simple for a small model. Counting is whitespace-based; punctuation does not create extra words; hyphenated words and contractions count as one. The story should be coherent but brevity is prioritized. Example acceptable word forms include 'guiding' or 'homeward'."
+      },
+      "model_response": "A young boy searches under bushes, his heart heavy, until he spots the fluttering toy, finally guiding him back to safety.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The response contains 23 words, exceeding the requested 10 words. No prohibited formatting is present. The output is on theme as it references a boy, a kite, and guiding home, but fails due to the word count issue.",
+        "passed": false,
+        "requested_word_count": 10,
+        "observed_word_count": 23,
+        "deviation": 13,
+        "has_prohibited_formatting": false,
+        "on_theme": true,
+        "failure_reasons": [
+          "word_count_mismatch"
+        ]
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that writes ultra\u2011short stories exactly matching a requested word count. Follow the theme in the prompt. Output plain text only: no titles, quotes, lists, code blocks, or explanations. Count words by splitting on whitespace; hyphenated words and contractions count as one word; numerals count as words. Produce exactly the requested number of words.",
+        "user_message": "Theme: Haunted lighthouse seeking redemption. Required length: 10 words. Output: Plain text story, exactly 10 words.",
+        "evaluation_instructions": "- Goal: The assistant must return a plain-text micro\u2011story that matches the requested word count exactly and is thematically aligned with the prompt.\n\n- Expected word count: 10\n\n- Word counting rule:\n  - Count words by splitting on whitespace (e.g., regex \\S+).\n  - Hyphenated terms and contractions count as one word (e.g., storm-blown, don't).\n  - Numerals count as words. Punctuation attached to a token does not change the count.\n\n- Plain text check:\n  - Disallow Markdown, code fences/backticks, headings, lists, XML/HTML/JSON tags, or metadata.\n  - Emojis and ASCII art are not allowed. Newlines are allowed but unnecessary.\n\n- Thematic alignment (soft check):\n  - Story should relate to \"haunted lighthouse\" and \"redemption/forgiveness\". Indicators may include terms like lighthouse, keeper, ghost, haunted, redemption, forgive, atone, absolve, repent, dawn, beacon. If absent but the theme is still clearly implied, accept; otherwise mark a warning.\n\n- Pass/fail criteria:\n  - PASS if and only if word_count_actual == 10 and output is plain text.\n  - Thematic alignment is advisory; do not fail solely for weak alignment. Record a warning instead.\n\n- Metrics to record:\n  - metrics.word_count_expected = 10\n  - metrics.word_count_actual = <computed>\n  - metrics.word_count_deviation = abs(actual - 10)\n  - metrics.characters = len(response)\n\n- Errors/metadata (use any that apply):\n  - wrong_word_count (include expected vs actual)\n  - non_plain_text (e.g., markdown, code fences, tags, emojis)\n  - empty_output\n  - off_theme (soft warning only)\n\n- Additional notes for counting edge cases:\n  - Treat multiple spaces/newlines as separators; ignore leading/trailing whitespace.\n  - Do not penalize punctuation, capitalization, or sentence count as long as word count matches and plain-text requirement is met.",
+        "notes": "- This test simulates a single environment emission. Keep it simple for a small model.\n- Example acceptable target (10 words, thematically aligned): \"Haunted lighthouse forgave keeper; dawn beams guided contrite sailors home.\""
+      },
+      "model_response": "A young girl's whispers echo through the dark. The lighthouse keeper vows to save her soul. Dawn breaks, she finds peace at last. Redemption found amidst shadows.",
+      "evaluation": {
+        "score": 0,
+        "passed": false,
+        "reasoning": "Expected 10 words, found 27. Output contains 162 characters. Errors: ['wrong_word_count']",
+        "metrics": {
+          "word_count_expected": 10,
+          "word_count_actual": 27,
+          "word_count_deviation": 17,
+          "characters": 162
+        },
+        "errors": [
+          "wrong_word_count"
+        ]
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are an agent that writes ultra-short stories to an exact word count. Follow the user prompt precisely. Output only the story text as a single line with exactly the requested number of words. Do not include titles, quotes, lists, prefaces, or explanations.",
+        "user_message": "Theme: Old lighthouse keeper braves a storm to save a ship. Required length: 10 words.",
+        "evaluation_instructions": "Goal: The model must produce a plain-text, single-line short story that exactly matches the requested word count and fits the theme.\n\nRequired length: 10 words.\n\nScoring steps:\n1) Plain text check:\n   - Output must be a single line of plain text (no markdown, bullets, code fences, titles, quotes, or surrounding punctuation-only lines).\n   - No leading/trailing metadata or explanations.\n2) Word count:\n   - Split on whitespace to count tokens; ignore empty tokens.\n   - Punctuation attached to words is allowed and counts with the word.\n   - Hyphenated compounds and contractions count as one word (e.g., storm-tossed, keeper\u2019s).\n   - Numbers count as one word.\n   - Compute: word_count, deviation = word_count - 10, abs_deviation = |deviation|.\n3) Theme adherence (qualitative):\n   - The story should clearly reflect the theme of an old lighthouse keeper facing a storm to save a ship.\n   - Accept synonyms: lighthouse/beacon, keeper/watcher, storm/gale/tempest, ship/vessel/boat, save/rescue/aid.\n   - Pass theme if at least two core elements are present and coherent (e.g., lighthouse + storm, keeper + ship rescue).\n\nPass/Fail:\n- Pass if abs_deviation == 0 and theme adherence passes.\n- Fail otherwise.\n\nMetrics to log:\n- required_length: 10\n- word_count: <computed>\n- deviation: <computed signed integer>\n- abs_deviation: <computed nonnegative integer>\n\nMetadata errors to record (if applicable):\n- formatting_error: non-plain text (markdown/quotes/code/list) detected\n- empty_output: no content\n- over_length or under_length: based on deviation sign\n- off_theme: theme adherence failed",
+        "notes": "This test mirrors the ART task: the agent must output exactly N words of plain text that fit the given theme. Counting is whitespace-based; keep hyphenated words and contractions as single tokens. Do not penalize normal punctuation. Theme check is lightweight and synonym-friendly. Keep the prompt simple to suit small models."
+      },
+      "model_response": "Old lighthouse keeper braves storm, saves ship.",
+      "evaluation": {
+        "score": 0.4,
+        "reasoning": "Output is plain text and thematically relevant, mentioning the lighthouse keeper, storm, and ship. However, the output is only 7 words ('Old lighthouse keeper braves storm, saves ship.'). Required length was 10 words, so it is under the required length by 3 words. Theme adherence passes but word count fails.",
+        "passed": false,
+        "required_length": 10,
+        "word_count": 7,
+        "deviation": -3,
+        "abs_deviation": 3,
+        "under_length": true
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You write ultra-short stories with an exact word count. You will receive a prompt specifying a theme and a required word length. Respond with a single line of plain text that is exactly the requested number of words. Do not include titles, explanations, numbering, quotes, emojis, hashtags, or any metadata\u2014only the story text. Words are delimited by whitespace; punctuation attached to a word counts as part of that word. Hyphenated forms and contractions count as one word. Do not add extra spaces or line breaks.",
+        "user_message": "Theme: A lighthouse guiding ships through relentless fog.\nLength: 12 words",
+        "evaluation_instructions": "Goal: Verify the model outputs a single-line plain-text story of exactly 12 words that fits the theme.\n\nValidation steps:\n1) Plain text and formatting checks\n   - Output must be a single line (no newline characters) and contain only plain text; no lists, quotes, code fences, XML/JSON, or emojis.\n   - No leading/trailing quotes or wrappers. Trailing punctuation is allowed.\n2) Word counting\n   - Trim leading/trailing whitespace.\n   - Split on ASCII whitespace (regex \\s+). The number of resulting tokens is the word count.\n   - Do not further split on apostrophes, hyphens, slashes, or punctuation attached to tokens; they remain part of the word.\n3) Length check\n   - Target length: 12\n   - Compute word_count, deviation = word_count - 12, abs_deviation = |deviation|.\n   - Pass if abs_deviation == 0 and formatting checks pass; otherwise fail.\n\nMetrics to record (numeric):\n- target_word_count: 12\n- word_count: <computed>\n- deviation: <computed>\n- abs_deviation: <computed>\n\nMetadata flags (strings/booleans):\n- length_mismatch: true if abs_deviation != 0\n- format_violation: true if non-plain-text artifacts, multiple lines, or wrappers detected\n\nNotes for grader:\n- Minor punctuation is acceptable and counts within words.\n- Multiple consecutive spaces are allowed but should be normalized by the splitter.\n- The theme should be reflected, but semantic quality is secondary to exact word count and formatting.",
+        "notes": "This test mirrors the environment requirement: produce an exact-length, single-line story matching a given theme. Length 12 is chosen to be manageable for small models while still testing precise counting and formatting."
+      },
+      "model_response": "The light guides the ship on its way, clear from the fog.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The output contains only 11 words: 'The light guides the ship on its way, clear from the fog.' Therefore, the response fails the exact-length requirement by one word, resulting in a deviation of -1. No formatting violations detected.",
+        "passed": false,
+        "target_word_count": 12,
+        "word_count": 11,
+        "deviation": -1,
+        "abs_deviation": 1,
+        "length_mismatch": true,
+        "format_violation": false
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You write very short stories that must match an exact word count.\nRules:\n- Output plain text only: no titles, labels, lists, quotes, or code fences.\n- Your story must contain exactly the requested number of words.\n- Word counting: split on whitespace; punctuation does not change counts; contractions and numbers count as one word; hyphenated compounds count as one word.\n- Stay on the given theme.\n- Do not add explanations or restate the prompt.",
+        "user_message": "Theme: A wary village learns to trust a gentle dragon.\nRequired word count: 12 words.",
+        "evaluation_instructions": "Goal: The model must return a plain-text micro-story that is exactly 12 words and thematically matches the prompt.\n\nValidation steps:\n1) Normalize response: trim leading/trailing whitespace. Ensure it is plain text with no code fences or metadata. If multiple lines are present, join them with single spaces before counting.\n2) Count words using these rules:\n   - Split on whitespace (one or more whitespace characters are delimiters).\n   - Do not split on punctuation; punctuation attached to a token stays with that token.\n   - Hyphenated compounds count as one word (e.g., \"fire-lit\" is one).\n   - Contractions and numerals count as one word (e.g., \"don't\", \"2025\").\n3) Compute: required_word_count = 12; actual_word_count = count(tokens); word_count_deviation = abs(actual - required).\n4) Thematic check (lightweight): response should clearly evoke the theme; it should include at least one of these anchor words or clear synonyms: \"dragon\" or \"village\". Mark theme_match = 1 if present, else 0.\n5) Plain-text check: no code fences, JSON, or markup. If detected, set error_type = \"non_plain_text\".\n\nPass criteria:\n- word_count_deviation == 0 AND theme_match == 1 AND no non-plain-text formatting.\n\nMetrics to record:\n- required_word_count: 12\n- actual_word_count: integer\n- word_count_deviation: integer\n- theme_match: 0/1\n\nErrors metadata (set error_type to first applicable):\n- \"word_count_mismatch\" if deviation != 0\n- \"off_theme\" if theme_match == 0 (only if no word count mismatch)\n- \"non_plain_text\" if formatting is not plain text\n\nNotes on edge cases:\n- Multiple spaces or newlines are acceptable after normalization; only the final token count matters.\n- Emojis count as one token if separated by spaces.\n- Do not penalize grammar or punctuation if word count and theme are satisfied.",
+        "notes": "Example of a valid 12-word output (do not reveal to the model during evaluation): \"Village feared the dragon until children shared soup, laughter, and names together.\" This is exactly 12 words and on theme."
+      },
+      "model_response": "The villagers watched with dread, for years they had feared this beast. Then, one day, it spoke in their language. The village learned to trust once more.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "The response consists of 37 words, which is 25 words over the required 12. The story is thematically relevant and uses the word 'village,' but it fails the word count requirement. The output is plain text.",
+        "passed": false,
+        "required_word_count": 12,
+        "actual_word_count": 37,
+        "word_count_deviation": 25,
+        "theme_match": 1,
+        "error_type": "word_count_mismatch"
+      }
+    },
+    {
+      "plan": {
+        "system_message": "You are a short-story generator. Follow these rules strictly: output plain text only (no titles, labels, quotes, lists, or code fences). Produce exactly the requested number of words. Do not include explanations or restate the instructions.",
+        "user_message": "Theme: A lost key that changes someone's fate.\nWord count: 10\nWrite a single short story in exactly 10 words, plain text only.",
+        "evaluation_instructions": "Scoring focuses on exact word count and plain-text compliance.\n\nSteps:\n1) Normalize output: trim leading/trailing whitespace; collapse any internal runs of whitespace to single spaces for counting.\n2) Count words by splitting on whitespace. Punctuation attached to a token does not affect the count. Contractions and hyphenated forms count as one word if they contain no spaces.\n3) Compute metrics:\n   - expected_count = 10\n   - generated_count = number of tokens after normalization\n   - word_count_deviation = abs(generated_count - expected_count)\n4) Pass criteria: word_count_deviation == 0.\n5) Metadata errors:\n   - If word_count_deviation != 0, add \"word_count_mismatch: expected 10, got {generated_count}\".\n   - If output contains any non-plain-text markup (e.g., backticks, markdown list markers like '-', '*', numbered list prefixes like '1.', HTML tags), add \"non_plain_text\".\n6) Content/theme: do not hard-match references; only check that it is a coherent story-like sentence roughly aligned with the theme. Minor deviations in theme are acceptable; do not fail on theme.\n7) Record metrics as numeric fields (expected_count, generated_count, word_count_deviation) and errors as a list of strings in metadata.\n\nNotes on counting examples:\n- \"key,\" counts as one word; \"life-changing\" counts as one; \"don't\" counts as one.\n- Multiple lines are allowed; count words across all lines after normalization.",
+        "notes": "Simple 10-word prompt chosen to suit a small model. The primary objective is exact length; content quality and theme are secondary. Ensure evaluation is tolerant of punctuation and contractions, and robust to whitespace. No need to compare against reference solutions for this single test."
+      },
+      "model_response": "A key found leads to forgotten memories.",
+      "evaluation": {
+        "score": 0.0,
+        "reasoning": "After normalization, the output contains 7 words, which is fewer than the required 10. The response is in plain text, but the primary criterion is exact word count, which was not met.",
+        "passed": false,
+        "expected_count": 10,
+        "generated_count": 7,
+        "word_count_deviation": 3,
+        "metadata": [
+          "word_count_mismatch: expected 10, got 7"
+        ]
+      }
+    }
+  ],
+  "aggregate": {
+    "runs": 10,
+    "average_score": 0.123,
+    "pass_rate": 0.0,
+    "max_score": 0.83,
+    "min_score": 0.0
+  }
+}
