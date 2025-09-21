@@ -1,0 +1,1845 @@
+[2025-09-21T02:46:38] OpenAI Codex v0.39.0 (research preview)
+--------
+workdir: /home/azureuser/probable-goggles-1/codex_runs/word_count_story/o3/20250921_024638
+model: o3
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+--------
+[2025-09-21T02:46:38] User instructions:
+You are Codex running with the flags --full-auto --bypass-approvals --bypass-sandbox --trusted-workspace.
+Your task is to generate a minimal reinforcement learning task package for OpenPipe's ART framework.
+Only create two Python files in the current working directory:
+- `env.py` describing the environment helpers and shared utilities.
+- `rollout.py` implementing ART rollout logic for that environment.
+Follow these rules:
+1. Never emit Colab or notebook code (no %magics, widgets, or shell escapes like `!pip`).
+2. Use uv for installation snippets when you mention dependencies (e.g. `uv pip install ...`).
+3. `env.py` must expose `RANDOM_SEED` (int) and `TRAINING_CONFIG` (dict) providing at least: `project`, `model_name`, `base_model`, `steps`, `trajectories_per_group`, `groups_per_step`, `learning_rate`, `max_completion_tokens`, `temperature`, `top_p`, `max_exceptions`, and `cleanup_keep_last`.
+4. Keep hyperparameters and environment constants easy to tweak at the top of the file; prefer small helper functions with docstrings for non-trivial logic.
+5. `rollout.py` must import from `env` and define `async def rollout(model: art.Model, step: int, config: dict[str, Any]) -> art.Trajectory` decorated with `@weave.op` and `@art.retry` guards, generating metadata and rewards similar to the 2048 example.
+6. Populate trajectory metadata using scalars only (no lists/dicts) so ART aggregation works.
+7. Use concise system/user prompts that explain how the policy should format responses.
+8. Validate structured outputs defensively and record any validation errors as metadata plus a numeric metric (e.g. `invalid_solution = 1.0`).
+9. Assume a LocalBackend for inference/training; add comments when copying memory-tuning values from 2048.py or when GPU selection matters.
+10. Avoid defining the training loop or evaluation entry point—the host project supplies a generic `training.py` that will import these files.
+11. Prefer type hints, docstrings, and a compact, readable style.
+12. Do not create extra files beyond `env.py` and `rollout.py`.
+13. Metadata must be a simple scalar value, not a list/dict.
+14. Metrics must be a number in trajectory.metrics.
+15. You should think deeply about the reward modeling for the task. Rewards are how the agent learns, so you should design them to be as informative as possible. You might want to consider having rewards that are somewhat smooth so that we can actually have some variance to learn.
+
+
+Example Implementation (2048):
+```python
+"""Clean ART training example for the game 2048.
+
+This script mirrors the structure we expect new Codex-generated jobs to follow:
+- pure Python environment helpers
+- rollout + reward shaping
+- training loop with gather/train steps
+- lightweight evaluation that reloads the trained LoRA weights
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import art
+from art.local import LocalBackend
+import requests
+import torch
+import weave
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from unsloth import FastLanguageModel
+
+BOARD_SIZE = 4
+WINNING_VALUE = 64
+RANDOM_SEED = 42
+
+
+class TwentyFortyEightGame(TypedDict):
+    """Simple state container for a single 2048 game."""
+
+    id: str
+    board: list[list[int | None]]
+
+
+def populate_random_cell(game: TwentyFortyEightGame) -> None:
+    """Populate a random empty cell with a 2 (90%) or 4 (10%)."""
+
+    clear_cells = [
+        (row_index, col_index)
+        for row_index, row in enumerate(game["board"])
+        for col_index, cell in enumerate(row)
+        if cell is None
+    ]
+    if not clear_cells:
+        return
+
+    row_index, col_index = random.choice(clear_cells)
+    game["board"][row_index][col_index] = 2 if random.random() < 0.9 else 4
+
+
+def generate_game() -> TwentyFortyEightGame:
+    """Create a fresh BOARD_SIZE x BOARD_SIZE game."""
+
+    game = {
+        "id": "".join(random.choices(string.ascii_letters + string.digits, k=6)),
+        "board": [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)],
+    }
+    populate_random_cell(game)
+    populate_random_cell(game)
+    return game
+
+
+def render_board(game: TwentyFortyEightGame) -> str:
+    """Return a printable board representation."""
+
+    def format_cell(value: int | None) -> str:
+        return str(value) if value is not None else "_"
+
+    column_width = max(
+        (len(format_cell(cell)) for row in game["board"] for cell in row),
+        default=1,
+    )
+    rows = [
+        "|".join(format_cell(cell).rjust(column_width) for cell in row)
+        for row in game["board"]
+    ]
+    return "\n".join(rows)
+
+
+def condense_sequence(sequence: list[int | None]) -> list[int | None]:
+    """Condense a row/column toward the start of the list."""
+
+    condensed: list[int | None] = []
+    values = [value for value in sequence if value is not None]
+    index = 0
+
+    while index < len(values):
+        if index + 1 < len(values) and values[index] == values[index + 1]:
+            condensed.append(values[index] * 2)
+            index += 2
+        else:
+            condensed.append(values[index])
+            index += 1
+
+    condensed.extend([None] * (BOARD_SIZE - len(condensed)))
+    return condensed
+
+
+def condense_board(
+    game: TwentyFortyEightGame,
+    direction: Literal["left", "right", "up", "down"],
+) -> None:
+    """Apply a move in the requested direction."""
+
+    if direction == "left":
+        for row_index, row in enumerate(game["board"]):
+            game["board"][row_index] = condense_sequence(row)
+
+    elif direction == "right":
+        for row_index, row in enumerate(game["board"]):
+            reversed_row = list(reversed(row))
+            condensed = list(reversed(condense_sequence(reversed_row)))
+            game["board"][row_index] = condensed
+
+    elif direction == "up":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = condense_sequence(column)
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+    elif direction == "down":
+        for col_index in range(BOARD_SIZE):
+            column = [row[col_index] for row in game["board"]]
+            condensed = list(reversed(condense_sequence(list(reversed(column)))))
+            for row_index in range(BOARD_SIZE):
+                game["board"][row_index][col_index] = condensed[row_index]
+
+
+def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
+    """Parse XML like <move>left</move> and mutate the board."""
+
+    try:
+        direction = ET.fromstring(move_xml).text
+    except ET.ParseError as exc:  # pragma: no cover - defensive
+        raise ValueError("Invalid XML payload") from exc
+
+    if direction not in {"left", "right", "up", "down"}:
+        raise ValueError(f"Invalid direction: {direction}")
+
+    condense_board(game, direction)  # type: ignore[arg-type]
+    populate_random_cell(game)
+
+
+def max_cell_value(game: TwentyFortyEightGame) -> int:
+    return max(cell or 0 for row in game["board"] for cell in row)
+
+
+def check_game_finished(game: TwentyFortyEightGame) -> bool:
+    if max_cell_value(game) >= WINNING_VALUE:
+        return True
+    if any(cell is None for row in game["board"] for cell in row):
+        return False
+    # When the board is full, we stop (simplification).
+    return True
+
+
+def total_board_value(game: TwentyFortyEightGame) -> int:
+    return sum(cell or 0 for row in game["board"] for cell in row)
+
+
+class Scenario2048(BaseModel):
+    step: int
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(model: art.Model, scenario: Scenario2048) -> art.Trajectory:
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    game = generate_game()
+    move_number = 0
+    trajectory = art.Trajectory(
+        messages_and_choices=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an excellent 2048 player. Always choose the move most "
+                    "likely to win. Valid moves are left/right/up/down. Respond with "
+                    "XML like <move>left</move>."
+                ),
+            }
+        ],
+        metadata={
+            "game_id": game["id"],
+            "notebook-id": "2048",
+            "step": scenario.step,
+        },
+        reward=0,
+    )
+
+    while True:
+        trajectory.messages_and_choices.append(
+            {"role": "user", "content": render_board(game)}
+        )
+
+        chat_completion = await client.chat.completions.create(
+            max_completion_tokens=128,
+            messages=trajectory.messages(),
+            model=model.name,
+            stream=False,
+        )
+
+        choice = chat_completion.choices[0]
+        content = choice.message.content
+        assert isinstance(content, str)
+        trajectory.messages_and_choices.append(choice)
+
+        try:
+            apply_agent_move(game, content)
+            move_number += 1
+        except ValueError:
+            trajectory.reward = -1
+            break
+
+        if check_game_finished(game):
+            max_value = max_cell_value(game)
+            board_value = total_board_value(game)
+            trajectory.metrics["max_value"] = max_value
+            trajectory.metrics["board_value"] = board_value
+            trajectory.metrics["move_number"] = move_number
+
+            if max_value < WINNING_VALUE:
+                trajectory.reward = _partial_win_reward(max_value, board_value)
+            else:
+                trajectory.reward = 2
+            break
+
+    return trajectory
+
+
+def _partial_win_reward(max_value: int, board_value: int) -> float:
+    max_value_reward = (math.log(max_value, 2) - 1) / (math.log(WINNING_VALUE, 2) - 1)
+    board_value_reward = (math.log(board_value, 2) - 1) / (
+        math.log(WINNING_VALUE * BOARD_SIZE * BOARD_SIZE, 2) - 1
+    )
+    return max_value_reward + (board_value_reward * 0.2)
+
+
+async def setup_model() -> tuple[art.TrainableModel, LocalBackend]:
+    load_dotenv()  # Optional W&B credentials.
+    random.seed(RANDOM_SEED)
+
+    model = art.TrainableModel(
+        name="agent-002",
+        project="2048-multi-turn",
+        base_model="Qwen/Qwen2.5-1.5B",
+    )
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(max_seq_length=8192),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.8,
+        ),
+    )
+
+    backend = LocalBackend(path="./.art")
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        print("Removing expandable_segments:True from PYTORCH_CUDA_ALLOC_CONF")
+        conf.remove("expandable_segments:True")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+    await model.register(backend)
+
+    if os.getenv("WANDB_API_KEY"):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    return model, backend
+
+
+async def run_training(model: art.TrainableModel, *, steps: int = 10, trajectories: int = 18) -> None:
+    for step in range(await model.get_step(), steps):
+        trajectory_groups = await art.gather_trajectory_groups(
+            (
+                art.TrajectoryGroup(
+                    rollout(model, Scenario2048(step=step)) for _ in range(trajectories)
+                )
+                for _ in range(1)
+            ),
+            pbar_desc="gather",
+            max_exceptions=trajectories,
+        )
+        await model.delete_checkpoints()
+        await model.train(
+            trajectory_groups,
+            config=art.TrainConfig(learning_rate=1e-5),
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+
+async def evaluate(model: art.TrainableModel) -> None:
+    step = await model.get_step()
+    checkpoint_dir = Path(
+        f".art/{model.project}/models/{model.name}/checkpoints/{step:04d}"
+    )
+    if not checkpoint_dir.exists():
+        print("No checkpoints available for evaluation")
+        return
+
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(checkpoint_dir),
+        max_seq_length=16384,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(peft_model)
+
+    game = generate_game()
+    move_number = 0
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an excellent 2048 player. Always choose the move most likely to "
+                "win. Respond with <move>left</move> style XML."
+            ),
+        }
+    ]
+
+    while not check_game_finished(game):
+        rendered_board = render_board(game)
+        messages.append({"role": "user", "content": rendered_board})
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+
+        with torch.no_grad():
+            outputs = peft_model.generate(
+                input_ids=inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        content = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": content})
+
+        apply_agent_move(game, content)
+        move_number += 1
+
+        if move_number % 10 == 0:
+            print(f"\nmove {move_number}")
+            print(f"board:\n{rendered_board}")
+            print(f"agent move: {content}")
+            print(f"updated board:\n{render_board(game)}")
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+
+    result = "game won!" if max_value >= WINNING_VALUE else "game lost."
+    print(
+        f"\nGame finished in {move_number} moves - {result}\n"
+        f"Final board:\n{render_board(game)}\n"
+        f"Max value: {max_value}\nBoard value: {board_value}"
+    )
+
+
+async def main() -> None:
+    model, _backend = await setup_model()
+    await run_training(model)
+    await evaluate(model)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+User Prompt:
+Create an ART reinforcement learning task that makes the agent generate short stories with an exact word count. The environment should emit a prompt describing theme and required word length (e.g. 10 words, 20 words). Seed with 10–20 reference prompts and target solutions. The agent must return plain text that matches the requested word count exactly; log word count deviations as numeric metrics and record errors in metadata. Follow the existing scaffold conventions.
+[2025-09-21T02:47:40] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/word_count_story/o3/20250921_024638/env.py
+"""Environment helpers for the *Exact Word-Count Story* ART task.
+
+This module contains minimal utilities required by OpenPipe's ART framework
+to train a language-model agent that writes short stories containing **exactly**
+a requested number of words.  All hyper-parameters live at the top of the file
+for easy experimentation.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
+
+# ---------------------------------------------------------------------------
+# Global constants & training configuration
+# ---------------------------------------------------------------------------
+
+# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
+# that unit tests and reproducibility are trivial.
+RANDOM_SEED: int = 2025
+
+
+# Training-loop settings consumed by ART's generic `training.py` script.  These
+# keys mirror those found in the 2048 example and are required by the prompt.
+TRAINING_CONFIG: dict = {
+    # wandb / weave project slug.
+    "project": "story-word-count",
+    # Name of the trainable model (arbitrary).
+    "model_name": "story-agent",
+    # The frozen base model that will receive the LoRA adapters.
+    # (The host machine must already have this model or know how to fetch it.)
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    # Total gradient-update steps.
+    "steps": 50,
+    # How many trajectory groups we gather per step.
+    "groups_per_step": 1,
+    # How many rollouts in each group.
+    "trajectories_per_group": 16,
+    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
+    "learning_rate": 1e-5,
+    # Generation parameters – we keep them conservative so the agent does not
+    # abuse the token budget.
+    "max_completion_tokens": 64,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    # Robustness & housekeeping.
+    "max_exceptions": 16,
+    "cleanup_keep_last": 3,
+}
+
+# ---------------------------------------------------------------------------
+# Scenario generation helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class StoryScenario:
+    """A single training / evaluation scenario.
+
+    Attributes
+    ----------
+    theme:  Short text describing what the story should be about.
+    word_count:  Exact number of words the agent must output.
+    reference:  Optional reference answer (not used for reward but handy for
+                debugging / dataset inspection).
+    """
+
+    theme: str
+    word_count: int
+    reference: str | None = None
+
+
+# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
+# practice you can extend / replace this with thousands of human-authored
+# examples – ART will happily scale.
+
+_SEED_SCENARIOS: List[StoryScenario] = [
+    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
+    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
+    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
+    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
+    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
+    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
+    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
+    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
+    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
+    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
+]
+
+
+def sample_scenario(step: int | None = None) -> StoryScenario:
+    """Return a pseudo-random scenario.
+
+    Parameters
+    ----------
+    step:  Current training step – incorporated into the RNG seed so that all
+           workers sample identical scenarios for deterministic debugging.
+    """
+
+    rng = random.Random(RANDOM_SEED + (step or 0))
+    return rng.choice(_SEED_SCENARIOS)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+
+def count_words(text: str) -> int:
+    """Return the number of whitespace-separated words in *text*.
+
+    The tokenizer is deliberately naive – we treat any contiguous sequence of
+    non-space characters as a word.  This matches how most evaluation scripts
+    count words and is fast enough for feedback-loop latencies.
+    """
+
+    return len([token for token in text.strip().split() if token])
+
+
+def word_count_reward(actual: int, target: int) -> float:
+    """Dense reward shaping for the word-count task.
+
+    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
+    reward decays linearly with the *relative* error so the gradient remains
+    informative even for large mistakes.
+    """
+
+    if target <= 0:
+        return -1.0  # Defensive – should never happen.
+    diff = abs(actual - target)
+    return max(1.0 - diff / target, -1.0)
+
+
+# Ensure deterministic behaviour across importers.
+random.seed(RANDOM_SEED)
+
+[2025-09-21T02:47:40] apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+A env.py
+[2025-09-21T02:47:40] turn diff:
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/env.py b/codex_runs/word_count_story/o3/20250921_024638/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f189b11089c425fa3bd35ec27203c242eddf2268
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/env.py
+@@ -0,0 +1,137 @@
++"""Environment helpers for the *Exact Word-Count Story* ART task.
++
++This module contains minimal utilities required by OpenPipe's ART framework
++to train a language-model agent that writes short stories containing **exactly**
++a requested number of words.  All hyper-parameters live at the top of the file
++for easy experimentation.
++"""
++
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from typing import Iterable, List, Tuple
++
++# ---------------------------------------------------------------------------
++# Global constants & training configuration
++# ---------------------------------------------------------------------------
++
++# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
++# that unit tests and reproducibility are trivial.
++RANDOM_SEED: int = 2025
++
++
++# Training-loop settings consumed by ART's generic `training.py` script.  These
++# keys mirror those found in the 2048 example and are required by the prompt.
++TRAINING_CONFIG: dict = {
++    # wandb / weave project slug.
++    "project": "story-word-count",
++    # Name of the trainable model (arbitrary).
++    "model_name": "story-agent",
++    # The frozen base model that will receive the LoRA adapters.
++    # (The host machine must already have this model or know how to fetch it.)
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    # Total gradient-update steps.
++    "steps": 50,
++    # How many trajectory groups we gather per step.
++    "groups_per_step": 1,
++    # How many rollouts in each group.
++    "trajectories_per_group": 16,
++    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
++    "learning_rate": 1e-5,
++    # Generation parameters – we keep them conservative so the agent does not
++    # abuse the token budget.
++    "max_completion_tokens": 64,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Robustness & housekeeping.
++    "max_exceptions": 16,
++    "cleanup_keep_last": 3,
++}
++
++# ---------------------------------------------------------------------------
++# Scenario generation helpers
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class StoryScenario:
++    """A single training / evaluation scenario.
++
++    Attributes
++    ----------
++    theme:  Short text describing what the story should be about.
++    word_count:  Exact number of words the agent must output.
++    reference:  Optional reference answer (not used for reward but handy for
++                debugging / dataset inspection).
++    """
++
++    theme: str
++    word_count: int
++    reference: str | None = None
++
++
++# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
++# practice you can extend / replace this with thousands of human-authored
++# examples – ART will happily scale.
++
++_SEED_SCENARIOS: List[StoryScenario] = [
++    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
++    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
++    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
++    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
++    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
++    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
++    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
++    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
++    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
++    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
++]
++
++
++def sample_scenario(step: int | None = None) -> StoryScenario:
++    """Return a pseudo-random scenario.
++
++    Parameters
++    ----------
++    step:  Current training step – incorporated into the RNG seed so that all
++           workers sample identical scenarios for deterministic debugging.
++    """
++
++    rng = random.Random(RANDOM_SEED + (step or 0))
++    return rng.choice(_SEED_SCENARIOS)
++
++
++# ---------------------------------------------------------------------------
++# Utility helpers
++# ---------------------------------------------------------------------------
++
++
++def count_words(text: str) -> int:
++    """Return the number of whitespace-separated words in *text*.
++
++    The tokenizer is deliberately naive – we treat any contiguous sequence of
++    non-space characters as a word.  This matches how most evaluation scripts
++    count words and is fast enough for feedback-loop latencies.
++    """
++
++    return len([token for token in text.strip().split() if token])
++
++
++def word_count_reward(actual: int, target: int) -> float:
++    """Dense reward shaping for the word-count task.
++
++    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
++    reward decays linearly with the *relative* error so the gradient remains
++    informative even for large mistakes.
++    """
++
++    if target <= 0:
++        return -1.0  # Defensive – should never happen.
++    diff = abs(actual - target)
++    return max(1.0 - diff / target, -1.0)
++
++
++# Ensure deterministic behaviour across importers.
++random.seed(RANDOM_SEED)
++
+
+[2025-09-21T02:47:40] tokens used: 12,378
+[2025-09-21T02:47:40] turn diff:
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/env.py b/codex_runs/word_count_story/o3/20250921_024638/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f189b11089c425fa3bd35ec27203c242eddf2268
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/env.py
+@@ -0,0 +1,137 @@
++"""Environment helpers for the *Exact Word-Count Story* ART task.
++
++This module contains minimal utilities required by OpenPipe's ART framework
++to train a language-model agent that writes short stories containing **exactly**
++a requested number of words.  All hyper-parameters live at the top of the file
++for easy experimentation.
++"""
++
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from typing import Iterable, List, Tuple
++
++# ---------------------------------------------------------------------------
++# Global constants & training configuration
++# ---------------------------------------------------------------------------
++
++# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
++# that unit tests and reproducibility are trivial.
++RANDOM_SEED: int = 2025
++
++
++# Training-loop settings consumed by ART's generic `training.py` script.  These
++# keys mirror those found in the 2048 example and are required by the prompt.
++TRAINING_CONFIG: dict = {
++    # wandb / weave project slug.
++    "project": "story-word-count",
++    # Name of the trainable model (arbitrary).
++    "model_name": "story-agent",
++    # The frozen base model that will receive the LoRA adapters.
++    # (The host machine must already have this model or know how to fetch it.)
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    # Total gradient-update steps.
++    "steps": 50,
++    # How many trajectory groups we gather per step.
++    "groups_per_step": 1,
++    # How many rollouts in each group.
++    "trajectories_per_group": 16,
++    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
++    "learning_rate": 1e-5,
++    # Generation parameters – we keep them conservative so the agent does not
++    # abuse the token budget.
++    "max_completion_tokens": 64,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Robustness & housekeeping.
++    "max_exceptions": 16,
++    "cleanup_keep_last": 3,
++}
++
++# ---------------------------------------------------------------------------
++# Scenario generation helpers
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class StoryScenario:
++    """A single training / evaluation scenario.
++
++    Attributes
++    ----------
++    theme:  Short text describing what the story should be about.
++    word_count:  Exact number of words the agent must output.
++    reference:  Optional reference answer (not used for reward but handy for
++                debugging / dataset inspection).
++    """
++
++    theme: str
++    word_count: int
++    reference: str | None = None
++
++
++# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
++# practice you can extend / replace this with thousands of human-authored
++# examples – ART will happily scale.
++
++_SEED_SCENARIOS: List[StoryScenario] = [
++    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
++    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
++    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
++    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
++    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
++    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
++    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
++    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
++    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
++    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
++]
++
++
++def sample_scenario(step: int | None = None) -> StoryScenario:
++    """Return a pseudo-random scenario.
++
++    Parameters
++    ----------
++    step:  Current training step – incorporated into the RNG seed so that all
++           workers sample identical scenarios for deterministic debugging.
++    """
++
++    rng = random.Random(RANDOM_SEED + (step or 0))
++    return rng.choice(_SEED_SCENARIOS)
++
++
++# ---------------------------------------------------------------------------
++# Utility helpers
++# ---------------------------------------------------------------------------
++
++
++def count_words(text: str) -> int:
++    """Return the number of whitespace-separated words in *text*.
++
++    The tokenizer is deliberately naive – we treat any contiguous sequence of
++    non-space characters as a word.  This matches how most evaluation scripts
++    count words and is fast enough for feedback-loop latencies.
++    """
++
++    return len([token for token in text.strip().split() if token])
++
++
++def word_count_reward(actual: int, target: int) -> float:
++    """Dense reward shaping for the word-count task.
++
++    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
++    reward decays linearly with the *relative* error so the gradient remains
++    informative even for large mistakes.
++    """
++
++    if target <= 0:
++        return -1.0  # Defensive – should never happen.
++    diff = abs(actual - target)
++    return max(1.0 - diff / target, -1.0)
++
++
++# Ensure deterministic behaviour across importers.
++random.seed(RANDOM_SEED)
++
+
+[2025-09-21T02:48:04] apply_patch auto_approved=true:
+A /home/azureuser/probable-goggles-1/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+"""ART rollout logic for the *Exact Word-Count Story* environment.
+
+This file is intentionally compact – it focuses solely on collecting a single
+trajectory: sampling a scenario, querying the model, validating the response,
+and attaching shaped rewards + metrics so ART can train adapters.
+"""
+
+from __future__ import annotations
+
+import math
+import xml.etree.ElementTree as ET  # noqa: F401 (kept for parity with 2048 example)
+from typing import Any
+
+import art
+import requests
+import weave
+from openai import AsyncOpenAI
+
+import env  # Local helpers
+
+
+# ---------------------------------------------------------------------------
+# Rollout
+# ---------------------------------------------------------------------------
+
+
+@weave.op
+@art.retry(exceptions=(requests.ReadTimeout,))
+async def rollout(
+    model: art.Model,
+    step: int,
+    config: dict[str, Any],  # noqa: D401 – Config forwarded by caller.
+) -> art.Trajectory:  # pragma: no cover – runtime function.
+    """Collect one trajectory for a *story-word-count* scenario.
+
+    Parameters
+    ----------
+    model:  The current *trainable* or *inference* model from ART.
+    step:   Training step so far – forwarded by ART's generic loop.
+    config: Unused free-form configuration dictionary (reserved for future).
+    """
+
+    # ---------------------------------------------------------------------
+    # 1. Sample / build scenario & tracking containers.
+    # ---------------------------------------------------------------------
+
+    scenario = env.sample_scenario(step)
+
+    # System instruction includes formatting constraints – used every turn so
+    # the model cannot claim it never saw the requirement.
+    system_prompt = (
+        "You are a concise creative writer.  Respond with *plain text only* – "
+        "no quotes, no bullet points, no numbering, and exactly the required "
+        "word count.  Contractions count as one word.  Avoid filler words."  # noqa: E501
+    )
+
+    # "User" message describes the concrete task.
+    user_prompt = (
+        f"Write a short story of exactly {scenario.word_count} words about "
+        f"{scenario.theme}."
+    )
+
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "system", "content": system_prompt}],
+        metadata={
+            "step": step,
+            "theme": scenario.theme,
+            "target_word_count": scenario.word_count,
+        },
+        reward=0.0,
+    )
+
+    # Append user prompt.
+    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
+
+    # ---------------------------------------------------------------------
+    # 2. Query model.
+    # ---------------------------------------------------------------------
+
+    client = AsyncOpenAI(
+        base_url=model.inference_base_url,
+        api_key=model.inference_api_key,
+    )
+
+    chat_completion = await client.chat.completions.create(
+        messages=trajectory.messages(),
+        model=model.name,
+        max_completion_tokens=env.TRAINING_CONFIG["max_completion_tokens"],
+        temperature=env.TRAINING_CONFIG["temperature"],
+        top_p=env.TRAINING_CONFIG["top_p"],
+        stream=False,
+    )
+
+    choice = chat_completion.choices[0]
+    content = choice.message.content or ""
+    trajectory.messages_and_choices.append(choice)
+
+    # ---------------------------------------------------------------------
+    # 3. Validate response & build rewards / metrics.
+    # ---------------------------------------------------------------------
+
+    actual_words = env.count_words(content)
+    target_words = scenario.word_count
+    diff = abs(actual_words - target_words)
+
+    trajectory.metrics["word_count"] = actual_words
+    trajectory.metrics["word_diff"] = diff
+
+    # Binary flag so we can quickly slice datasets for troubleshooting.
+    invalid_solution = float(diff != 0)
+    trajectory.metrics["invalid_solution"] = invalid_solution
+
+    # Reward shaping – dense and symmetric so PPO has gradient everywhere.
+    trajectory.reward = env.word_count_reward(actual_words, target_words)
+
+    # Record validation error in *metadata* (string scalar) for aggregation.
+    if diff != 0:
+        trajectory.metadata["error"] = (
+            f"wrong word count: expected {target_words}, got {actual_words}"
+        )
+
+    return trajectory
+
+
+# ---------------------------------------------------------------------------
+# Convenience exposure so `training.py` can import without knowing internals.
+# ---------------------------------------------------------------------------
+
+__all__ = ["rollout"]
+
+[2025-09-21T02:48:04] apply_patch(auto_approved=true) exited 0 in 5ms:
+Success. Updated the following files:
+A rollout.py
+[2025-09-21T02:48:04] turn diff:
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/env.py b/codex_runs/word_count_story/o3/20250921_024638/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f189b11089c425fa3bd35ec27203c242eddf2268
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/env.py
+@@ -0,0 +1,137 @@
++"""Environment helpers for the *Exact Word-Count Story* ART task.
++
++This module contains minimal utilities required by OpenPipe's ART framework
++to train a language-model agent that writes short stories containing **exactly**
++a requested number of words.  All hyper-parameters live at the top of the file
++for easy experimentation.
++"""
++
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from typing import Iterable, List, Tuple
++
++# ---------------------------------------------------------------------------
++# Global constants & training configuration
++# ---------------------------------------------------------------------------
++
++# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
++# that unit tests and reproducibility are trivial.
++RANDOM_SEED: int = 2025
++
++
++# Training-loop settings consumed by ART's generic `training.py` script.  These
++# keys mirror those found in the 2048 example and are required by the prompt.
++TRAINING_CONFIG: dict = {
++    # wandb / weave project slug.
++    "project": "story-word-count",
++    # Name of the trainable model (arbitrary).
++    "model_name": "story-agent",
++    # The frozen base model that will receive the LoRA adapters.
++    # (The host machine must already have this model or know how to fetch it.)
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    # Total gradient-update steps.
++    "steps": 50,
++    # How many trajectory groups we gather per step.
++    "groups_per_step": 1,
++    # How many rollouts in each group.
++    "trajectories_per_group": 16,
++    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
++    "learning_rate": 1e-5,
++    # Generation parameters – we keep them conservative so the agent does not
++    # abuse the token budget.
++    "max_completion_tokens": 64,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Robustness & housekeeping.
++    "max_exceptions": 16,
++    "cleanup_keep_last": 3,
++}
++
++# ---------------------------------------------------------------------------
++# Scenario generation helpers
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class StoryScenario:
++    """A single training / evaluation scenario.
++
++    Attributes
++    ----------
++    theme:  Short text describing what the story should be about.
++    word_count:  Exact number of words the agent must output.
++    reference:  Optional reference answer (not used for reward but handy for
++                debugging / dataset inspection).
++    """
++
++    theme: str
++    word_count: int
++    reference: str | None = None
++
++
++# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
++# practice you can extend / replace this with thousands of human-authored
++# examples – ART will happily scale.
++
++_SEED_SCENARIOS: List[StoryScenario] = [
++    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
++    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
++    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
++    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
++    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
++    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
++    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
++    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
++    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
++    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
++]
++
++
++def sample_scenario(step: int | None = None) -> StoryScenario:
++    """Return a pseudo-random scenario.
++
++    Parameters
++    ----------
++    step:  Current training step – incorporated into the RNG seed so that all
++           workers sample identical scenarios for deterministic debugging.
++    """
++
++    rng = random.Random(RANDOM_SEED + (step or 0))
++    return rng.choice(_SEED_SCENARIOS)
++
++
++# ---------------------------------------------------------------------------
++# Utility helpers
++# ---------------------------------------------------------------------------
++
++
++def count_words(text: str) -> int:
++    """Return the number of whitespace-separated words in *text*.
++
++    The tokenizer is deliberately naive – we treat any contiguous sequence of
++    non-space characters as a word.  This matches how most evaluation scripts
++    count words and is fast enough for feedback-loop latencies.
++    """
++
++    return len([token for token in text.strip().split() if token])
++
++
++def word_count_reward(actual: int, target: int) -> float:
++    """Dense reward shaping for the word-count task.
++
++    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
++    reward decays linearly with the *relative* error so the gradient remains
++    informative even for large mistakes.
++    """
++
++    if target <= 0:
++        return -1.0  # Defensive – should never happen.
++    diff = abs(actual - target)
++    return max(1.0 - diff / target, -1.0)
++
++
++# Ensure deterministic behaviour across importers.
++random.seed(RANDOM_SEED)
++
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/rollout.py b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27a87007f27b1b63c7438ea7003dabe6004eab21
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+@@ -0,0 +1,130 @@
++"""ART rollout logic for the *Exact Word-Count Story* environment.
++
++This file is intentionally compact – it focuses solely on collecting a single
++trajectory: sampling a scenario, querying the model, validating the response,
++and attaching shaped rewards + metrics so ART can train adapters.
++"""
++
++from __future__ import annotations
++
++import math
++import xml.etree.ElementTree as ET  # noqa: F401 (kept for parity with 2048 example)
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++import env  # Local helpers
++
++
++# ---------------------------------------------------------------------------
++# Rollout
++# ---------------------------------------------------------------------------
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(
++    model: art.Model,
++    step: int,
++    config: dict[str, Any],  # noqa: D401 – Config forwarded by caller.
++) -> art.Trajectory:  # pragma: no cover – runtime function.
++    """Collect one trajectory for a *story-word-count* scenario.
++
++    Parameters
++    ----------
++    model:  The current *trainable* or *inference* model from ART.
++    step:   Training step so far – forwarded by ART's generic loop.
++    config: Unused free-form configuration dictionary (reserved for future).
++    """
++
++    # ---------------------------------------------------------------------
++    # 1. Sample / build scenario & tracking containers.
++    # ---------------------------------------------------------------------
++
++    scenario = env.sample_scenario(step)
++
++    # System instruction includes formatting constraints – used every turn so
++    # the model cannot claim it never saw the requirement.
++    system_prompt = (
++        "You are a concise creative writer.  Respond with *plain text only* – "
++        "no quotes, no bullet points, no numbering, and exactly the required "
++        "word count.  Contractions count as one word.  Avoid filler words."  # noqa: E501
++    )
++
++    # "User" message describes the concrete task.
++    user_prompt = (
++        f"Write a short story of exactly {scenario.word_count} words about "
++        f"{scenario.theme}."
++    )
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": system_prompt}],
++        metadata={
++            "step": step,
++            "theme": scenario.theme,
++            "target_word_count": scenario.word_count,
++        },
++        reward=0.0,
++    )
++
++    # Append user prompt.
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # ---------------------------------------------------------------------
++    # 2. Query model.
++    # ---------------------------------------------------------------------
++
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=env.TRAINING_CONFIG["max_completion_tokens"],
++        temperature=env.TRAINING_CONFIG["temperature"],
++        top_p=env.TRAINING_CONFIG["top_p"],
++        stream=False,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # ---------------------------------------------------------------------
++    # 3. Validate response & build rewards / metrics.
++    # ---------------------------------------------------------------------
++
++    actual_words = env.count_words(content)
++    target_words = scenario.word_count
++    diff = abs(actual_words - target_words)
++
++    trajectory.metrics["word_count"] = actual_words
++    trajectory.metrics["word_diff"] = diff
++
++    # Binary flag so we can quickly slice datasets for troubleshooting.
++    invalid_solution = float(diff != 0)
++    trajectory.metrics["invalid_solution"] = invalid_solution
++
++    # Reward shaping – dense and symmetric so PPO has gradient everywhere.
++    trajectory.reward = env.word_count_reward(actual_words, target_words)
++
++    # Record validation error in *metadata* (string scalar) for aggregation.
++    if diff != 0:
++        trajectory.metadata["error"] = (
++            f"wrong word count: expected {target_words}, got {actual_words}"
++        )
++
++    return trajectory
++
++
++# ---------------------------------------------------------------------------
++# Convenience exposure so `training.py` can import without knowing internals.
++# ---------------------------------------------------------------------------
++
++__all__ = ["rollout"]
++
+
+[2025-09-21T02:48:04] tokens used: 20,268
+[2025-09-21T02:48:04] turn diff:
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/env.py b/codex_runs/word_count_story/o3/20250921_024638/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f189b11089c425fa3bd35ec27203c242eddf2268
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/env.py
+@@ -0,0 +1,137 @@
++"""Environment helpers for the *Exact Word-Count Story* ART task.
++
++This module contains minimal utilities required by OpenPipe's ART framework
++to train a language-model agent that writes short stories containing **exactly**
++a requested number of words.  All hyper-parameters live at the top of the file
++for easy experimentation.
++"""
++
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from typing import Iterable, List, Tuple
++
++# ---------------------------------------------------------------------------
++# Global constants & training configuration
++# ---------------------------------------------------------------------------
++
++# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
++# that unit tests and reproducibility are trivial.
++RANDOM_SEED: int = 2025
++
++
++# Training-loop settings consumed by ART's generic `training.py` script.  These
++# keys mirror those found in the 2048 example and are required by the prompt.
++TRAINING_CONFIG: dict = {
++    # wandb / weave project slug.
++    "project": "story-word-count",
++    # Name of the trainable model (arbitrary).
++    "model_name": "story-agent",
++    # The frozen base model that will receive the LoRA adapters.
++    # (The host machine must already have this model or know how to fetch it.)
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    # Total gradient-update steps.
++    "steps": 50,
++    # How many trajectory groups we gather per step.
++    "groups_per_step": 1,
++    # How many rollouts in each group.
++    "trajectories_per_group": 16,
++    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
++    "learning_rate": 1e-5,
++    # Generation parameters – we keep them conservative so the agent does not
++    # abuse the token budget.
++    "max_completion_tokens": 64,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Robustness & housekeeping.
++    "max_exceptions": 16,
++    "cleanup_keep_last": 3,
++}
++
++# ---------------------------------------------------------------------------
++# Scenario generation helpers
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class StoryScenario:
++    """A single training / evaluation scenario.
++
++    Attributes
++    ----------
++    theme:  Short text describing what the story should be about.
++    word_count:  Exact number of words the agent must output.
++    reference:  Optional reference answer (not used for reward but handy for
++                debugging / dataset inspection).
++    """
++
++    theme: str
++    word_count: int
++    reference: str | None = None
++
++
++# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
++# practice you can extend / replace this with thousands of human-authored
++# examples – ART will happily scale.
++
++_SEED_SCENARIOS: List[StoryScenario] = [
++    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
++    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
++    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
++    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
++    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
++    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
++    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
++    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
++    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
++    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
++]
++
++
++def sample_scenario(step: int | None = None) -> StoryScenario:
++    """Return a pseudo-random scenario.
++
++    Parameters
++    ----------
++    step:  Current training step – incorporated into the RNG seed so that all
++           workers sample identical scenarios for deterministic debugging.
++    """
++
++    rng = random.Random(RANDOM_SEED + (step or 0))
++    return rng.choice(_SEED_SCENARIOS)
++
++
++# ---------------------------------------------------------------------------
++# Utility helpers
++# ---------------------------------------------------------------------------
++
++
++def count_words(text: str) -> int:
++    """Return the number of whitespace-separated words in *text*.
++
++    The tokenizer is deliberately naive – we treat any contiguous sequence of
++    non-space characters as a word.  This matches how most evaluation scripts
++    count words and is fast enough for feedback-loop latencies.
++    """
++
++    return len([token for token in text.strip().split() if token])
++
++
++def word_count_reward(actual: int, target: int) -> float:
++    """Dense reward shaping for the word-count task.
++
++    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
++    reward decays linearly with the *relative* error so the gradient remains
++    informative even for large mistakes.
++    """
++
++    if target <= 0:
++        return -1.0  # Defensive – should never happen.
++    diff = abs(actual - target)
++    return max(1.0 - diff / target, -1.0)
++
++
++# Ensure deterministic behaviour across importers.
++random.seed(RANDOM_SEED)
++
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/rollout.py b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27a87007f27b1b63c7438ea7003dabe6004eab21
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+@@ -0,0 +1,130 @@
++"""ART rollout logic for the *Exact Word-Count Story* environment.
++
++This file is intentionally compact – it focuses solely on collecting a single
++trajectory: sampling a scenario, querying the model, validating the response,
++and attaching shaped rewards + metrics so ART can train adapters.
++"""
++
++from __future__ import annotations
++
++import math
++import xml.etree.ElementTree as ET  # noqa: F401 (kept for parity with 2048 example)
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++import env  # Local helpers
++
++
++# ---------------------------------------------------------------------------
++# Rollout
++# ---------------------------------------------------------------------------
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(
++    model: art.Model,
++    step: int,
++    config: dict[str, Any],  # noqa: D401 – Config forwarded by caller.
++) -> art.Trajectory:  # pragma: no cover – runtime function.
++    """Collect one trajectory for a *story-word-count* scenario.
++
++    Parameters
++    ----------
++    model:  The current *trainable* or *inference* model from ART.
++    step:   Training step so far – forwarded by ART's generic loop.
++    config: Unused free-form configuration dictionary (reserved for future).
++    """
++
++    # ---------------------------------------------------------------------
++    # 1. Sample / build scenario & tracking containers.
++    # ---------------------------------------------------------------------
++
++    scenario = env.sample_scenario(step)
++
++    # System instruction includes formatting constraints – used every turn so
++    # the model cannot claim it never saw the requirement.
++    system_prompt = (
++        "You are a concise creative writer.  Respond with *plain text only* – "
++        "no quotes, no bullet points, no numbering, and exactly the required "
++        "word count.  Contractions count as one word.  Avoid filler words."  # noqa: E501
++    )
++
++    # "User" message describes the concrete task.
++    user_prompt = (
++        f"Write a short story of exactly {scenario.word_count} words about "
++        f"{scenario.theme}."
++    )
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": system_prompt}],
++        metadata={
++            "step": step,
++            "theme": scenario.theme,
++            "target_word_count": scenario.word_count,
++        },
++        reward=0.0,
++    )
++
++    # Append user prompt.
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # ---------------------------------------------------------------------
++    # 2. Query model.
++    # ---------------------------------------------------------------------
++
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=env.TRAINING_CONFIG["max_completion_tokens"],
++        temperature=env.TRAINING_CONFIG["temperature"],
++        top_p=env.TRAINING_CONFIG["top_p"],
++        stream=False,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # ---------------------------------------------------------------------
++    # 3. Validate response & build rewards / metrics.
++    # ---------------------------------------------------------------------
++
++    actual_words = env.count_words(content)
++    target_words = scenario.word_count
++    diff = abs(actual_words - target_words)
++
++    trajectory.metrics["word_count"] = actual_words
++    trajectory.metrics["word_diff"] = diff
++
++    # Binary flag so we can quickly slice datasets for troubleshooting.
++    invalid_solution = float(diff != 0)
++    trajectory.metrics["invalid_solution"] = invalid_solution
++
++    # Reward shaping – dense and symmetric so PPO has gradient everywhere.
++    trajectory.reward = env.word_count_reward(actual_words, target_words)
++
++    # Record validation error in *metadata* (string scalar) for aggregation.
++    if diff != 0:
++        trajectory.metadata["error"] = (
++            f"wrong word count: expected {target_words}, got {actual_words}"
++        )
++
++    return trajectory
++
++
++# ---------------------------------------------------------------------------
++# Convenience exposure so `training.py` can import without knowing internals.
++# ---------------------------------------------------------------------------
++
++__all__ = ["rollout"]
++
+
+[2025-09-21T02:48:04] codex
+
+Two-file task package ready.
+
+env.py
+- Defines RANDOM_SEED, fully-tweakable TRAINING_CONFIG, tiny seeded prompt set, `sample_scenario`, `count_words`, and dense `word_count_reward`.
+
+rollout.py
+- Implements `@weave.op` + `@art.retry` async `rollout`.
+- Samples a scenario, sends concise system/user prompts, validates exact word count, logs scalar metadata/metrics, and shapes reward smoothly.
+
+Both files follow ART conventions and contain no extraneous code or dependencies.
+[2025-09-21T02:48:06] tokens used: 23,451
+[2025-09-21T02:48:06] turn diff:
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/env.py b/codex_runs/word_count_story/o3/20250921_024638/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f189b11089c425fa3bd35ec27203c242eddf2268
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/env.py
+@@ -0,0 +1,137 @@
++"""Environment helpers for the *Exact Word-Count Story* ART task.
++
++This module contains minimal utilities required by OpenPipe's ART framework
++to train a language-model agent that writes short stories containing **exactly**
++a requested number of words.  All hyper-parameters live at the top of the file
++for easy experimentation.
++"""
++
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from typing import Iterable, List, Tuple
++
++# ---------------------------------------------------------------------------
++# Global constants & training configuration
++# ---------------------------------------------------------------------------
++
++# NOTE: Keep a single, deterministic random seed for *all* stochastic helpers so
++# that unit tests and reproducibility are trivial.
++RANDOM_SEED: int = 2025
++
++
++# Training-loop settings consumed by ART's generic `training.py` script.  These
++# keys mirror those found in the 2048 example and are required by the prompt.
++TRAINING_CONFIG: dict = {
++    # wandb / weave project slug.
++    "project": "story-word-count",
++    # Name of the trainable model (arbitrary).
++    "model_name": "story-agent",
++    # The frozen base model that will receive the LoRA adapters.
++    # (The host machine must already have this model or know how to fetch it.)
++    "base_model": "Qwen/Qwen2.5-1.5B",
++    # Total gradient-update steps.
++    "steps": 50,
++    # How many trajectory groups we gather per step.
++    "groups_per_step": 1,
++    # How many rollouts in each group.
++    "trajectories_per_group": 16,
++    # Adam learning-rate schedule.  Copied from 2048 baseline for memory safety.
++    "learning_rate": 1e-5,
++    # Generation parameters – we keep them conservative so the agent does not
++    # abuse the token budget.
++    "max_completion_tokens": 64,
++    "temperature": 0.7,
++    "top_p": 0.9,
++    # Robustness & housekeeping.
++    "max_exceptions": 16,
++    "cleanup_keep_last": 3,
++}
++
++# ---------------------------------------------------------------------------
++# Scenario generation helpers
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class StoryScenario:
++    """A single training / evaluation scenario.
++
++    Attributes
++    ----------
++    theme:  Short text describing what the story should be about.
++    word_count:  Exact number of words the agent must output.
++    reference:  Optional reference answer (not used for reward but handy for
++                debugging / dataset inspection).
++    """
++
++    theme: str
++    word_count: int
++    reference: str | None = None
++
++
++# A *tiny* seed dataset so the agent receives diverse prompts early on.  In
++# practice you can extend / replace this with thousands of human-authored
++# examples – ART will happily scale.
++
++_SEED_SCENARIOS: List[StoryScenario] = [
++    StoryScenario("a sunrise over the ocean", 10, "Waves whispered secrets as golden sunbeams painted the awakening sea."),
++    StoryScenario("lost in a haunted library", 15, "Dusty tomes murmured forgotten curses while candles flickered, guiding Clara through endless aisles."),
++    StoryScenario("cyberpunk street market", 12, "Neon drenched vendors bartered hacked dreams beneath buzzing hover-bikes and rain."),
++    StoryScenario("dragon negotiates peace", 20, "Scales shimmering, the ancient dragon addressed trembling kings, proposing treaties forged in embered wisdom and mutual respect."),
++    StoryScenario("interstellar coffee shop", 11, "Aliens traded star-maps for espresso, discussing supernovas over fragrant crema."),
++    StoryScenario("time-looping birthday", 14, "Every candle relit itself, trapping Jonah in cheerful repetition until gratitude broke the cycle."),
++    StoryScenario("robot learns to paint", 13, "Metal fingers hesitated, then blossomed colors, discovering humanity in gentle brushstrokes."),
++    StoryScenario("hidden forest portal", 16, "Mossy archway shimmered; Eva stepped through, exchanging mundane worries for luminescent blossoms and curious sprites."),
++    StoryScenario("deserted carnival at midnight", 18, "Rusty rides creaked haunting lullabies while moonlit tickets fluttered like ghosts around Liam's cautious footsteps."),
++    StoryScenario("astronaut's lonely orbit", 17, "Earth rose blue and silent; Commander Reyes whispered stories to the twinkling void for company."),
++]
++
++
++def sample_scenario(step: int | None = None) -> StoryScenario:
++    """Return a pseudo-random scenario.
++
++    Parameters
++    ----------
++    step:  Current training step – incorporated into the RNG seed so that all
++           workers sample identical scenarios for deterministic debugging.
++    """
++
++    rng = random.Random(RANDOM_SEED + (step or 0))
++    return rng.choice(_SEED_SCENARIOS)
++
++
++# ---------------------------------------------------------------------------
++# Utility helpers
++# ---------------------------------------------------------------------------
++
++
++def count_words(text: str) -> int:
++    """Return the number of whitespace-separated words in *text*.
++
++    The tokenizer is deliberately naive – we treat any contiguous sequence of
++    non-space characters as a word.  This matches how most evaluation scripts
++    count words and is fast enough for feedback-loop latencies.
++    """
++
++    return len([token for token in text.strip().split() if token])
++
++
++def word_count_reward(actual: int, target: int) -> float:
++    """Dense reward shaping for the word-count task.
++
++    The agent receives a reward \in [-1, 1].  Perfect matches yield 1.0.  The
++    reward decays linearly with the *relative* error so the gradient remains
++    informative even for large mistakes.
++    """
++
++    if target <= 0:
++        return -1.0  # Defensive – should never happen.
++    diff = abs(actual - target)
++    return max(1.0 - diff / target, -1.0)
++
++
++# Ensure deterministic behaviour across importers.
++random.seed(RANDOM_SEED)
++
+diff --git a/codex_runs/word_count_story/o3/20250921_024638/rollout.py b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27a87007f27b1b63c7438ea7003dabe6004eab21
+--- /dev/null
++++ b/codex_runs/word_count_story/o3/20250921_024638/rollout.py
+@@ -0,0 +1,130 @@
++"""ART rollout logic for the *Exact Word-Count Story* environment.
++
++This file is intentionally compact – it focuses solely on collecting a single
++trajectory: sampling a scenario, querying the model, validating the response,
++and attaching shaped rewards + metrics so ART can train adapters.
++"""
++
++from __future__ import annotations
++
++import math
++import xml.etree.ElementTree as ET  # noqa: F401 (kept for parity with 2048 example)
++from typing import Any
++
++import art
++import requests
++import weave
++from openai import AsyncOpenAI
++
++import env  # Local helpers
++
++
++# ---------------------------------------------------------------------------
++# Rollout
++# ---------------------------------------------------------------------------
++
++
++@weave.op
++@art.retry(exceptions=(requests.ReadTimeout,))
++async def rollout(
++    model: art.Model,
++    step: int,
++    config: dict[str, Any],  # noqa: D401 – Config forwarded by caller.
++) -> art.Trajectory:  # pragma: no cover – runtime function.
++    """Collect one trajectory for a *story-word-count* scenario.
++
++    Parameters
++    ----------
++    model:  The current *trainable* or *inference* model from ART.
++    step:   Training step so far – forwarded by ART's generic loop.
++    config: Unused free-form configuration dictionary (reserved for future).
++    """
++
++    # ---------------------------------------------------------------------
++    # 1. Sample / build scenario & tracking containers.
++    # ---------------------------------------------------------------------
++
++    scenario = env.sample_scenario(step)
++
++    # System instruction includes formatting constraints – used every turn so
++    # the model cannot claim it never saw the requirement.
++    system_prompt = (
++        "You are a concise creative writer.  Respond with *plain text only* – "
++        "no quotes, no bullet points, no numbering, and exactly the required "
++        "word count.  Contractions count as one word.  Avoid filler words."  # noqa: E501
++    )
++
++    # "User" message describes the concrete task.
++    user_prompt = (
++        f"Write a short story of exactly {scenario.word_count} words about "
++        f"{scenario.theme}."
++    )
++
++    trajectory = art.Trajectory(
++        messages_and_choices=[{"role": "system", "content": system_prompt}],
++        metadata={
++            "step": step,
++            "theme": scenario.theme,
++            "target_word_count": scenario.word_count,
++        },
++        reward=0.0,
++    )
++
++    # Append user prompt.
++    trajectory.messages_and_choices.append({"role": "user", "content": user_prompt})
++
++    # ---------------------------------------------------------------------
++    # 2. Query model.
++    # ---------------------------------------------------------------------
++
++    client = AsyncOpenAI(
++        base_url=model.inference_base_url,
++        api_key=model.inference_api_key,
++    )
++
++    chat_completion = await client.chat.completions.create(
++        messages=trajectory.messages(),
++        model=model.name,
++        max_completion_tokens=env.TRAINING_CONFIG["max_completion_tokens"],
++        temperature=env.TRAINING_CONFIG["temperature"],
++        top_p=env.TRAINING_CONFIG["top_p"],
++        stream=False,
++    )
++
++    choice = chat_completion.choices[0]
++    content = choice.message.content or ""
++    trajectory.messages_and_choices.append(choice)
++
++    # ---------------------------------------------------------------------
++    # 3. Validate response & build rewards / metrics.
++    # ---------------------------------------------------------------------
++
++    actual_words = env.count_words(content)
++    target_words = scenario.word_count
++    diff = abs(actual_words - target_words)
++
++    trajectory.metrics["word_count"] = actual_words
++    trajectory.metrics["word_diff"] = diff
++
++    # Binary flag so we can quickly slice datasets for troubleshooting.
++    invalid_solution = float(diff != 0)
++    trajectory.metrics["invalid_solution"] = invalid_solution
++
++    # Reward shaping – dense and symmetric so PPO has gradient everywhere.
++    trajectory.reward = env.word_count_reward(actual_words, target_words)
++
++    # Record validation error in *metadata* (string scalar) for aggregation.
++    if diff != 0:
++        trajectory.metadata["error"] = (
++            f"wrong word count: expected {target_words}, got {actual_words}"
++        )
++
++    return trajectory
++
++
++# ---------------------------------------------------------------------------
++# Convenience exposure so `training.py` can import without knowing internals.
++# ---------------------------------------------------------------------------
++
++__all__ = ["rollout"]
++
+
