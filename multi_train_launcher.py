@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-DEFAULT_TIMEOUT_SECONDS = 600  # 10 minutes
+DEFAULT_TIMEOUT_SECONDS = 300  # 5 minutes
 DEFAULT_MAX_CONCURRENT = 1
 
 

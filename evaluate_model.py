@@ -12,7 +12,8 @@ from typing import Any, Dict
 import torch
 from openai import OpenAI
 from unsloth import FastLanguageModel
-
+from dotenv import load_dotenv
+load_dotenv()
 
 @dataclass
 class EvaluationPlan:
@@ -51,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gpt5-model",
-        default="gpt-5.0",
-        help="Model name for the GPT-5 planner (default: gpt-5.0)",
+        default="gpt-5",
+        help="Model name for the GPT-5 planner (default: gpt-5)",
     )
     parser.add_argument(
         "--evaluator-model",
@@ -88,6 +89,9 @@ def request_evaluation_plan(client: OpenAI, gpt5_model: str, user_prompt: str) -
         "You are designing an evaluation for a fine-tuned model. "
         "Using the provided task description, craft a single test case. "
         "Return JSON with keys system_message, user_message, evaluation_instructions, notes."
+        "Note: the provided task description was the prompt that was used to create the RL environment that the model was GRPOed on."
+        "You should design a question that would be in line with the task description and the model was trying to solve - not creating the RL environment itself."
+        f"Also - do remember that the model that we are evaluating is relatively small, so the question should be relatively simple."
     )
     resp = client.responses.create(
         model=gpt5_model,
@@ -165,7 +169,7 @@ def evaluate_with_code_interpreter(
 ) -> Dict[str, Any]:
     instructions = (
         "You are a meticulous evaluator. Use the python code tool when helpful to check correctness. "
-        "Return a JSON object with keys score (0-1), reasoning, passed (boolean)."
+        "Return a JSON object with keys score (0-1.0) non-integer scores are allowed, reasoning, passed (boolean)."
     )
     evaluation_prompt = (
         "Task description notes:\n" + plan.notes + "\n\n"

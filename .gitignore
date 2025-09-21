@@ -1,5 +1,6 @@
 *.pyc
 .art/
+.art_old/
 unsloth_compiled_cache/
 wandb/
 .env
