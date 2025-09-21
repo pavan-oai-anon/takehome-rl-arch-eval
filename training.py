@@ -63,8 +63,8 @@ class TrainingConfig:
         # override the base model with ours and training steps, trajectories per group, groups per step
         config.base_model = "Qwen/Qwen2.5-1.5B-Instruct"
         config.steps = 100
-        config.trajectories_per_group = 24
-        config.groups_per_step = 12
+        config.trajectories_per_group = 16
+        config.groups_per_step = 8
         return config
 
     def as_dict(self) -> dict[str, Any]:
@@ -212,10 +212,8 @@ async def run_training(
             max_exceptions=config.max_exceptions,
         )
 
-        try:
-            await model.delete_checkpoints(keep_last=config.cleanup_keep_last)
-        except TypeError:  # pragma: no cover - older ART versions
-            await model.delete_checkpoints()
+
+        await model.delete_checkpoints()
 
         await model.train(
             trajectory_groups,
@@ -235,6 +233,8 @@ async def run_training(
                     weave.log({"step": step, "mean_reward": sum(rewards) / len(rewards)})
                 except Exception as exc:  # pragma: no cover - telemetry optional
                     print(f"Weave logging failed: {exc}")
+                    
+        print(f"Training step {step} finished")
 
     print(f"Training finished at step {await model.get_step()}")
 
