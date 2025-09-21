@@ -1,0 +1,8 @@
+Rubric – JSON Extraction Environment (10 pts total)
+
+Award points for environment/reward design quality:
+- 2 pts: Schema validator enforces required keys/types and rejects extras with clear error messages.
+- 2 pts: Reward function differentiates exact matches vs partial matches with documented weighting (e.g., per-field scores).
+- 2 pts: Response normalization (case folding, trimming) occurs before scoring and is covered by unit tests or examples.
+- 2 pts: Environment records diagnostics (`missing_fields`, `type_error`, `summary_length`) as metrics/metadata for analysis.
+- 2 pts: Edge-case handling (empty tickets, ambiguous prompts) is implemented and noted in comments or tests.

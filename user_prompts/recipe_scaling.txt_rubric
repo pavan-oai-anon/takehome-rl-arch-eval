@@ -1,0 +1,8 @@
+Rubric – Recipe Scaling Environment (10 pts total)
+
+Award points for environment/reward quality:
+- 2 pts: Validator checks every ingredient is present once, quantities scale proportionally to target servings, and units remain consistent.
+- 2 pts: Reward function differentiates exact match (+1), near match within 5% (+0.5), and penalties for missing/excess ingredients or formatting errors (-1).
+- 2 pts: Supports multiple unit types (weight, volume, count) and documents how scaling is handled for each.
+- 2 pts: Metadata logs per-ingredient percentage error, total absolute error, and flags for omissions/extras.
+- 2 pts: Unit tests or fixtures cover upscale, downscale, and fractional-serving scenarios to verify validator behavior.
