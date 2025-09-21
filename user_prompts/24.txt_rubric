@@ -3,6 +3,6 @@ Rubric – 24 Arithmetic Game Environment
 Award points based on the quality of the environment implementation and reward shaping:
 - 2 pts: Reward function properly executes the expression and checks to see if the expression equals 24. 
 - 2 pts: Reward function makes sure that the expression uses all four digits exactly once.
-- 5 pts: Environment and prompting is setup to elicit thinking / reasoning in a <thinking> tag or some equivalent manner.
+- 4 pts: Environment and prompting is setup to elicit thinking / reasoning in a <thinking> tag or some equivalent manner.
 - 1 pt: Reward function is smooth, where even if the expression is not exactly 24, there is a positive reward for being close to 24.
 - 1 pt: There is either a penatly for not following the formatting the prompt demands, or a reward for following the formatting the prompt demands.

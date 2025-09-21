@@ -1,8 +1,8 @@
 Rubric – Typo Correction Environment (10 pts total)
 
 Award points for environment/reward quality:
-- 2 pts: Automatic diffing (Levenshtein or token comparison) scores outputs and distinguishes exact match vs partial fixes.
-- 2 pts: Reward tiers are documented (exact match, minor style difference, unchanged/introduces error) and implemented in code.
-- 2 pts: Sentiment/intent checks (e.g., simple similarity or heuristic) flag meaning drift and feed into metadata/reward.
-- 2 pts: Environment logs edit distance, unchanged flag, and semantic change indicator for analysis.
-- 2 pts: Regression tests or golden examples ensure the validator handles all-caps, punctuation-only, and already-correct strings.
+- 2 pts: Reward signal does not just compare for exact match, but also uses something better like a levenshtein distance or similar.
+- 2 pts: More than 10 examples are seeded in the environment.
+- 2 pts: Examples are varied, and not just one overwelming error repeated.
+- 2 pts: Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.
+- 2 pts: Environment stayed on topic to reviews and has difficulty labels.

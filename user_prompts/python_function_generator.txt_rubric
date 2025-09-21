@@ -3,6 +3,6 @@ Rubric – Python Function Generator Environment (10 pts total)
 Award points for environment/reward quality:
 - 2 pts: AST-based validator checks syntax and exact signature (name, params, return type) before scoring.
 - 2 pts: Reward structure differentiates between syntax errors, signature mismatches, logic failures, and full success.
-- 2 pts: Automatic unit tests or assertions run per prompt, feeding pass/fail results into rewards.
+- 2 pts: Automatic unit tests or assertions run per prompt, feeding pass/fail results into rewards. The environment should *actually* run the function and check to see if it is correct and compare it to the golden implementation.
 - 2 pts: Environment enforces docstring/type hint requirements when specified, with clear penalties when missing.
-- 2 pts: Metadata captures `syntax_ok`, `signature_ok`, `tests_passed`, and error messages to aid analysis.
+- 2 pts: Reward function is smooth, where even if we're not exactly correct, we still have some reward for being partially correct.
