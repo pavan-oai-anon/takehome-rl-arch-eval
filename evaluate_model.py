@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Generate and run an automatic evaluation for a PEFT model using OpenAI."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict
+
+import torch
+from openai import OpenAI
+from unsloth import FastLanguageModel
+
+
+@dataclass
+class EvaluationPlan:
+    system_message: str
+    user_message: str
+    evaluation_instructions: str
+    notes: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a PEFT model using GPT-5 generated tests")
+    parser.add_argument("model_path", help="Path to the PEFT model checkpoint directory")
+    parser.add_argument("user_prompt_path", help="Path to the user prompt text file that describes the task")
+    parser.add_argument(
+        "--output",
+        default="evaluation_report.json",
+        help="Where to write the evaluation JSON report (default: evaluation_report.json)",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to sample from the model (default: 256)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for the PEFT model (default: 0.7)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Top-p nucleus sampling for the PEFT model (default: 0.9)",
+    )
+    parser.add_argument(
+        "--gpt5-model",
+        default="gpt-5.0",
+        help="Model name for the GPT-5 planner (default: gpt-5.0)",
+    )
+    parser.add_argument(
+        "--evaluator-model",
+        default="gpt-4.1",
+        help="Model name for the code-interpreter evaluation step (default: gpt-4.1)",
+    )
+    return parser.parse_args()
+
+
+def load_user_prompt(path: Path) -> str:
+    return path.read_text().strip()
+
+
+def collect_response_text(resp: Any) -> str:
+    pieces: list[str] = []
+    for item in getattr(resp, "output", []):
+        for part in getattr(item, "content", []):
+            if getattr(part, "type", None) == "text":
+                pieces.append(getattr(part, "text", ""))
+    if not pieces and hasattr(resp, "output_text"):
+        return resp.output_text
+    return "".join(pieces)
+
+
+def request_evaluation_plan(client: OpenAI, gpt5_model: str, user_prompt: str) -> EvaluationPlan:
+    instructions = (
+        "You are designing an evaluation for a fine-tuned model. "
+        "Using the provided task description, craft a single test case. "
+        "Return JSON with keys system_message, user_message, evaluation_instructions, notes."
+    )
+    resp = client.responses.create(
+        model=gpt5_model,
+        instructions=instructions,
+        input=user_prompt,
+    )
+    text = collect_response_text(resp)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GPT-5 plan was not valid JSON: {text}") from exc
+
+    required_keys = {"system_message", "user_message", "evaluation_instructions", "notes"}
+    missing = required_keys - data.keys()
+    if missing:
+        raise RuntimeError(f"Evaluation plan JSON missing keys: {missing}")
+    return EvaluationPlan(
+        system_message=data["system_message"],
+        user_message=data["user_message"],
+        evaluation_instructions=data["evaluation_instructions"],
+        notes=data["notes"],
+    )
+
+
+def load_peft_model(model_path: Path) -> tuple[Any, Any, str]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    peft_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(model_path),
+        max_seq_length=16384,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        load_in_4bit=torch.cuda.is_available(),
+    )
+    FastLanguageModel.for_inference(peft_model)
+    return peft_model, tokenizer, device
+
+
+def generate_with_model(
+    model,
+    tokenizer,
+    device: str,
+    system_message: str,
+    user_message: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> str:
+    messages = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": user_message})
+
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        add_generation_prompt=True,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+        )
+    generated = tokenizer.decode(outputs[0][inputs.shape[1] :], skip_special_tokens=True)
+    return generated.strip()
+
+
+def evaluate_with_code_interpreter(
+    client: OpenAI,
+    evaluator_model: str,
+    plan: EvaluationPlan,
+    model_response: str,
+) -> Dict[str, Any]:
+    instructions = (
+        "You are a meticulous evaluator. Use the python code tool when helpful to check correctness. "
+        "Return a JSON object with keys score (0-1), reasoning, passed (boolean)."
+    )
+    evaluation_prompt = (
+        "Task description notes:\n" + plan.notes + "\n\n"
+        "System message provided to model:\n" + plan.system_message + "\n\n"
+        "User input sent to model:\n" + plan.user_message + "\n\n"
+        "Model response:\n" + model_response + "\n\n"
+        "Evaluation instructions:\n" + plan.evaluation_instructions + "\n"
+    )
+    resp = client.responses.create(
+        model=evaluator_model,
+        tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
+        instructions=instructions,
+        input=evaluation_prompt,
+    )
+    text = collect_response_text(resp)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Evaluator did not return valid JSON: {text}") from exc
+    return data
+
+
+def main() -> None:
+    args = parse_args()
+    model_path = Path(args.model_path).resolve()
+    user_prompt_path = Path(args.user_prompt_path).resolve()
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path {model_path} does not exist")
+    if not user_prompt_path.exists():
+        raise FileNotFoundError(f"User prompt path {user_prompt_path} does not exist")
+
+    user_prompt = load_user_prompt(user_prompt_path)
+    client = OpenAI()
+
+    plan = request_evaluation_plan(client, args.gpt5_model, user_prompt)
+
+    peft_model, tokenizer, device = load_peft_model(model_path)
+    model_response = generate_with_model(
+        peft_model,
+        tokenizer,
+        device,
+        plan.system_message,
+        plan.user_message,
+        args.max_new_tokens,
+        args.temperature,
+        args.top_p,
+    )
+
+    evaluation = evaluate_with_code_interpreter(
+        client,
+        args.evaluator_model,
+        plan,
+        model_response,
+    )
+
+    report = {
+        "model_path": str(model_path),
+        "user_prompt_path": str(user_prompt_path),
+        "plan": plan.__dict__,
+        "model_response": model_response,
+        "evaluation": evaluation,
+    }
+
+    output_path = Path(args.output).resolve()
+    output_path.write_text(json.dumps(report, indent=2))
+    print(f"Evaluation written to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
