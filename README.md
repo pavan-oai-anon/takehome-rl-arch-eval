@@ -146,3 +146,14 @@ Rough steps to run the eval:
 4. To evaluate the output model, use `evaluate_model.py`.
 
 To create charts/graphs after running the above, use `generate_evaluation_charts.py` and `generate_rubric_charts.py`.
+
+
+## Meta-thoughts of this eval
+
+This eval is a compound eval -- we're checking the model for quite a lot of things: 
+1) Code writing abillities on writing working python code
+2) Reasoning about the right way to structure a reward signal 
+3) Testing the creativity of samples that our model decides to seed the environment with. 
+4) Testing the abillity to infer use cases from the user prompts - and the abillity to extrapolate information on only a small amount of info.
+
+Compound evals I think are cool - but the signal sometimes is a bit weak on "hill climbing" on the eval. This also being a sort of "meta-eval" also might make the signal a tad challenging to learn from - but I think if we can remove some of the synthetic eval steps I did - we could start to get some nice signal out here!
